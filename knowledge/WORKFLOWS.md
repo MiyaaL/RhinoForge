@@ -15,6 +15,12 @@ For model assessment or implementation, use the
 [`rhinoforge-port` skill](../.agents/skills/rhinoforge-port/SKILL.md) with
 [model porting](../docs/model_porting.md).
 
+For exact RPU operator or fusion performance work, use the
+[`rhinoforge-kernel-opt` skill](../skills/rhinoforge-kernel-opt/SKILL.md) with
+[performance measurement](../docs/performance.md). Its device campaign must
+stop when board access, an authorized compiler/source interface, or the
+release-matched operator asset is unavailable.
+
 ## Add or update knowledge
 
 1. Confirm the statement in public source or documentation.

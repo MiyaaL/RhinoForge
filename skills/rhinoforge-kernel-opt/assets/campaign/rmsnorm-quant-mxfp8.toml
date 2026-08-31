@@ -1,0 +1,88 @@
+schema_version = 1
+state = "draft"
+
+[campaign]
+id = "rmsnorm-quant-mxfp8-m16-c1024"
+op = "rmsnorm+quant_mxfp8"
+candidate_root = "solution"
+reference_root = "reference"
+reference_tree_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[commands]
+correctness = ["python", "runner.py", "--mode", "correctness"]
+benchmark = ["python", "runner.py", "--mode", "benchmark"]
+profile_one_call = ["python", "runner.py", "--mode", "profile-one-call"]
+benchmark_adapter = "runner.py"
+benchmark_adapter_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[attestation]
+mode = "unavailable"
+scheme = "none"
+namespace = "rhinoforge-full-verdict-v1"
+signer_id = "not-available"
+public_key_base64 = "not-available"
+policy_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+signer_build_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+verifier_executable = "not-available"
+verifier_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[runtime]
+trace_schema = "rhinoforge-rpu-chrome-v1"
+trace_event_category = "rpu_device_program"
+# Replace this all-zero draft sentinel with `git rev-parse HEAD` before approval.
+rhinoforge_commit = "0000000000000000000000000000000000000000"
+runtime_set = "runtime-v1.0.0-r4"
+torch_version = "2.10.0+cpu"
+launch_version = "1.0.0"
+launch_library = "/home/hx/.local/opt/rhino-launch-kernel-v1.0.0-linux-aarch64/lib/librhino_launch.so.1.0.0"
+launch_library_sha256 = "4be09d385895601b3f5a73c66d49a814ba9d6bf344e60fa3165dbd2a7ad959dd"
+operator_version = "1.0.0"
+operator_asset = "/home/hx/.local/share/rhinoforge/runtime/runtime-v1.0.0-r4/rhinoOpLib_rhinoforge_v1.0.0.ref"
+operator_asset_sha256 = "538f49e256814d104c98aa8df4b6d3af3d89b2d636a1fe22b0731df3ce39ac99"
+kernel_manifest = "/home/hx/.local/share/rhinoforge/runtime/runtime-v1.0.0-r4/rhinoOpLib_rhinoforge_v1.0.0.ref.kernels"
+kernel_manifest_sha256 = "9bc05b25957679a95b00814f3cbb90862a289d747c2b4f7fa30dd938d764033b"
+requires_device_compiler = true
+device_compiler_authorized = false
+device_compiler_id = "hxcc version 1.0+0a6ba7e4"
+device_compiler_sha256 = "b887d6686bf588ca173e965ff8ff97c6dda4e12b89717aca11eeab7eda5096cc"
+compiler_authorization_receipt = "UNRESOLVED"
+compiler_authorization_receipt_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+asset_release_owner = "UNRESOLVED"
+fused_kernel = "REPLACE_WITH_RELEASE_APPROVED_RMSNORM_QUANT_MXFP8_FUSION"
+# NVFP4 is not MXFP8. Replace the sentinel only with the exact approved
+# RMSNorm+MXFP8 one-program fusion name and freeze the payload/scale ABI.
+required_kernels = [
+  "llama_rms_norm",
+  "REPLACE_WITH_RELEASE_APPROVED_RMSNORM_QUANT_MXFP8_FUSION",
+]
+
+[measurement]
+metric = "latency_us"
+direction = "min"
+warmup = 10
+samples = 50
+verdict_processes = 2
+
+[gates]
+max_abs = 0.01
+max_rel = 0.01
+anchor_max_abs = 0.02
+anchor_max_rel = 1.0
+max_cv = 0.05
+require_same_dtype = true
+require_fp32_anchor = true
+require_graph_replay = true
+require_independent_outputs = true
+max_epilogue_tax_pct = 1.0
+fusion_confidence = 0.95
+fusion_bootstrap_trials = 10000
+fusion_bootstrap_seed = 20260831
+
+[[workloads]]
+id = "rmsnorm-m16-c1024-mxfp8-block32"
+m = 16
+n = 1024
+k = 1
+dtype = "float16-to-mxfp8"
+layout = "row-major-payload-plus-block-scales"
+semantic_inputs = ["candidate_execution=single-device-program-rpu-spm", "rmsnorm_path=fused-direct-address-spm-not-eager-cpu", "eps=1e-6", "block_size=32", "mxfp8_format=must-be-frozen", "rounding=must-be-frozen", "outputs=payload-and-scale"]

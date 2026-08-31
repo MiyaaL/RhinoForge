@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Campaign state and restricted/generated artifacts stay outside Git.
+runs/
+worktrees/
+*.o
+*.ref
+*.bin
+*.pt
+*.pth
+*.trace
+*.hwperf

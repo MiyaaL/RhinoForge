@@ -21,6 +21,11 @@ RhinoForge is an inference-only PyTorch `PrivateUse1` backend exposed as
    workaround.
 6. Query [the knowledge index](knowledge/INDEX.md) before searching source for a
    documented concept.
+7. For exact RPU operator or fusion performance campaigns, use the
+   [`rhinoforge-kernel-opt` skill](skills/rhinoforge-kernel-opt/SKILL.md) and
+   [performance measurement](docs/performance.md). Stop device work when board
+   access, an authorized compiler/source interface, or the release-matched
+   operator asset is unavailable.
 
 Use [getting started](docs/getting_started.md) and
 [restricted runtime assets](docs/runtime_assets.md) for installation,

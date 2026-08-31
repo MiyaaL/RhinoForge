@@ -90,6 +90,9 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
   conditions.
 - [`rhinoforge-port`](../.agents/skills/rhinoforge-port/SKILL.md): AI workflow
   for capability assessment and model-port implementation.
+- [`rhinoforge-kernel-opt`](../skills/rhinoforge-kernel-opt/SKILL.md):
+  evidence-driven exact-profile RPU operator/fusion campaigns, roofline and
+  epilogue-cost analysis, and serialized multi-agent board validation.
 
 ## Knowledge operations
 

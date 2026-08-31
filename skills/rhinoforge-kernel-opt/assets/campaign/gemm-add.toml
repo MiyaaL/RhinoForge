@@ -1,0 +1,89 @@
+schema_version = 1
+state = "draft"
+
+[campaign]
+id = "gemm-residual-add-fp16-m16-n1024-k1024"
+op = "gemm+add"
+candidate_root = "solution"
+reference_root = "reference"
+reference_tree_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[commands]
+correctness = ["python", "runner.py", "--mode", "correctness"]
+benchmark = ["python", "runner.py", "--mode", "benchmark"]
+profile_one_call = ["python", "runner.py", "--mode", "profile-one-call"]
+benchmark_adapter = "runner.py"
+benchmark_adapter_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[attestation]
+mode = "unavailable"
+scheme = "none"
+namespace = "rhinoforge-full-verdict-v1"
+signer_id = "not-available"
+public_key_base64 = "not-available"
+policy_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+signer_build_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+verifier_executable = "not-available"
+verifier_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[runtime]
+trace_schema = "rhinoforge-rpu-chrome-v1"
+trace_event_category = "rpu_device_program"
+# Replace this all-zero draft sentinel with `git rev-parse HEAD` before approval.
+rhinoforge_commit = "0000000000000000000000000000000000000000"
+runtime_set = "runtime-v1.0.0-r4"
+torch_version = "2.10.0+cpu"
+launch_version = "1.0.0"
+launch_library = "/home/hx/.local/opt/rhino-launch-kernel-v1.0.0-linux-aarch64/lib/librhino_launch.so.1.0.0"
+launch_library_sha256 = "4be09d385895601b3f5a73c66d49a814ba9d6bf344e60fa3165dbd2a7ad959dd"
+operator_version = "1.0.0"
+operator_asset = "/home/hx/.local/share/rhinoforge/runtime/runtime-v1.0.0-r4/rhinoOpLib_rhinoforge_v1.0.0.ref"
+operator_asset_sha256 = "538f49e256814d104c98aa8df4b6d3af3d89b2d636a1fe22b0731df3ce39ac99"
+kernel_manifest = "/home/hx/.local/share/rhinoforge/runtime/runtime-v1.0.0-r4/rhinoOpLib_rhinoforge_v1.0.0.ref.kernels"
+kernel_manifest_sha256 = "9bc05b25957679a95b00814f3cbb90862a289d747c2b4f7fa30dd938d764033b"
+requires_device_compiler = true
+device_compiler_authorized = false
+device_compiler_id = "hxcc version 1.0+0a6ba7e4"
+device_compiler_sha256 = "b887d6686bf588ca173e965ff8ff97c6dda4e12b89717aca11eeab7eda5096cc"
+compiler_authorization_receipt = "UNRESOLVED"
+compiler_authorization_receipt_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+asset_release_owner = "UNRESOLVED"
+fused_kernel = "REPLACE_WITH_RELEASE_APPROVED_GEMM_RESIDUAL_ADD_FUSION"
+# Bias-in-Linear is not this residual-add contract. Replace this sentinel only
+# with the release-approved general residual epilogue program name.
+required_kernels = [
+  "gemm_fp16_spm_16b_w128x128_k128_1core_buf1_nt_lpaddr_peak",
+  "binary_sameshape",
+  "REPLACE_WITH_RELEASE_APPROVED_GEMM_RESIDUAL_ADD_FUSION",
+]
+
+[measurement]
+metric = "latency_us"
+direction = "min"
+warmup = 10
+samples = 50
+verdict_processes = 2
+
+[gates]
+max_abs = 0.01
+max_rel = 0.01
+anchor_max_abs = 0.01
+anchor_max_rel = 0.01
+max_cv = 0.05
+require_same_dtype = true
+require_fp32_anchor = true
+require_graph_replay = true
+require_independent_outputs = true
+max_epilogue_tax_pct = 1.0
+fusion_confidence = 0.95
+fusion_bootstrap_trials = 10000
+fusion_bootstrap_seed = 20260831
+
+[[workloads]]
+id = "residual-m16-n1024-k1024-fp16"
+m = 16
+n = 1024
+k = 1024
+dtype = "float16"
+layout = "gemm-and-residual-row-major"
+semantic_inputs = ["candidate_execution=single-device-program-rpu-spm", "unfused_baseline=gemm-plus-binary_sameshape", "add=residual-mxn", "alpha=1", "bias=none", "accumulation=must-be-frozen", "rounding=must-be-frozen", "output=materialized"]
