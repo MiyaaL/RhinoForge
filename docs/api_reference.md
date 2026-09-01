@@ -166,6 +166,10 @@ exactly the three canonical cameras, an initial multimodal prefix no longer
 than 384 tokens, Dataset-V2 single-stage BICUBIC image preprocessing, robot ID
 `10070`, normalizer `x2_normal`, state/action masks `[1]*20+[0]*6`, an action
 shape of `[1,32,26]`, and 10 Euler steps.
+`predict_action_chunk(..., initial_noise=...)` accepts a finite CPU FP32-
+convertible tensor with shape `[32,26]` or `[1,32,26]` for exact cross-device
+flow-input parity. It is mutually exclusive with `noise_seed`; omitting both
+preserves the deterministic seed-0 behavior.
 `from_checkpoint(..., allow_numeric_blocked_vision=True)` is the required
 explicit opt-in before `.to("rpu")`, because its Qwen3.5 vision path remains
 numeric-blocked. `WallQwen35ActionOutput.actions` is a fresh contiguous CPU

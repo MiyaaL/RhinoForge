@@ -6,8 +6,9 @@ and action-decoding contract: annotated events are split into 32-step chunks
 without crossing event boundaries, one RGB frame per camera is sampled at each
 chunk start, and the physical relative 26D policy output is decoded to an
 absolute dual-arm 14D trajectory for comparison with the recorded master arms.
-Its deterministic host-noise schedule is recorded explicitly because it is not
-bit-identical to Harrix's stateful CUDA RNG. It never executes robot actions.
+Its deterministic host-noise schedule is exported and can be replaced by an
+explicit common-noise artifact for device-to-device parity. It never executes
+robot actions.
 """
 
 from __future__ import annotations
@@ -90,6 +91,63 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _flow_noise_schedule(
+    path: Path | None,
+    *,
+    request_count: int,
+    base_seed: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    expected = (request_count, ACTION_HORIZON, 26)
+    if path is None:
+        chunks = []
+        for request_index in range(request_count):
+            generator = torch.Generator(device="cpu").manual_seed(
+                base_seed + request_index
+            )
+            chunks.append(
+                torch.randn(
+                    (ACTION_HORIZON, 26),
+                    generator=generator,
+                    dtype=torch.float32,
+                ).numpy()
+            )
+        values = np.stack(chunks).astype(np.float32, copy=False)
+        source = {
+            "kind": "generated_cpu_per_request",
+            "base_seed": int(base_seed),
+            "schedule": "torch CPU generator re-seeded with base_seed + request_idx",
+        }
+    else:
+        resolved = path.expanduser().resolve(strict=True)
+        if not resolved.is_file():
+            raise ValueError(f"flow noise is not a regular file: {resolved}")
+        try:
+            values = np.load(resolved, allow_pickle=False)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"cannot load flow noise {resolved}: {exc}") from exc
+        if values.ndim == 4 and values.shape[1] == 1:
+            values = values[:, 0]
+        source = {
+            "kind": "explicit_npy",
+            "source_path": str(resolved),
+            "source_sha256": _sha256(resolved),
+        }
+    if tuple(values.shape) != expected:
+        raise ValueError(
+            f"flow noise must have shape {expected}, got {tuple(values.shape)}"
+        )
+    try:
+        values = np.asarray(values, dtype=np.float32, order="C")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("flow noise must be convertible to FP32") from exc
+    if not np.isfinite(values).all():
+        raise ValueError("flow noise must contain only finite values")
+    source["value_sha256"] = hashlib.sha256(values.tobytes()).hexdigest()
+    source["shape"] = list(values.shape)
+    source["dtype"] = str(values.dtype)
+    return values, source
 
 
 def _runtime_provenance(policy: Any) -> dict[str, Any]:
@@ -1190,6 +1248,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-requests", "--max-events", dest="max_requests", type=int, default=0)
     parser.add_argument("--noise-seed", type=int, default=SEED_DEFAULT)
     parser.add_argument(
+        "--flow-noise",
+        type=Path,
+        help=(
+            "common FP32 .npy noise with shape [requests,32,26] (or "
+            "[requests,1,32,26]); bypasses --noise-seed"
+        ),
+    )
+    parser.add_argument(
         "--torch-profile",
         action="store_true",
         help="profile post-install inference requests with CPU and PrivateUse1",
@@ -1290,8 +1356,19 @@ def main() -> int:
         checkpoint, parsed, dataset_key=args.dataset_key, robot_id=args.robot_id
     )
     prefix_lengths = [item["prefix_length"] for item in prefix_preflight]
-    if args.noise_seed + len(parsed["segments"]) - 1 > (2**63 - 1):
+    if (
+        args.flow_noise is None
+        and args.noise_seed + len(parsed["segments"]) - 1 > (2**63 - 1)
+    ):
         raise SystemExit("per-request noise seed schedule exceeds 2^63-1")
+    try:
+        flow_noise, flow_noise_meta = _flow_noise_schedule(
+            args.flow_noise,
+            request_count=len(parsed["segments"]),
+            base_seed=int(args.noise_seed),
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     print(
         "[wall-qwen35-openloop] preflight OK: "
         f"frames={len(parsed['trajectory'])}, events={len(parsed['events'])}, "
@@ -1314,6 +1391,13 @@ def main() -> int:
         output_dir,
         profile_plan=profile_plan,
     )
+    flow_noise_path = output_dir / "flow_noise.npy"
+    np.save(flow_noise_path, flow_noise)
+    flow_noise_meta = {
+        **flow_noise_meta,
+        "artifact": str(flow_noise_path),
+        "artifact_sha256": _sha256(flow_noise_path),
+    }
 
     common_meta = {
         "mode": "wall_qwen35_openloop",
@@ -1330,11 +1414,10 @@ def main() -> int:
         "action_horizon": ACTION_HORIZON,
         "num_inference_steps": args.inference_steps,
         "action_dim": 26,
-        "noise_seed_base": int(args.noise_seed),
-        "noise_schedule": (
-            "CPU generator re-seeded with base_seed + request_idx; this keeps "
-            "requests distinct but is not CUDA RNG bit parity with Harrix"
+        "noise_seed_base": (
+            int(args.noise_seed) if args.flow_noise is None else None
         ),
+        "flow_noise": flow_noise_meta,
         "model_requests": len(parsed["segments"]),
         "recorded_frames": len(parsed["trajectory"]),
         "annotated_events": len(parsed["events"]),
@@ -1415,7 +1498,11 @@ def main() -> int:
         for request_index, segment in enumerate(parsed["segments"]):
             start = int(segment["start"])
             state = _make_state26(parsed["trajectory"][start])
-            request_noise_seed = int(args.noise_seed) + request_index
+            request_noise_seed = (
+                int(args.noise_seed) + request_index
+                if args.flow_noise is None
+                else None
+            )
             request_started = time.perf_counter()
             request_kwargs = {
                 "images": {
@@ -1429,7 +1516,7 @@ def main() -> int:
                 "proprioception": state,
                 "agent_pos_mask": MASK26,
                 "dof_mask": MASK26,
-                "noise_seed": request_noise_seed,
+                "initial_noise": flow_noise[request_index],
             }
             if (
                 torch_profile_meta["mode"] == "ready_replay"
@@ -1580,6 +1667,9 @@ def main() -> int:
                     "request_idx": request_index,
                     "prefix_length": prefix_preflight[request_index]["prefix_length"],
                     "noise_seed": request_noise_seed,
+                    "flow_noise_sha256": hashlib.sha256(
+                        flow_noise[request_index].tobytes()
+                    ).hexdigest(),
                     "prediction_steps": eval_steps,
                     "seconds": request_seconds,
                     **metrics,

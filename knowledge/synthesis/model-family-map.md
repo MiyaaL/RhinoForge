@@ -134,7 +134,12 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
   fresh CPU FP32 physical-action tensor
   with shape `[1,32,26]` after exactly 10 Euler steps. Neighboring camera,
   prefix, batch, precision, horizon, action-dimension, and step profiles do not
-  inherit admission.
+  inherit admission. Cross-device numerical comparisons may inject one finite
+  CPU `initial_noise` tensor with shape `[32,26]` or `[1,32,26]`; it is
+  mutually exclusive with `noise_seed`. The open-loop wrapper exports the
+  exact `[requests,32,26]` noise artifact it consumed so comparisons can prove
+  same-noise input instead of conflating flow-sampling variance with backend
+  precision.
   [Wall Qwen3.5 facade](../../python/rpu_backend/api/wall_qwen35.py)
 - Vision, base text, and action own three live fused handles. The policy binds
   the cold `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1` setting before any handle

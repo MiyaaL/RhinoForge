@@ -50,6 +50,29 @@ def _finite_vector(value: Any, *, name: str, binary: bool = False) -> torch.Tens
     return tensor
 
 
+def _finite_initial_noise(value: Any) -> torch.Tensor:
+    try:
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(
+            "WallQwen35Policy initial_noise must be tensor-like"
+        ) from exc
+    if tensor.device.type != "cpu":
+        raise ValueError("WallQwen35Policy initial_noise must be on CPU")
+    if tuple(tensor.shape) == (_ACTION_HORIZON, _ACTION_DIM):
+        tensor = tensor.unsqueeze(0)
+    if tuple(tensor.shape) != (1, _ACTION_HORIZON, _ACTION_DIM):
+        raise ValueError(
+            "WallQwen35Policy initial_noise must have shape [32,26] or "
+            f"[1,32,26], got {tuple(tensor.shape)}"
+        )
+    if not bool(torch.isfinite(tensor).all()):
+        raise ValueError(
+            "WallQwen35Policy initial_noise must contain only finite values"
+        )
+    return tensor.contiguous().clone()
+
+
 def _camera_mapping(images: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(images, Mapping):
         raise ValueError(
@@ -207,7 +230,8 @@ class WallQwen35Policy:
         proprioception: Any,
         agent_pos_mask: Any | None = None,
         dof_mask: Any | None = None,
-        noise_seed: int = 0,
+        noise_seed: int | None = None,
+        initial_noise: Any | None = None,
     ) -> WallQwen35ActionOutput:
         if self._runtime is None or self._closed:
             raise RuntimeError(
@@ -232,8 +256,20 @@ class WallQwen35Policy:
             )
         if not torch.equal(action_mask, expected_mask):
             raise ValueError("WallQwen35Policy dof_mask must be [1]*20 + [0]*6")
-        if isinstance(noise_seed, bool) or not isinstance(noise_seed, Integral):
-            raise ValueError("WallQwen35Policy noise_seed must be an integer")
+        if noise_seed is not None and (
+            isinstance(noise_seed, bool) or not isinstance(noise_seed, Integral)
+        ):
+            raise ValueError("WallQwen35Policy noise_seed must be an integer or None")
+        if initial_noise is not None and noise_seed is not None:
+            raise ValueError(
+                "WallQwen35Policy accepts either noise_seed or initial_noise, not both"
+            )
+        explicit_noise = (
+            None if initial_noise is None else _finite_initial_noise(initial_noise)
+        )
+        resolved_noise_seed = (
+            0 if initial_noise is None and noise_seed is None else noise_seed
+        )
         if not isinstance(instruction, (str, Mapping)):
             raise ValueError(
                 "WallQwen35Policy instruction must be a string or task/detail mapping"
@@ -245,7 +281,12 @@ class WallQwen35Policy:
             proprioception=state,
             agent_pos_mask=state_mask,
             dof_mask=action_mask,
-            noise_seed=int(noise_seed),
+            noise_seed=(
+                None
+                if resolved_noise_seed is None
+                else int(resolved_noise_seed)
+            ),
+            initial_noise=explicit_noise,
         )
         if isinstance(result, WallQwen35ActionOutput):
             output = result

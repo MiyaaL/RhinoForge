@@ -13,6 +13,7 @@ NORM_KEY="${NORM_KEY:-x2_normal}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 MAX_REQUESTS="${MAX_REQUESTS:-${MAX_EVENTS:-0}}"
 NOISE_SEED="${NOISE_SEED:-${SEED:-3407}}"
+FLOW_NOISE="${FLOW_NOISE:-}"
 RUN_WITH_SUDO="${RUN_WITH_SUDO:-1}"
 TORCH_PROFILE="${TORCH_PROFILE:-0}"
 TORCH_PROFILE_OUTPUT="${TORCH_PROFILE_OUTPUT:-}"
@@ -51,6 +52,8 @@ Options:
       --max-events N           Reference-compatible alias for --max-requests.
       --noise-seed N           Base for the deterministic per-request seed
                                schedule (base + request index; default: 3407).
+      --flow-noise PATH        Common FP32 .npy noise [requests,32,26]; bypasses
+                               --noise-seed and is copied into the run output.
       --torch-profile          Warm the first request without recording, then
                                profile exactly one identical repeat with CPU +
                                PrivateUse1 activities and Graph admission.
@@ -79,6 +82,7 @@ Options:
 Environment overrides:
   ENV_SH, DATASET_DIR, CHECKPOINT_PATH, OUTPUT_DIR, INSTRUCTION_SOURCE, ROBOT_ID,
   NORM_KEY, NUM_INFERENCE_STEPS, MAX_REQUESTS/MAX_EVENTS, NOISE_SEED/SEED,
+  FLOW_NOISE,
   RUN_WITH_SUDO, TORCH_PROFILE, TORCH_PROFILE_OUTPUT, TORCH_PROFILE_DIR,
   TORCH_PROFILE_RECORD_SHAPES, TORCH_PROFILE_MEMORY, TORCH_PROFILE_WITH_STACK,
   HW_PERF, HW_PERF_OUTPUT, HW_PERF_MAX_DUMPS, LKN_RPU_FREQ_MHZ,
@@ -92,6 +96,9 @@ Examples:
     --hw-perf-output /home/hx/miyaa/work/prof/wall_qwen35_hwperf
   bash run_wall_qwen35_openloop.sh --max-events 1 \
     --torch-profile-dir /tmp/wall_qwen35-openloop-profile
+  bash run_wall_qwen35_openloop.sh \
+    --flow-noise /mnt/miyaa/work/prof/harrix_qwen35_bf16_flow_noise_20260901.npy \
+    --output-dir /tmp/wall_qwen35_accuracy_report_repro
   bash run_wall_qwen35_openloop.sh
 EOF
 }
@@ -202,6 +209,16 @@ while (($#)); do
             ;;
         --noise-seed=*)
             NOISE_SEED="${1#*=}"
+            shift
+            ;;
+        --flow-noise)
+            require_value "$1" "${2:-}"
+            FLOW_NOISE="$2"
+            shift 2
+            ;;
+        --flow-noise=*)
+            FLOW_NOISE="${1#*=}"
+            [[ -n "$FLOW_NOISE" ]] || fatal "--flow-noise requires a value"
             shift
             ;;
         --torch-profile)
@@ -348,6 +365,10 @@ PYTHON_BIN="${PYTHON_BIN:-$CONDA_PREFIX/bin/python}"
 
 DATASET_DIR="$(cd -- "$DATASET_DIR" && pwd -P)"
 CHECKPOINT_PATH="$(cd -- "$CHECKPOINT_PATH" && pwd -P)"
+if [[ -n "$FLOW_NOISE" ]]; then
+    [[ -f "$FLOW_NOISE" ]] || fatal "flow noise file is missing: $FLOW_NOISE"
+    FLOW_NOISE="$(cd -- "$(dirname -- "$FLOW_NOISE")" && pwd -P)/$(basename -- "$FLOW_NOISE")"
+fi
 if [[ "$OUTPUT_DIR" != /* ]]; then
     OUTPUT_DIR="$(pwd -P)/$OUTPUT_DIR"
 fi
@@ -389,6 +410,9 @@ PYTHON_ARGS=(
     --max-requests "$MAX_REQUESTS"
     --noise-seed "$NOISE_SEED"
 )
+if [[ -n "$FLOW_NOISE" ]]; then
+    PYTHON_ARGS+=(--flow-noise "$FLOW_NOISE")
+fi
 if [[ $check_only == 1 ]]; then
     PYTHON_ARGS+=(--check-config)
 else
@@ -427,7 +451,12 @@ printf '  %-22s %s\n' 'robot id:' "$ROBOT_ID"
 printf '  %-22s %s\n' 'normalizer:' "$NORM_KEY"
 printf '  %-22s %s\n' 'inference steps:' "$NUM_INFERENCE_STEPS"
 printf '  %-22s %s\n' 'max requests:' "$([[ $MAX_REQUESTS == 0 ]] && printf all || printf '%s' "$MAX_REQUESTS")"
-printf '  %-22s %s\n' 'noise seed base:' "$NOISE_SEED"
+if [[ -n "$FLOW_NOISE" ]]; then
+    printf '  %-22s %s\n' 'noise seed base:' 'ignored (explicit flow noise)'
+else
+    printf '  %-22s %s\n' 'noise seed base:' "$NOISE_SEED"
+fi
+printf '  %-22s %s\n' 'flow noise:' "${FLOW_NOISE:-generated and exported}"
 printf '  %-22s %s\n' 'sudo:' "$([[ $use_sudo == 1 ]] && printf enabled || printf disabled)"
 printf '  %-22s %s\n' 'torch profile:' "$profile_mode"
 if ((profile_enabled)); then

@@ -370,14 +370,19 @@ class WallQwen35Runtime:
         proprioception: Any | None = None,
         agent_pos_mask: Any | None = None,
         dof_mask: Any | None = None,
-        noise_seed: int = 0,
+        noise_seed: int | None = None,
+        initial_noise: Any | None = None,
     ) -> dict[str, Any]:
         if not self._installed:
             raise RuntimeError("call runtime.to('rpu') before inference")
         if self._closed:
             raise RuntimeError("WallQwen35Runtime is closed")
-        if isinstance(noise_seed, bool) or not isinstance(noise_seed, int):
-            raise ValueError("noise_seed must be an integer")
+        if noise_seed is not None and (
+            isinstance(noise_seed, bool) or not isinstance(noise_seed, int)
+        ):
+            raise ValueError("noise_seed must be an integer or None")
+        if initial_noise is not None and noise_seed is not None:
+            raise ValueError("provide either noise_seed or initial_noise, not both")
         if (state is None) == (proprioception is None):
             raise ValueError(
                 "provide exactly one of state or proprioception"
@@ -392,16 +397,40 @@ class WallQwen35Runtime:
         )
         prefix_cache = self._build_prefix(prepared)
         _, action_module = _wall_modules()
-        generator = torch.Generator(device="cpu").manual_seed(noise_seed)
-        action = torch.randn(
-            (1, ACTION_HORIZON, STATE_DIM),
-            generator=generator, dtype=torch.float32,
-        )
-        initial_noise = action.clone()
+        if initial_noise is None:
+            resolved_noise_seed = 0 if noise_seed is None else noise_seed
+            generator = torch.Generator(device="cpu").manual_seed(
+                resolved_noise_seed
+            )
+            action = torch.randn(
+                (1, ACTION_HORIZON, STATE_DIM),
+                generator=generator, dtype=torch.float32,
+            )
+            noise_source = "cpu_seed"
+        else:
+            try:
+                action = torch.as_tensor(initial_noise, dtype=torch.float32)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                raise ValueError("initial_noise must be tensor-like") from exc
+            if action.device.type != "cpu":
+                raise ValueError("initial_noise must be on CPU")
+            if tuple(action.shape) == (ACTION_HORIZON, STATE_DIM):
+                action = action.unsqueeze(0)
+            if tuple(action.shape) != (1, ACTION_HORIZON, STATE_DIM):
+                raise ValueError(
+                    "initial_noise must have shape [32,26] or [1,32,26], "
+                    f"got {tuple(action.shape)}"
+                )
+            if not bool(torch.isfinite(action).all()):
+                raise ValueError("initial_noise must contain only finite values")
+            action = action.contiguous().clone()
+            resolved_noise_seed = None
+            noise_source = "explicit"
+        noise_snapshot = action.clone()
         padding_action = (
             ((-self._action_min) / self._action_delta) * 2.0 - 1.0
         ).clamp(-1.0, 1.0).view(1, 1, STATE_DIM)
-        padding_velocity = padding_action - initial_noise
+        padding_velocity = padding_action - noise_snapshot
         times = torch.linspace(0.0, 1.0, 11, dtype=torch.float32) * 0.999
         with torch.inference_mode(), _profile_scope(
             "wall_qwen35_action_denoise_loop"
@@ -445,7 +474,10 @@ class WallQwen35Runtime:
                 device="cpu", dtype=torch.float32
             ).contiguous().clone(),
             "prefix_length": prepared.prefix_length,
-            "extra": {"noise_seed": noise_seed},
+            "extra": {
+                "noise_seed": resolved_noise_seed,
+                "noise_source": noise_source,
+            },
         }
 
     def close(self):

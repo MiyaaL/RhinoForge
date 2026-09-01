@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import numpy as np
 from pathlib import Path
 import re
 import runpy
@@ -32,6 +33,51 @@ def _profile_args(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_flow_noise_schedule_round_trips_common_artifact(
+    openloop_namespace,
+    tmp_path: Path,
+) -> None:
+    schedule = openloop_namespace["_flow_noise_schedule"]
+    generated, metadata = schedule(None, request_count=2, base_seed=3407)
+
+    assert generated.shape == (2, 32, 26)
+    assert generated.dtype == np.float32
+    assert metadata["kind"] == "generated_cpu_per_request"
+    assert metadata["base_seed"] == 3407
+    assert metadata["value_sha256"] == hashlib.sha256(
+        generated.tobytes()
+    ).hexdigest()
+
+    artifact = tmp_path / "flow_noise.npy"
+    np.save(artifact, generated[:, None])
+    loaded, loaded_metadata = schedule(
+        artifact, request_count=2, base_seed=9999
+    )
+
+    np.testing.assert_array_equal(loaded, generated)
+    assert loaded_metadata["kind"] == "explicit_npy"
+    assert loaded_metadata["source_path"] == str(artifact.resolve())
+    assert loaded_metadata["value_sha256"] == metadata["value_sha256"]
+
+
+def test_flow_noise_schedule_rejects_wrong_shape_and_nonfinite(
+    openloop_namespace,
+    tmp_path: Path,
+) -> None:
+    schedule = openloop_namespace["_flow_noise_schedule"]
+    wrong = tmp_path / "wrong.npy"
+    np.save(wrong, np.zeros((1, 32, 26), dtype=np.float32))
+    with pytest.raises(ValueError, match="shape"):
+        schedule(wrong, request_count=2, base_seed=3407)
+
+    nonfinite = tmp_path / "nonfinite.npy"
+    values = np.zeros((2, 32, 26), dtype=np.float32)
+    values[0, 0, 0] = np.nan
+    np.save(nonfinite, values)
+    with pytest.raises(ValueError, match="only finite"):
+        schedule(nonfinite, request_count=2, base_seed=3407)
 
 
 def test_profile_is_disabled_by_default(openloop_namespace, tmp_path: Path) -> None:

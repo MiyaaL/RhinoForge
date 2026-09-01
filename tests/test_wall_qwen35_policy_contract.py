@@ -416,6 +416,21 @@ def test_predict_validates_inputs_orders_cameras_and_clones_outputs() -> None:
     assert runtime.calls[1]["agent_pos_mask"].tolist() == [1.0] * 20 + [0.0] * 6
     assert runtime.calls[1]["dof_mask"].tolist() == [1.0] * 20 + [0.0] * 6
 
+    initial_noise = torch.randn((32, 26), dtype=torch.float32)
+    explicit = policy.predict_action_chunk(
+        images=images,
+        instruction="pick",
+        proprioception=torch.zeros(26),
+        initial_noise=initial_noise,
+    )
+    assert torch.all(explicit.actions == 3)
+    passed_noise = runtime.calls[2]["initial_noise"]
+    assert tuple(passed_noise.shape) == (1, 32, 26)
+    assert passed_noise.is_contiguous()
+    assert passed_noise.data_ptr() != initial_noise.data_ptr()
+    torch.testing.assert_close(passed_noise[0], initial_noise)
+    assert runtime.calls[2]["noise_seed"] is None
+
 
 def test_predict_rejects_bad_request_and_runtime_output() -> None:
     policy = _live_policy(_PredictRuntime())
@@ -433,6 +448,30 @@ def test_predict_rejects_bad_request_and_runtime_output() -> None:
             instruction="task",
             proprioception=torch.zeros(26),
             noise_seed=True,
+        )
+    with pytest.raises(ValueError, match="either noise_seed or initial_noise"):
+        policy.predict_action_chunk(
+            images=cameras,
+            instruction="task",
+            proprioception=torch.zeros(26),
+            noise_seed=1,
+            initial_noise=torch.zeros((32, 26)),
+        )
+    with pytest.raises(ValueError, match=r"shape \[32,26\]"):
+        policy.predict_action_chunk(
+            images=cameras,
+            instruction="task",
+            proprioception=torch.zeros(26),
+            initial_noise=torch.zeros((31, 26)),
+        )
+    nonfinite_noise = torch.zeros((32, 26))
+    nonfinite_noise[0, 0] = float("nan")
+    with pytest.raises(ValueError, match="only finite"):
+        policy.predict_action_chunk(
+            images=cameras,
+            instruction="task",
+            proprioception=torch.zeros(26),
+            initial_noise=nonfinite_noise,
         )
     with pytest.raises(ValueError, match="only 0 or 1"):
         policy.predict_action_chunk(

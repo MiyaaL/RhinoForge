@@ -132,14 +132,36 @@ bash run_wall_qwen35_openloop.sh --max-events 1 \
 bash run_wall_qwen35_openloop.sh --max-events 1 \
   --hw-perf-output /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
 bash run_wall_qwen35_openloop.sh
+bash run_wall_qwen35_openloop.sh \
+  --flow-noise /path/to/common_flow_noise.npy
 ```
 
 The live commands use `sudo` by default for board access and source
 `/home/hx/miyaa/work/env.sh`. Their output includes reference-compatible NumPy
 filenames, physical-unit metrics, exact-profile provenance, and retained-Graph
 diagnostics. Before Python starts, the wrapper fixes the cold multi-handle
-setting `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`. The deterministic CPU seed
-schedule is recorded as not bit-identical to the reference CUDA RNG stream.
+setting `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`. Every run exports the exact
+`flow_noise.npy` it consumed. The default deterministic CPU seed schedule is
+not bit-identical to the reference CUDA RNG stream, so device precision claims
+must use `--flow-noise` with the same `[requests,32,26]` artifact on every
+backend.
+
+The checked-in 2026-09-01 accuracy report is reproduced by a fresh, unprofiled
+full run with the captured Harrix BF16 CUDA noise:
+
+```bash
+bash run_wall_qwen35_openloop.sh \
+  --flow-noise /mnt/miyaa/work/prof/harrix_qwen35_bf16_flow_noise_20260901.npy \
+  --output-dir /tmp/wall_qwen35_accuracy_report_repro
+sha256sum /tmp/wall_qwen35_accuracy_report_repro/{flow_noise,pred_concat}.npy
+```
+
+The expected hashes are `6b01140934037843ef2364a5da5dd864bf0ee7f27df3820ed1ff370bf866f5d3`
+for `flow_noise.npy` and
+`5fb358fbe7ea148b0e7374137fb4ad6cd44f77c9a228c8ab71d3dc706a4b6e3b`
+for `pred_concat.npy`. The output directory must not already exist. The full
+same-noise BF16/MXFP8/RPU evidence and FP64 aggregate metrics are in
+`reports/wall_qwen35_accuracy_comparison_20260901.html` and its sibling JSON.
 
 The default `--torch-profile` path is a READY probe: it runs the first admitted
 request once without a profiler, then records exactly one identical repeat.
