@@ -41,6 +41,11 @@ record_shapes = false # 默认 false；记录算子输入 shape。
 profile_memory = false # 默认 false；记录内存事件。
 with_stack = false # 默认 false；记录 Python stack，开销更高。
 
+[runner.hw_perf]
+enabled = false # 默认 false；启用 r4 kernel/DMA Chrome trace。
+output_dir = "profiles/pi05_hwperf" # 可复用目录；文件名自动带时间戳。
+max_dumps = 32 # segment JSON 文件总数上限。
+
 [rpu_execution.prefill]
 chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
 padding_budget = 64 # 默认 64；非负整数；与 padding_rows 二选一。

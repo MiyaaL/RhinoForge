@@ -95,8 +95,6 @@ def test_public_tree_excludes_internal_release_markers() -> None:
         (r"rpu_(?:kernel_probe_by_name|rope_probe|rope_kernel_info)", 0),
         ("get_runtime_" + "payload_paths", 0),
         ("get_kernel_" + "args_instr", 0),
-        ("hw_" + "perf_trace", re.IGNORECASE),
-        ("dump_" + "hw_perf_chrome", re.IGNORECASE),
         (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", 0),
     )
     for pattern, flags in forbidden:
@@ -139,3 +137,21 @@ def test_runtime_diagnostics_do_not_expose_address_values() -> None:
         text = path.read_text(encoding="utf-8", errors="ignore")
         for pattern in forbidden:
             assert re.search(pattern, text) is None, f"{path}: {pattern}"
+
+
+def test_public_r4_hwperf_surface_is_bounded_and_graph_scoped() -> None:
+    pybind = (ROOT / "src/core/rpu_pybind.inc").read_text(encoding="utf-8")
+    execute = (ROOT / "src/graph/graph_runtime_execute.cpp").read_text(
+        encoding="utf-8"
+    )
+    runtime = (ROOT / "src/graph/graph_runtime.cpp").read_text(encoding="utf-8")
+
+    assert 'm.def("set_hw_perf_trace"' in pybind
+    assert 'm.def("get_hw_perf_trace"' in pybind
+    assert "wq.set_enable_hw_perf(rpu_hw_perf_trace_enabled())" in execute
+    assert execute.count("dump_hw_perf_chrome") >= 4
+    assert 'gid, "build", seg_idx_for_instr' in execute
+    assert 'built_signature_.op_id_str, "replay"' in execute
+    assert 'hw_perf_graph_label, "oneshot", seg_idx_oneshot' in execute
+    assert "invalidate_registered_rpu_kernel_graphs_uncoordinated();" in runtime
+    assert "state.config.dump_count >= state.config.max_dumps" in runtime

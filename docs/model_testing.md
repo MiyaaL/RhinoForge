@@ -33,6 +33,7 @@ numerical comparison or expand the support status in
 | Pi0.5 reduced-step / closed-loop | Public policy API | None | Source-only and validation pending; no public smoke claim and no inheritance from the exact FP16 or quantized paths |
 | Pi0.5 base | None | None | Source-only alias; no independent task profile or smoke claim |
 | Wall-OSS FP16/W8A16/W4A16 | `examples/wall_oss.py` | `wall_oss` | Public `wall-x` source-only integration |
+| Wall Qwen3.5 exact flow policy | `examples/wall_qwen35.py`; `run_wall_qwen35_openloop.sh` | None | Source-only controlled-evaluation entry for one locally admitted checkpoint: FP16 batch 1, robot ID `10070`, `x2_normal`, fixed mask `[1]*20+[0]*6`, three canonical Dataset-V2 camera inputs, initial prefix `<=384`, action `[1,32,26]`, and 10 Euler steps; on-board numerical, Graph-lifecycle, and task validation remain pending |
 | Hy-Embodied-0.5-VLA FP16/W16 | `examples/hy_embodied.py` | `hy_embodied` | Runnable normalized-action entry for the exact public profile |
 | Hy-Embodied-0.5-VLA W8/W4 | `examples/hy_embodied.py` | `hy_embodied` | Source-only runtime-conversion entry; no public immutable derived checkpoint identity or hash is bound |
 | RhinoVLA | `examples/rhinovla.py` | `rhinovla` | Integration entry; the model repository supplies its runtime factory |
@@ -75,8 +76,8 @@ does not bind a derived checkpoint identity or change a Source-only status.
 
 ## Direct examples
 
-Every direct example accepts a TOML file and can validate it without loading a
-checkpoint:
+Every runner-backed direct example accepts a TOML file and can validate it
+without loading a checkpoint:
 
 ```bash
 python examples/qwen3_vl.py --config examples/configs/qwen3_vl_2b.toml --check-config
@@ -92,6 +93,91 @@ image included only so the public entry points run without a private input.
 Replace it with representative images before numerical or task validation.
 VLA camera inputs remain caller supplied because their names and preprocessing
 belong to the exact model profile.
+
+The Wall Qwen3.5 entry is a standalone exact-checkpoint CLI rather than a TOML
+runner target. Supply exactly the three canonical cameras and a 26-value state:
+
+```bash
+python examples/wall_qwen35.py \
+  --checkpoint /path/to/exact/checkpoint \
+  --image face_view=/path/to/face.png \
+  --image left_wrist_view=/path/to/left.png \
+  --image right_wrist_view=/path/to/right.png \
+  --instruction "perform the requested action" \
+  --state-json /path/to/state-26.json \
+  --allow-numeric-blocked-vision
+```
+
+The flag is an explicit controlled-evaluation opt-in for the numeric-blocked
+Qwen3.5 vision path; it does not promote this Source-only profile. State and
+degree-of-freedom masks, when supplied, must both equal the exact 26-value
+`[1]*20+[0]*6` profile. Adding
+`--check-config` validates supplied command-line paths and input shapes; with
+no request arguments it performs the repository's dependency-free CLI probe.
+Neither mode performs checkpoint admission, RPU execution, numerical parity,
+Graph lifecycle, or task-quality validation.
+
+For the pinned put-spoon-to-bowl episode, the repository-root wrapper mirrors
+the Harrix data, prompt, segmentation, and action-decoding contract and never
+sends a robot command:
+
+```bash
+bash run_wall_qwen35_openloop.sh --check --no-sudo
+bash run_wall_qwen35_openloop.sh --max-events 1
+bash run_wall_qwen35_openloop.sh --max-events 1 --torch-profile
+bash run_wall_qwen35_openloop.sh --max-events 1 --torch-profile \
+  --torch-profile-output /tmp/qwen35-openloop-ready-profile
+bash run_wall_qwen35_openloop.sh --max-events 1 \
+  --torch-profile-dir /tmp/qwen35-openloop-profile
+bash run_wall_qwen35_openloop.sh --max-events 1 \
+  --hw-perf-output /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
+bash run_wall_qwen35_openloop.sh
+```
+
+The live commands use `sudo` by default for board access and source
+`/home/hx/miyaa/work/env.sh`. Their output includes reference-compatible NumPy
+filenames, physical-unit metrics, exact-profile provenance, and retained-Graph
+diagnostics. Before Python starts, the wrapper fixes the cold multi-handle
+setting `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`. The deterministic CPU seed
+schedule is recorded as not bit-identical to the reference CUDA RNG stream.
+
+The default `--torch-profile` path is a READY probe: it runs the first admitted
+request once without a profiler, then records exactly one identical repeat.
+`--torch-profile-output DIR` selects its output directory. Timestamped
+`wall_qwen35_torch_profile_YYYYMMDD_HHMMSS_PID.trace.json` and matching
+`.summary.json` files make repeated runs non-overwriting. The summary contains
+compact Torch key averages, exact warmup/repeat action parity, and component
+Graph lifecycle evidence. It reports `accepted` only when Vision, base Prefill,
+and Action all prove stable retained replay; a generated trace is not itself a
+READY claim. Named ranges expose `wall_qwen35_preprocess`,
+`wall_qwen35_vision_text_prefill`, `wall_qwen35_action_denoise_loop`, and
+`wall_qwen35_action_decoder` directly in the trace.
+
+The legacy/reference-compatible `--torch-profile-dir DIR` mode still requests
+CPU and `PrivateUse1` activities and profiles every post-install action request
+into a separate `qwen35_generate_flow_action_batch_*.trace.json.gz` file. It
+retains the reference `generate_flow_action_batch` range name and enables
+shapes and stacks by default. Optional
+`--torch-profile-record-shapes`, `--torch-profile-memory`, and
+`--torch-profile-with-stack` diagnostics match the generic runner controls.
+The two modes are mutually exclusive. Profile destinations are validated
+before checkpoint loading or RPU initialization. Profiling cannot be combined
+with `--check`, never overwrites a trace or summary, and produces
+diagnostic-only latency. Keep traces outside the
+repository: it may expose application shapes, source paths, and operation
+metadata. The explicit `policy.to("rpu")` installation and the READY-probe
+warmup are both outside the default trace. The current component gaps and the
+release-matched vendor interface request are recorded in the
+[Wall Qwen3.5 READY-profile assessment](wall_qwen35_ready_profile_assessment.md).
+
+`--hw-perf-output DIR` enables the r4 device trace before policy installation;
+`--hw-perf` uses `OUTPUT_DIR/rpu_hwperf`. The wrapper passes
+`LKN_RPU_FREQ_MHZ` through sudo (default 800 MHz) and bounds the number of
+segment JSON files with `--hw-perf-max-dumps`. Filenames include a timestamp,
+PID, BUILD/REPLAY/oneshot phase, and segment index. Use the `*_replay_segN.json`
+files in Perfetto and merge every segment belonging to the inference region.
+These traces are intentionally redacted in the r4 Release runtime and perturb
+latency; rerun without hardware tracing for the final latency number.
 
 The Pi0.5 `batch_file` is not bundled. Produce it with the checkpoint-compatible
 LeRobot policy preprocessing pipeline, then save the tensor dictionary with
@@ -121,10 +207,13 @@ QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 \
 ```
 
 This does not waive the failed official real-image numerical gate or enable
-video. The Qwen3-VL 32B template retains an explicit opt-in only to reproduce its
-known hard Graph failure; it is not a passing hard-gate or runnable-support
-claim. LingBot2 and InternVLA/NavDP templates contain explicit source-only or
-controlled-evaluation acknowledgements. Removing a gate must fail
+video. The Wall Qwen3.5 CLI has the same fail-closed controlled-evaluation
+principle through its dedicated flag; it does not use the full runner or claim
+that its pending board gates pass. The Qwen3-VL 32B template retains an explicit
+opt-in only to reproduce its known hard Graph failure; it is not a passing
+hard-gate or runnable-support claim. LingBot2 and InternVLA/NavDP templates
+contain explicit source-only or controlled-evaluation acknowledgements.
+Removing a gate must fail
 rather than fall back to an ordinary profile. G0.5
 has no stable standalone public policy constructor: its example validates the
 configuration and then stops with the exact integration step for the official
@@ -167,6 +256,11 @@ output = "profiles/torch.json"
 record_shapes = false
 profile_memory = false
 with_stack = false
+
+[runner.hw_perf]
+enabled = false
+output_dir = "profiles/rpu_hwperf"
+max_dumps = 32
 ```
 
 The remaining `[model]`, `[generation]`, or `[request]` tables are consumed by
@@ -221,6 +315,16 @@ frames, and source paths add application detail to the trace.
 
 Open the JSON in Perfetto or another Chrome-trace viewer. Profiling adds
 overhead, so use a profiler-disabled run for latency measurement.
+
+## RPU hardware profile
+
+Set `[runner.hw_perf].enabled = true` only with an r4 Rhino Launch build that
+provides the hardware trace API. The output directory may already exist; each
+session writes non-overwriting `rpu_hwperf_*.json` filenames. Configuration
+validation accepts this table without initializing the device. At execution,
+the runner fails clearly if the installed RhinoForge extension predates the
+integration. The context is entered before the model target and resets live
+Graph batches both when enabling and disabling collection.
 
 ## Debugging an incorrect or unstable run
 

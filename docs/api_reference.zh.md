@@ -130,12 +130,26 @@ adapter。
 | `Pi05Policy` | `from_pretrained(...)` / `from_lerobot_policy(...)`；`to("rpu")`；`prepare_graphs(...)`；`predict_action_chunk(...)`；`select_action(...)` |
 | `RhinoVLAPolicy` | `from_runtime(...)` / `from_factory(...)` / `from_pretrained(..., runtime_factory=...)`；`prepare_graphs(...)`；`predict(...)`；`predict_action_chunk(...)` |
 | `WallOssPolicy` | `from_checkpoint(...)` / `from_pretrained(...)`；`to("rpu")`；`prepare_graphs(...)`；`infer(...)`；`predict_action_chunk(...)` |
+| `WallQwen35Policy` | `from_checkpoint(...)`；`to("rpu")`；`predict_action_chunk(...)` / `infer(...)`；`close()` |
 | `Lingbot2Policy` | `from_checkpoint(...)`；`to("rpu")`；`prepare_graphs(...)`；`infer(...)`；`predict_action_chunk(...)`；`close()` |
 | `HyEmbodiedPolicy` | `from_checkpoint(...)`；`to("rpu")`；`infer(...)`；`predict_action_chunk(...)`；`close()` |
 
-`WallOssActionOutput`、`Lingbot2ActionOutput`、`HyEmbodiedActionOutput` 是对应
-结构化结果。带物理单位的 action 字段只表示已应用配置 normalization，不认证机器人
-安全或坐标系。
+`WallOssActionOutput`、`WallQwen35ActionOutput`、`Lingbot2ActionOutput`、
+`HyEmbodiedActionOutput` 是对应结构化结果。带物理单位的 action 字段只表示已应用配置
+normalization，不认证机器人安全或坐标系。
+
+`WallQwen35Policy` 是绑定到一个精确本地准入 checkpoint 的 Source-only 受控评估
+API。初版范围固定为 FP16 batch 1、精确三个规范相机、初始多模态 prefix 不超过
+384 token、Dataset-V2 单次 BICUBIC 图像预处理、robot ID `10070`、normalizer
+`x2_normal`、state/action mask `[1]*20+[0]*6`、action shape `[1,32,26]` 和
+10 个 Euler step。Qwen3.5 vision 路径仍为
+numeric-blocked，因此 `.to("rpu")` 前必须通过
+`from_checkpoint(..., allow_numeric_blocked_vision=True)` 显式 opt-in。
+`WallQwen35ActionOutput.actions` 是 shape `[1,32,26]`、物理单位、独立存储的连续
+CPU FP32 tensor。runtime 负责冷启动多 handle 配置
+`RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`；若调用方显式配置为假，会在加载权重前
+拒绝，且执行必须从新进程开始。板上数值对齐、独立 Graph 生命周期和带阈值的任务
+验证仍为 pending。
 
 `RhinoVLAPolicy` 把 checkpoint 组合与 preprocessing 委托给显式 model-repository
 runtime factory。Runtime 必须声明 execution capability 和实际消费的 `rpu_execution`；
@@ -271,9 +285,22 @@ Swizzle 原地改变 parameter storage，必须只运行一次。Fused subsystem
 - `set_debug_export` / `get_debug_export` / `list_debug_tensors` /
   `get_debug_tensor` / `clear_debug_tensors`；
 - `set_spm_debug` / `get_spm_debug` / `spm_alloc_dump`。
+- r4 硬件 kernel/DMA Chrome trace：
+  `set_hw_perf_trace(enabled, output_dir, max_dumps)`、
+  `get_hw_perf_trace()`，以及上下文管理器
+  `hw_perf_trace(output_dir, max_dumps=32)`。
 
 Debug tensor 可能含模型输入或 activation。把这些视为敏感应用产物，不要附到公开
 issue；API 不暴露 raw Graph register/resource/plan payload。
+
+硬件 trace 配置是进程全局状态，只能在 forward 之间修改。Rhino Launch 会在
+`build_batch()` 时固化采集状态，因此每次配置变化都会使全部已注册 Graph 失效。应在
+第一次 forward 前启用，最好使用新进程。`get_hw_perf_trace()` 返回 `enabled`、
+`output_dir`、`max_dumps` 和 `dump_count`。文件名形如
+`rpu_hwperf_*_<graph>_{build,replay,oneshot}_segN.json`；分析一个 Graph 时要合并全部 segment，
+稳态结构主要查看 replay 文件。r4 Release trace 保留 kernel/DMA timing 与调度元数据，
+但会移除可读 kernel 名、op type 和原始地址。它是敏感应用诊断产物，不是完整的
+cache/stall/utilization PMU profiler。
 
 CPU/RPU boundary flush 默认打开，正常推理不要关闭。Chunk size 属于 per-handle
 `rpu_execution`，不是进程全局 `torch.rpu` setter。内部 `torch.ops.rpu.*` 是 adapter

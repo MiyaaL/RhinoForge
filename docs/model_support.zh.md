@@ -53,6 +53,7 @@
 | Pi0.5 reduced-step / closed-loop | `rpu_backend.api.Pi05Policy` | Source-only | 仅保留策略源码；验证仍待完成，这些执行 profile 不继承精确 FP16 或量化路径的证据与状态 |
 | Wall-OSS-0.5 | `rpu_backend.api.WallOssPolicy` | Source-only | 仅公开 `wall-x` 接入；固定的公开 checkpoint 尚未完成发布验证门禁 |
 | Wall-OSS 量化配置 | `rpu_backend.api.WallOssPolicy` | Source-only | 包含公开 converter；每个派生资产仍需 converter provenance、输出身份和重新验证 |
+| Wall Qwen3.5 精确 flow policy | `rpu_backend.api.WallQwen35Policy` | Source-only | 仅用于精确本地准入 checkpoint 的受控评估：FP16、batch 1、robot ID `10070`、normalizer `x2_normal`、固定 mask `[1]*20+[0]*6`、精确三个规范相机及 Dataset-V2 单次 BICUBIC 预处理、初始多模态 prefix `<=384`、不执行语言 `lm_head` 的 cache-only base decode、action 输出 `[1,32,26]`、10 个 Euler step，以及冷启动多 handle 配置 `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`。Qwen3.5 vision 路径仍为 numeric-blocked，必须显式 opt-in；发布数值、独立 Graph 生命周期和任务门禁仍为 pending |
 | SigLIP | `rpu_backend.adapters.siglip.patch_siglip_model_for_rpu_all_layers_once` | Component-only | 仅视觉编码器组件 |
 | GR00T-N1.7-3B | `rpu_backend.adapters.gr00t.build_gr00t_vla` | Source-only | 公开 loader、checkpoint、TOML 和端到端资产流程尚未完整 |
 | Gemma4-E4B text | `rpu_backend.adapters.gemma4.Gemma4Adapter` | Source-only | 依赖兼容已解决；checkpoint、runtime 资产和精确 profile 验证仍待完成 |
@@ -81,6 +82,7 @@ v1.0.0 release record 已将每个声明 profile 绑定到 reference identity、
 | Qwen3.5 text 0.8B / 4B | 执行相同的 bounded-one-shot prefill 和稳定 REPLAY decode 生命周期 | 本次 192-token 验证的 last-prefill full-vocabulary relative L2 超过 `0.01` | Numeric-blocked；受控评估不构成发布支持 |
 | Qwen3.5 Vision 2B / 4B | 默认在 Vision handle 创建或权重转换前 fail closed；受控评估使用有界 retained cache 且仅接受图像 | 声明的 row-mean cosine `>=0.999`、loose minimum `>=0.90`、maximum relative error `<0.40` 门未被任一尺寸的官方真实图满足 | 尚无认证的生产安全正常图像范围；受控结果不构成图像或视频支持 |
 | Pi0.5 Libero FP16 | 精确 action shape/dtype、finite output、多相机与长度行为，以及 27/27 action/prefill/vision execution-plan record；独立 fresh process 证明 READY 后稳定 Graph replay，且无 recapture 或 invariant 失败 | 9/9 same-noise numeric 用例均通过源码 MSE 上限 `0.0072` | 精确 9/9 action/task matrix 与独立 Graph cell 均通过；量化和 reduced-step profile 不继承 |
+| Wall Qwen3.5 精确 flow policy | 强制执行精确 checkpoint/profile 准入与初版 FP16 batch-1 输入范围。开环 READY 探测会预热一个请求、只记录同一请求的一次重复执行，并输出组件生命周期准入。Action 对重复 prefix 可证明稳定 replay，但两个 Vision 几何会竞争单 entry 缓存，Base Prefill 仍为 bounded one-shot；完整 READY 和独立发布生命周期门仍为 pending | 板上 same-dtype parity 与 FP32-anchor 验证仍为 pending | runner 会输出对齐的绝对 action 指标，但尚未绑定固定通过阈值或 RNG 对齐 reference；代表性发布任务验证仍为 pending |
 | Hy-Embodied FP16/W16 | 精确 profile admission、finite output、四次调用 repeatability spread `<=1e-4`、稳定 Graph 生命周期和 A/B/A 输入刷新 | final action cosine `>=0.999`、MSE `<=0.01`；命名中间阶段分别使用冻结的 `0.99995` 或 `0.999` 门 | checkpoint 自有离线 action 证据；机器人安全和 W8/W4 不在结论内 |
 
 reference identity、near-zero row、量化 reference 顺序、task metric retention

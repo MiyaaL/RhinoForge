@@ -8,6 +8,7 @@ from .qwen3_5_cache import Qwen3_5Cache
 from .policy import Pi05Policy
 from .rhinovla import RhinoVLAPolicy
 from .wall_oss import WallOssActionOutput, WallOssPolicy
+from .wall_qwen35 import WallQwen35ActionOutput, WallQwen35Policy
 from .lingbot2 import Lingbot2ActionOutput, Lingbot2Policy
 from .hy_embodied import HyEmbodiedActionOutput, HyEmbodiedPolicy
 from .conditional_generation import RPUModelForConditionalGeneration
@@ -36,6 +37,8 @@ __all__ = [
     "RhinoVLAPolicy",
     "WallOssActionOutput",
     "WallOssPolicy",
+    "WallQwen35ActionOutput",
+    "WallQwen35Policy",
     "Lingbot2ActionOutput",
     "Lingbot2Policy",
     "HyEmbodiedActionOutput",

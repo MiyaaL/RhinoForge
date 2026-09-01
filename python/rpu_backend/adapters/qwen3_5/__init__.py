@@ -66,6 +66,9 @@ _SUPPORTED_PROFILES = frozenset({
 
 
 _SWIZZLE_LOCK = threading.Lock()
+_WALL_CACHE_ONLY_MARKER = "_wall_qwen35_cache_only_no_lm_head"
+_WALL_CACHE_ONLY_ADMITTED = "_wall_qwen35_cache_only_admitted"
+_WALL_QWEN35_VOCAB_SIZE = 256277
 
 
 _QWEN3_5_TEXT_STATE_ATTRS = (
@@ -81,6 +84,60 @@ _QWEN3_5_TEXT_STATE_ATTRS = (
     "padding_budget",
     "prefill_graph",
 )
+
+
+def _admit_wall_cache_only_model(model) -> bool:
+    """Admit only the exact streamed Wall model to the no-lm-head path."""
+
+    if getattr(model, _WALL_CACHE_ONLY_MARKER, False) is not True:
+        return False
+    tc = _text_config(model.config)
+    fusion = getattr(model, "model", None)
+    inner = getattr(fusion, "language_model", fusion)
+    embed = getattr(inner, "embed_tokens", None)
+    output = model.get_output_embeddings()
+    problems = []
+    manifest = getattr(model, "_wall_qwen35_checkpoint_manifest", None)
+    try:
+        # The process-local admission token and file identities are owned by
+        # the exact Wall checkpoint loader.  Python marker attributes, model
+        # geometry, and tied-weight identity alone are intentionally
+        # insufficient to bypass the generic language head.
+        from rpu_backend.adapters.wall_qwen35.checkpoint import _admit_manifest
+
+        if manifest is None:
+            raise ValueError("exact checkpoint manifest is missing")
+        _admit_manifest(getattr(manifest, "root", None), manifest)
+    except Exception as error:
+        problems.append(f"exact checkpoint manifest is invalid: {error}")
+    if getattr(model, "_wall_qwen35_load_complete", False) is not True:
+        problems.append("exact checkpoint stream load is incomplete")
+    if int(getattr(tc, "vocab_size", -1)) != _WALL_QWEN35_VOCAB_SIZE:
+        problems.append(f"text vocab_size must be {_WALL_QWEN35_VOCAB_SIZE}")
+    if not bool(getattr(tc, "tie_word_embeddings", False)):
+        problems.append("text config must use tied word embeddings")
+    if embed is None or output is None or not hasattr(output, "weight"):
+        problems.append("tied input/output embedding is unavailable")
+    elif (
+        tuple(embed.weight.shape) != (_WALL_QWEN35_VOCAB_SIZE, int(tc.hidden_size))
+        or output.weight is not embed.weight
+    ):
+        problems.append("input/output embedding identity or shape drifted")
+    if problems:
+        raise UnsupportedModelError(
+            "Qwen3.5 cache-only/no-lm-head is private to the exact Wall "
+            "checkpoint: " + "; ".join(problems)
+        )
+    setattr(model, _WALL_CACHE_ONLY_ADMITTED, True)
+    return True
+
+
+def _is_admitted_wall_cache_only(model) -> bool:
+    return (
+        getattr(model, _WALL_CACHE_ONLY_MARKER, False) is True
+        and getattr(model, _WALL_CACHE_ONLY_ADMITTED, False) is True
+        and getattr(model, "_wall_qwen35_load_complete", False) is True
+    )
 
 
 def _qwen3_5_text_runtime_state(model):
@@ -107,7 +164,10 @@ def _qwen3_5_text_runtime_state(model):
         return None
     if getattr(inner, "_rpu_qwen3_5_text_install_started", False) is not True:
         return None
-    if getattr(model, "_lm_head_w_rpu_keepalive", None) is None:
+    if (
+        not _is_admitted_wall_cache_only(model)
+        and getattr(model, "_lm_head_w_rpu_keepalive", None) is None
+    ):
         return None
     installed_forward = vars(model).get("forward")
     if not (
@@ -219,6 +279,13 @@ class Qwen3_5Adapter:
         self.model = model
         _check_profile(model.config)
         _validate_layer_types(model.config)
+        cache_only = _admit_wall_cache_only_model(model)
+        vocab_size = int(getattr(_text_config(model.config), "vocab_size", -1))
+        if not cache_only and vocab_size % 128:
+            raise UnsupportedModelError(
+                "Qwen3.5 lm_head vocab_size must be divisible by 128 before "
+                f"RPU weight transformation, got {vocab_size}"
+            )
         self._rpu_execution = bind_rpu_execution(
             model,
             normalized_execution if rpu_execution is not None else None,
@@ -318,6 +385,11 @@ class Qwen3_5Adapter:
         and forward replacement last.
         """
         model = self.model
+        # Revalidate the process-local exact-checkpoint capability immediately
+        # before any ownership claim, dtype conversion, or weight swizzle.
+        # Constructor-time admission alone is insufficient across a delayed
+        # install because checkpoint files may have changed in the meantime.
+        _admit_wall_cache_only_model(model)
         state = _qwen3_5_text_runtime_state(model)
         if state is not None:
             _sync_adapter_text_state(self, state)
@@ -393,6 +465,14 @@ class Qwen3_5Adapter:
             self._graph_cache = inner._rpu_qwen3_5.graph_cache
 
             # ── Step B: lm_head (ForConditionalGeneration concern) ──
+            # The exact Wall flow runtime consumes only the populated physical
+            # prefix cache; it neither samples nor compares language logits.
+            # Its checkpoint-specific vocab width (256277) is not a legal RPU
+            # col-swizzle N.  That private runtime therefore marks its model as
+            # cache-only and deliberately owns the no-lm-head exception instead
+            # of padding vocabulary semantics or pretending adjacent CausalLM
+            # profiles are supported.
+            cache_only = _is_admitted_wall_cache_only(model)
             embed = inner.embed_tokens
 
             # lm_head on RPU via rpu_linear (aten::linear), exactly like Qwen3 — NOT
@@ -405,9 +485,18 @@ class Qwen3_5Adapter:
             # get_output_embeddings() returns the tied embedding when tie_word_embeddings
             # (0.8B/2B/4B) and the SEPARATE lm_head weight when NOT tied (9B). Using
             # embed.weight directly is wrong for untied models (garbage logits).
-            _lm_head_w = _out_emb.weight if _out_emb is not None else embed.weight
-            model._lm_head_w_rpu_keepalive = transform_linear_weight(
-                _lm_head_w.detach().to("cpu").to(torch.float16).contiguous(), 1).to("rpu")
+            if cache_only:
+                # The readiness predicate owns this exact exception directly;
+                # do not overload the tensor keepalive field with a sentinel.
+                pass
+            else:
+                _lm_head_w = (
+                    _out_emb.weight if _out_emb is not None else embed.weight
+                )
+                model._lm_head_w_rpu_keepalive = transform_linear_weight(
+                    _lm_head_w.detach().to("cpu").to(torch.float16).contiguous(),
+                    1,
+                ).to("rpu")
 
             # ── Step C: vision tower — LAZY (installed on first image forward) ──
             # Not installed here on purpose: a Qwen3.5 checkpoint is used for BOTH
@@ -484,6 +573,11 @@ def _rpu_qwen3_5_forward(self, input_ids=None, inputs_embeds=None,
         raise NotImplementedError(
             "Qwen3.5 RPU forward supports only a non-negative integer "
             "logits_to_keep.")
+    cache_only = _is_admitted_wall_cache_only(self)
+    if cache_only and logits_to_keep != 1:
+        raise NotImplementedError(
+            "Qwen3.5 cache-only forward requires logits_to_keep=1"
+        )
 
     cache = past_key_values
     if pixel_values is not None:
@@ -552,13 +646,21 @@ def _rpu_qwen3_5_forward(self, input_ids=None, inputs_embeds=None,
         inner, hidden, cache, attention_mask=attention_mask,
         position_ids=position_ids)
 
-    # 4. lm_head runs on RPU with the swizzled weight. Only project the last
-    # `logits_to_keep` positions; 0 keeps every prefill position for parity tests.
-    if isinstance(logits_to_keep, int) and logits_to_keep > 0:
-        head_in = out[:, -logits_to_keep:, :].contiguous()
+    # 4. lm_head runs on RPU with the swizzled weight. The exact Wall flow
+    # cache-only exception returns an explicit empty-logit sentinel after the
+    # cache side effect; callers cannot mistake it for language-model output.
+    if cache_only:
+        logits = torch.empty(
+            (int(out.shape[0]), 1, 0), dtype=torch.float32, device="cpu"
+        )
     else:
-        head_in = out
-    logits = F.linear(head_in, self._lm_head_w_rpu_keepalive).to("cpu").to(torch.float32)
+        if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+            head_in = out[:, -logits_to_keep:, :].contiguous()
+        else:
+            head_in = out
+        logits = F.linear(
+            head_in, self._lm_head_w_rpu_keepalive
+        ).to("cpu").to(torch.float32)
     return Qwen3_5CausalLMOutputWithPast(
         loss=None,
         logits=logits,

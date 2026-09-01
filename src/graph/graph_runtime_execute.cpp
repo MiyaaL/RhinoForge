@@ -1295,6 +1295,10 @@ void RpuKernelGraph::prepare_segment_queue(
     // enqueu_batch 即等价于 BATCH_CTX 时代的 prepare-once-launch-many 快路径。
     seg.mutable_dmas.clear();
     uint32_t next_mutable_dma_id = 0;
+    // HW perf state is baked into the batch.  This must happen before every
+    // add_kernel/add_dma/build_batch call; configuration transitions invalidate
+    // registered Graphs so a sync-only replay never retains the old setting.
+    wq.set_enable_hw_perf(rpu_hw_perf_trace_enabled());
     wq.set_broadcast_mode(seg.queue_state.broadcast_mode);
     wq.set_flush_icache(seg.queue_state.flush_icache);
     for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
@@ -1420,6 +1424,16 @@ void RpuKernelGraph::launch_segment_for_replay(Segment& seg) {
                     "launch_segment_sync_only: SDK rc=", rc,
                     " on segment idx=", seg_idx,
                     " (mutable_dmas.size=", seg.mutable_dmas.size(), ")");
+        if (auto path = rpu_reserve_hw_perf_trace_path(
+                built_signature_.op_id_str, "replay",
+                static_cast<size_t>(seg_idx))) {
+            const uint32_t dump_rc = private_queue_->dump_hw_perf_chrome(
+                path->c_str());
+            TORCH_CHECK(dump_rc == 0,
+                        "launch_segment_for_replay(sync-only): "
+                        "dump_hw_perf_chrome SDK rc=", dump_rc,
+                        " on segment idx=", seg_idx, " path=", *path);
+        }
         ++last_stats_.prepared_segment_hit_total;
         ++last_stats_.hw_batch_submit_total;
         return;
@@ -1434,6 +1448,15 @@ void RpuKernelGraph::launch_segment_for_replay(Segment& seg) {
     TORCH_CHECK(rc_fallback == 0,
                 "launch_segment_for_replay(fallback): enqueu_batch SDK rc=",
                 rc_fallback, " on segment idx=", seg_idx);
+    if (auto path = rpu_reserve_hw_perf_trace_path(
+            built_signature_.op_id_str, "replay",
+            static_cast<size_t>(seg_idx))) {
+        const uint32_t dump_rc = wq->dump_hw_perf_chrome(path->c_str());
+        TORCH_CHECK(dump_rc == 0,
+                    "launch_segment_for_replay(fallback): "
+                    "dump_hw_perf_chrome SDK rc=", dump_rc,
+                    " on segment idx=", seg_idx, " path=", *path);
+    }
     ++last_stats_.hw_batch_submit_total;
     private_queue_built_segment_idx_ = seg_idx;
     ++last_stats_.prepared_segment_miss_total;
@@ -2153,6 +2176,14 @@ void RpuKernelGraph::execute_graph_for_recording() {
         TORCH_CHECK(rc_build == 0,
                     "execute_graph_for_recording: enqueu_batch SDK rc=", rc_build,
                     " on segment idx=", seg_idx_for_instr);
+        if (auto path = rpu_reserve_hw_perf_trace_path(
+                gid, "build", seg_idx_for_instr)) {
+            const uint32_t dump_rc = wq->dump_hw_perf_chrome(path->c_str());
+            TORCH_CHECK(dump_rc == 0,
+                        "execute_graph_for_recording: dump_hw_perf_chrome SDK rc=",
+                        dump_rc, " on segment idx=", seg_idx_for_instr,
+                        " path=", *path);
+        }
         ++last_stats_.hw_batch_submit_total;
         // 标记本段为 private_queue_ 当前 build 的内容，供下次 REPLAY
         // 比对 (单段 graph 一定命中;多段 graph 只有 last seg 命中)。
@@ -2287,6 +2318,10 @@ void RpuKernelGraph::execute_graph_oneshot() {
     }
     size_t next_node = 0;
     size_t seg_idx_oneshot = 0;
+    const std::string hw_perf_graph_label =
+        pending_signature_.has_value() &&
+                !pending_signature_->op_id_str.empty()
+            ? pending_signature_->op_id_str : std::string("graph");
     for (auto& seg : segments_) {
         for (size_t i = next_node; i < seg.start_idx; ++i) {
             execute_data_node(nodes_[i]);
@@ -2303,6 +2338,14 @@ void RpuKernelGraph::execute_graph_oneshot() {
         TORCH_CHECK(rc_oneshot == 0,
                     "execute_graph_oneshot: enqueu_batch SDK rc=", rc_oneshot,
                     " on segment idx=", seg_idx_oneshot);
+        if (auto path = rpu_reserve_hw_perf_trace_path(
+                hw_perf_graph_label, "oneshot", seg_idx_oneshot)) {
+            const uint32_t dump_rc = wq->dump_hw_perf_chrome(path->c_str());
+            TORCH_CHECK(dump_rc == 0,
+                        "execute_graph_oneshot: dump_hw_perf_chrome SDK rc=",
+                        dump_rc, " on segment idx=", seg_idx_oneshot,
+                        " path=", *path);
+        }
         ++last_stats_.hw_batch_submit_total;
 
         const uint32_t rc_discard = wq->discard_completed_batch();

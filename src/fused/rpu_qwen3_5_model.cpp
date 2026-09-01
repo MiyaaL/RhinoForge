@@ -38,6 +38,15 @@ using namespace ::rhino_lkn;
 
 namespace {
 
+constexpr int64_t kWallActionNumLayers = 24;
+constexpr int64_t kWallActionHiddenSize = 1024;
+constexpr int64_t kWallActionIntermediateSize = 2048;
+constexpr int64_t kWallActionNumQHeads = 8;
+constexpr int64_t kWallActionEffectiveKvHeads = 8;
+constexpr int64_t kWallActionHeadDim = 256;
+constexpr int64_t kWallActionLen = 32;
+constexpr int64_t kWallActionFullLayers[] = {3, 7, 11, 15, 19, 23};
+
 // PARTIAL_MROPE encodes DDR bases in 256-byte units (addr >> 8). The caching
 // allocator guarantees only 32-byte alignment, so retain an aligned view when
 // needed instead of silently truncating address bits in the launcher.
@@ -122,8 +131,58 @@ void Qwen3_5Model::enable_action_mode() {
                 "Qwen3.5 action mode requires set_weights first");
     TORCH_CHECK(!has_gdn_,
                 "Qwen3.5 action mode supports all-full-attention experts only");
+    TORCH_CHECK(!wall_action_mode_,
+                "Qwen3.5 G0.5 action mode and Wall action mode are mutually exclusive");
     action_mode_ = true;
     action_prefix_lens_.assign(num_layers(), 0);
+    set_chunk_size_override(0);
+    invalidate_model_state();
+}
+
+void Qwen3_5Model::enable_wall_action_mode(at::IntArrayRef full_layers) {
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0,
+                "Qwen3.5 Wall action mode must be enabled before the first forward");
+    TORCH_CHECK(num_layers() > 0,
+                "Qwen3.5 Wall action mode requires set_weights first");
+    TORCH_CHECK(!action_mode_,
+                "Qwen3.5 Wall action mode must be selected directly after set_weights");
+    TORCH_CHECK(!has_gdn_,
+                "Qwen3.5 Wall action mode requires an all-full/no-GDN weight shell");
+    TORCH_CHECK(num_layers() == kWallActionNumLayers
+                && hidden_size() == kWallActionHiddenSize
+                && intermediate_size() == kWallActionIntermediateSize
+                && num_q_heads() == kWallActionNumQHeads
+                && num_kv_heads() == kWallActionEffectiveKvHeads
+                && head_dim() == kWallActionHeadDim,
+                "Qwen3.5 Wall action mode supports only layers=24, hidden=1024, "
+                "intermediate=2048, q_heads=8, effective_kv_heads=8, head_dim=256; got ",
+                "layers=", num_layers(), ", hidden=", hidden_size(),
+                ", intermediate=", intermediate_size(),
+                ", q_heads=", num_q_heads(),
+                ", effective_kv_heads=", num_kv_heads(),
+                ", head_dim=", head_dim());
+    constexpr int64_t num_full_layers =
+        static_cast<int64_t>(sizeof(kWallActionFullLayers)
+                             / sizeof(kWallActionFullLayers[0]));
+    TORCH_CHECK(static_cast<int64_t>(full_layers.size()) == num_full_layers,
+                "Qwen3.5 Wall action full_layers must be exactly "
+                "[3, 7, 11, 15, 19, 23]");
+
+    wall_action_full_mask_.assign(num_layers(), 0);
+    for (int64_t i = 0; i < num_full_layers; ++i) {
+        TORCH_CHECK(full_layers[i] == kWallActionFullLayers[i],
+                    "Qwen3.5 Wall action full_layers must be exactly "
+                    "[3, 7, 11, 15, 19, 23]");
+        wall_action_full_mask_[full_layers[i]] = 1;
+    }
+
+    action_mode_ = true;
+    wall_action_mode_ = true;
+    action_residual_eps_ = eps_ / 16.0;
+    action_prefix_lens_.assign(num_layers(), 0);
+    action_step_active_ = false;
+    action_loop_active_ = false;
+    action_num_steps_ = 1;
     set_chunk_size_override(0);
     invalidate_model_state();
 }
@@ -134,6 +193,8 @@ void Qwen3_5Model::set_action_io_weights(
     int64_t action_dim, int64_t action_dim_pad, int64_t action_len) {
     TORCH_CHECK(action_mode_,
                 "Qwen3.5 action I/O weights require action mode");
+    TORCH_CHECK(!wall_action_mode_,
+                "Qwen3.5 Wall action mode does not support native action I/O or Euler steps");
     TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                 "Qwen3.5 action I/O weights must be set before the first forward");
     TORCH_CHECK(action_dim > 0 && action_dim_pad >= action_dim
@@ -197,6 +258,12 @@ at::Tensor Qwen3_5Model::forward_action(
     TORCH_CHECK(hidden_states.dim() == 3 && hidden_states.size(0) == 1,
                 "Qwen3.5 action hidden_states must be [1, action_len, hidden]");
     const int64_t seq_len = hidden_states.size(1);
+    if (wall_action_mode_) {
+        TORCH_CHECK(seq_len == kWallActionLen
+                    && hidden_states.size(2) == kWallActionHiddenSize,
+                    "Qwen3.5 Wall action hidden_states must be exactly [1, 32, 1024], got ",
+                    hidden_states.sizes());
+    }
     TORCH_CHECK(seq_len > 0 && seq_len % 16 == 0,
                 "Qwen3.5 action_len must be a positive multiple of 16, got ",
                 seq_len);
@@ -220,18 +287,63 @@ at::Tensor Qwen3_5Model::forward_action(
 
     action_prefix_lens_.assign(prefix_lens.begin(), prefix_lens.end());
     int64_t max_prefix = 0;
+    int64_t wall_full_prefix = -1;
     for (int64_t i = 0; i < num_layers(); ++i) {
         const int64_t prefix = action_prefix_lens_[i];
         TORCH_CHECK(prefix >= 0,
                     "Qwen3.5 action prefix_lens[", i, "] must be non-negative");
-        TORCH_CHECK(i < static_cast<int64_t>(k_caches.size())
-                    && k_caches[i].defined() && k_caches[i].dim() == 7,
-                    "Qwen3.5 action K cache[", i, "] must be a defined 7D tensor");
-        const int64_t capacity = k_caches[i].size(1) * 16;
-        TORCH_CHECK(prefix + seq_len <= capacity,
-                    "Qwen3.5 action cache capacity exceeded at layer ", i,
-                    ": prefix=", prefix, " action_len=", seq_len,
-                    " capacity=", capacity);
+        if (wall_action_mode_ && !wall_action_full_mask_[i]) {
+            TORCH_CHECK(prefix == 0,
+                        "Qwen3.5 Wall identity layer ", i,
+                        " must have prefix_lens[", i, "] == 0");
+            continue;
+        }
+        if (wall_action_mode_) {
+            TORCH_CHECK(prefix <= 384,
+                        "Qwen3.5 Wall full-layer prefix must be <= 384, got ",
+                        prefix, " at layer ", i);
+            if (wall_full_prefix < 0) {
+                wall_full_prefix = prefix;
+            } else {
+                TORCH_CHECK(prefix == wall_full_prefix,
+                            "Qwen3.5 Wall full-layer prefixes must be equal; layer ",
+                            i, " has ", prefix, " versus ", wall_full_prefix);
+            }
+            TORCH_CHECK(i < static_cast<int64_t>(k_caches.size())
+                        && i < static_cast<int64_t>(v_caches.size()),
+                        "Qwen3.5 Wall cache lists are missing full layer ", i);
+            const auto& kc = k_caches[i];
+            const auto& vc = v_caches[i];
+            TORCH_CHECK(kc.defined() && vc.defined()
+                        && kc.dim() == 7 && vc.dim() == 7
+                        && kc.sizes() == vc.sizes()
+                        && kc.size(0) == 1
+                        && kc.size(2) == 1 && kc.size(3) == 16
+                        && kc.size(4) == 8 && kc.size(5) == 16
+                        && kc.size(6) == 16,
+                        "Qwen3.5 Wall cache[", i,
+                        "] must use the effective-KV8 7D RPUCache topology "
+                        "[1, blocks, 1, 16, 8, 16, 16], got k=",
+                        kc.sizes(), " v=", vc.sizes());
+            const int64_t k_capacity = kc.size(1) * 16;
+            const int64_t v_capacity = vc.size(1) * 16;
+            TORCH_CHECK(prefix + seq_len <= k_capacity
+                        && prefix + seq_len <= v_capacity,
+                        "Qwen3.5 Wall K/V cache capacity exceeded at layer ", i,
+                        ": prefix=", prefix, " action_len=", seq_len,
+                        " k_capacity=", k_capacity,
+                        " v_capacity=", v_capacity);
+        } else {
+            TORCH_CHECK(i < static_cast<int64_t>(k_caches.size())
+                        && k_caches[i].defined() && k_caches[i].dim() == 7,
+                        "Qwen3.5 action K cache[", i,
+                        "] must be a defined 7D tensor");
+            const int64_t capacity = k_caches[i].size(1) * 16;
+            TORCH_CHECK(prefix + seq_len <= capacity,
+                        "Qwen3.5 action cache capacity exceeded at layer ", i,
+                        ": prefix=", prefix, " action_len=", seq_len,
+                        " capacity=", capacity);
+        }
         max_prefix = std::max(max_prefix, prefix);
     }
 
@@ -260,6 +372,9 @@ at::Tensor Qwen3_5Model::forward_action_step(
     std::vector<at::Tensor>& v_caches,
     at::IntArrayRef prefix_lens,
     int64_t num_steps) {
+    TORCH_CHECK(!wall_action_mode_,
+                "Qwen3.5 Wall action mode exposes decoder-only forward; "
+                "native action I/O and Euler steps are unsupported");
     TORCH_CHECK(action_mode_ && action_input_w_.defined(),
                 "Qwen3.5 action step requires action mode and I/O weights");
     TORCH_CHECK(num_steps == 1 || num_steps == 10,
@@ -496,6 +611,13 @@ void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
     const uint32_t input_residual = addr(0, "residual1");
 
     // A layer = input DMA → input_layernorm → token mixer → post_norm + MLP + output.
+    // The Wall residual bridge is Persistent so every layer can read the same
+    // address.  Record a deterministic zero-fill in the graph before its first
+    // use; this executes on BUILD and every REPLAY and no later node writes it.
+    if (wall_action_mode_ && layer_idx == 0) {
+        rpu_launch_memset_spm_multicore(
+            addr(0, "zero_resid"), chunk.len * h);
+    }
     // ① input DMA: the first layer of the cross-layer group brings h_in into residual1.
     if (!ctx().input_in_spm) {
         emit_layer_input_dma(layer_idx, chunk);   // h_in → residual1
@@ -512,7 +634,13 @@ void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
             layer_addr(layer_idx, 0, "norm_w"), chunk.len, h, eps_);
     }
     // ③ token mixer (reads "input_norm"; ends with an all_reduce that adds the h_in residual).
-    if (layer_is_full_[layer_idx]) {
+    if (wall_action_mode_ && !wall_action_full_mask_[layer_idx]) {
+        // Wall disables source linear attention for the action decoder.  Its
+        // token-mixer result is the adaptive-normalized stream itself:
+        // residual2 = residual1 + gate * input_norm.
+        apply_wall_residual_gate(
+            addr(0, "input_norm"), input_residual, chunk);
+    } else if (layer_is_full_[layer_idx]) {
         // full-attn's all_reduce leaves the stream in residual2 (== input_norm) directly.
         build_full_attention(layer_idx, chunk);
     } else {
@@ -557,7 +685,8 @@ void Qwen3_5Model::apply_adaptive_norm(
     const uint32_t modulation = addr(0, "adaptive_mod");
     const uint32_t shift = modulation + static_cast<uint32_t>(h * DWIDTH);
     rpu_launch_rmsnorm_spm_kernel(
-        input, output, modulation, chunk.len, h, eps_);
+        input, output, modulation, chunk.len, h,
+        wall_action_mode_ ? action_residual_eps_ : eps_);
     rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
         shift, output, output, chunk.len, h,
         c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false);
@@ -583,6 +712,53 @@ void Qwen3_5Model::apply_raw_residual_gate(
     rpu_launch_eltwise_binary_spm_kernel(
         output, residual, output, elems,
         ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+}
+
+void Qwen3_5Model::apply_wall_residual_gate(
+    uint32_t output, uint32_t residual, const ChunkInfo& chunk) {
+    const int64_t h = hidden_size();
+    const uint32_t gate = addr(0, "adaptive_mod")
+        + static_cast<uint32_t>(2 * h * DWIDTH);
+    // Wall's certified FP16 ABI keeps the mixed branch separate until after
+    // gating.  This avoids the add→sub cancellation used by the legacy G0.5
+    // path and implements residual + (gate/4) * branch directly.
+    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+        gate, output, output, chunk.len, h,
+        c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+    rpu_launch_eltwise_binary_spm_kernel(
+        output, residual, output, chunk.len * h,
+        ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+}
+
+void Qwen3_5Model::emit_wall_mlp_pipeline(
+    const at::Tensor& gate_w, const at::Tensor& up_w,
+    const at::Tensor& down_w, const ChunkInfo& chunk) {
+    const int64_t h = hidden_size();
+    const int64_t is = intermediate_size();
+    const int64_t local_elems = chunk.len * (is / NUM_CORES);
+
+    launch_linear(
+        addr(0, "residual1"), gate_w, addr(0, "gate"),
+        chunk.len, is, h, /*partition=*/1, NUM_CORES);
+    if (use_silu_) {
+        rpu_launch_eltwise_unary_spm_kernel(
+            addr(0, "gate"), addr(0, "gate"), local_elems,
+            ValuOpType::SILU);
+    }
+    launch_linear(
+        addr(0, "residual1"), up_w, addr(0, "up"),
+        chunk.len, is, h, /*partition=*/1, NUM_CORES);
+    rpu_launch_eltwise_binary_spm_kernel(
+        addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+        local_elems, ValuOpType::MUL, c10::Half(1.0), NUM_CORES);
+    launch_linear(
+        addr(0, "gate"), down_w, addr(0, "down"),
+        chunk.len, h, is, /*partition=*/0, NUM_CORES);
+    rpu_launch_all_reduce_sum_residual_kernel(
+        addr(0, "down"), addr(0, "zero_resid"), addr(0, "residual1"),
+        chunk.len, h, NUM_CORES, NUM_CORES);
+    apply_wall_residual_gate(
+        addr(0, "residual1"), addr(0, "residual2"), chunk);
 }
 
 void Qwen3_5Model::emit_action_input_projection() {
@@ -798,12 +974,18 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
     launch_linear(
         addr(0, "output"), lw.o_w, addr(0, "oproj"), seq_len, h, nq * hd, 0, tp);
 
-    // Phase 5: attention reduce + residual (tp inputs → NUM_CORES out)
+    // Phase 5: attention reduce + residual (tp inputs → NUM_CORES out).
+    // Wall first materializes only the mixed branch against deterministic zero,
+    // then performs gate MUL and residual ADD as distinct FP16 operations.
     rpu_launch_all_reduce_sum_residual_kernel(
-        addr(0, "oproj"), addr(0, "residual1"),
+        addr(0, "oproj"),
+        wall_action_mode_ ? addr(0, "zero_resid") : addr(0, "residual1"),
         addr(0, "residual2"), seq_len, h,
         tp, NUM_CORES);
-    if (action_mode_) {
+    if (wall_action_mode_) {
+        apply_wall_residual_gate(
+            addr(0, "residual2"), addr(0, "residual1"), chunk);
+    } else if (action_mode_) {
         apply_adaptive_residual_gate(
             addr(0, "residual2"), addr(0, "residual1"), chunk);
     }
@@ -1213,15 +1395,19 @@ void Qwen3_5Model::emit_mlp_and_output(int layer_idx, const ChunkInfo& chunk) {
             layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_);
     }
     // MLP (SwiGLU) + reduce + residual → residual1.
-    emit_mlp_pipeline(lw.gate_w, lw.up_w, lw.down_w, seq_len,
-                      use_silu_ ? ActivationKind::SILU : ActivationKind::NONE,
-                      {}, {}, {},
-                      /*gate_nvfp4_ts_addr=*/0,
-                      /*up_nvfp4_ts_addr=*/0,
-                      /*down_nvfp4_ts_addr=*/0,
-                      /*nvfp4_layer_id=*/0,
-                      /*acc32=*/linear_acc32_);
-    if (action_mode_) {
+    if (wall_action_mode_) {
+        emit_wall_mlp_pipeline(lw.gate_w, lw.up_w, lw.down_w, chunk);
+    } else {
+        emit_mlp_pipeline(lw.gate_w, lw.up_w, lw.down_w, seq_len,
+                          use_silu_ ? ActivationKind::SILU : ActivationKind::NONE,
+                          {}, {}, {},
+                          /*gate_nvfp4_ts_addr=*/0,
+                          /*up_nvfp4_ts_addr=*/0,
+                          /*down_nvfp4_ts_addr=*/0,
+                          /*nvfp4_layer_id=*/0,
+                          /*acc32=*/linear_acc32_);
+    }
+    if (action_mode_ && !wall_action_mode_) {
         apply_adaptive_residual_gate(
             addr(0, "residual1"), addr(0, "residual2"), chunk);
     }
@@ -1298,6 +1484,13 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     decls.push_back({"residual1",  res,  1, 8, StorageClass::Temp, 0, nullptr});
     decls.push_back({"input_norm", res,  1, 8, StorageClass::Temp, 0, nullptr});
     decls.push_back({"residual2",  0,    0, 0, StorageClass::Temp, 0, "input_norm"});
+    if (wall_action_mode_) {
+        // Read-only dummy residual for pure mixed-branch AllReduce.  It is
+        // initialized by a graph-recorded memset in layer 0, not here, keeping
+        // declare_buffers deterministic and launch-free.
+        decls.push_back({
+            "zero_resid", res, 1, 8, StorageClass::Persistent, 0, nullptr});
+    }
     decls.push_back({"q",          q,    2, 5, StorageClass::Temp, 0, nullptr});
     decls.push_back({"k",          kv,   2, 4, StorageClass::Temp, 0, nullptr});
     decls.push_back({"v",          kv,   2, 4, StorageClass::Temp, 0, nullptr});
@@ -1717,12 +1910,18 @@ void Qwen3_5Model::set_weights(
     has_qk_norm_ = q_norm_list.size() > 0;
     use_silu_    = use_silu;
     eps_         = eps;
+    action_residual_eps_ = eps_;
 
     layer_is_full_.assign(layer_is_full.begin(), layer_is_full.end());
     has_gdn_ = std::any_of(
         layer_is_full_.begin(), layer_is_full_.end(),
         [](uint8_t is_full) { return !is_full; });
     action_mode_ = false;
+    wall_action_mode_ = false;
+    wall_action_full_mask_.clear();
+    action_step_active_ = false;
+    action_loop_active_ = false;
+    action_num_steps_ = 1;
     adaptive_mod_ref_ = at::Tensor();
     action_prefix_lens_.clear();
     layer_weights_.assign(N, LayerWeights{});
@@ -1866,6 +2065,12 @@ void rpu_qwen3_5_set_fast_replay(int64_t handle, bool enabled) {
 void rpu_qwen3_5_enable_action_mode(int64_t handle) {
     Qwen3_5Registry::get(handle, "rpu_qwen3_5_enable_action_mode")
         ->enable_action_mode();
+}
+
+void rpu_qwen3_5_enable_wall_action_mode(
+    int64_t handle, at::IntArrayRef full_layers) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_enable_wall_action_mode")
+        ->enable_wall_action_mode(full_layers);
 }
 
 void rpu_qwen3_5_set_action_io_weights(

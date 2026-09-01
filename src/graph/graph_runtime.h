@@ -227,6 +227,23 @@ private:
 std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph();
 void invalidate_registered_rpu_kernel_graphs();
 
+// Process-scoped hardware trace admission.  The SDK bakes the enable bit and
+// perf-buffer wiring into build_batch(), so every configuration transition
+// invalidates all registered Graphs before another forward may execute.
+struct RpuHwPerfTraceConfig {
+    bool enabled = false;
+    std::string output_dir;
+    uint64_t max_dumps = 0;
+    uint64_t dump_count = 0;
+};
+
+void rpu_set_hw_perf_trace(
+    bool enabled, const std::string& output_dir, uint64_t max_dumps);
+RpuHwPerfTraceConfig rpu_get_hw_perf_trace();
+bool rpu_hw_perf_trace_enabled();
+std::optional<std::string> rpu_reserve_hw_perf_trace_path(
+    const std::string& graph_label, const char* phase, size_t segment_idx);
+
 // Public allocator bindings route through these process-coordinated helpers.
 // reset_temporary may execute under the current thread's active Graph claim;
 // init/reset_all require an exclusive cleanup claim.

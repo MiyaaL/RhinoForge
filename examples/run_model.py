@@ -68,7 +68,7 @@ _EXECUTION_SUPPORT = {
         "action": ("chunk_size",),
     },
 }
-_RUNNER_KEYS = {"target", "env", "torch_profile"}
+_RUNNER_KEYS = {"target", "env", "torch_profile", "hw_perf"}
 _TORCH_PROFILE_KEYS = {
     "enabled",
     "output",
@@ -76,6 +76,7 @@ _TORCH_PROFILE_KEYS = {
     "profile_memory",
     "with_stack",
 }
+_HW_PERF_KEYS = {"enabled", "output_dir", "max_dumps"}
 _DENIED_ENV = {"RPU_KERNEL_LIB_PATH"}
 _CREDENTIAL_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
 
@@ -163,6 +164,22 @@ def load_config(path: Path) -> dict:
     if not isinstance(output, str) or not output:
         raise ValueError("[runner.torch_profile].output must be a path string")
 
+    hw_perf = runner.get("hw_perf", {})
+    if not isinstance(hw_perf, dict):
+        raise ValueError("[runner.hw_perf] must be a table")
+    _unknown_keys(hw_perf, _HW_PERF_KEYS, "[runner.hw_perf]")
+    _require_bool(hw_perf, "enabled", False)
+    hw_output = hw_perf.get("output_dir", "profiles/rpu_hwperf")
+    if not isinstance(hw_output, str) or not hw_output:
+        raise ValueError("[runner.hw_perf].output_dir must be a path string")
+    max_dumps = hw_perf.get("max_dumps", 32)
+    if (
+        isinstance(max_dumps, bool)
+        or not isinstance(max_dumps, int)
+        or max_dumps <= 0
+    ):
+        raise ValueError("[runner.hw_perf].max_dumps must be a positive integer")
+
     return config
 
 
@@ -193,9 +210,11 @@ def _run_profiled(config: dict, config_path: Path) -> None:
     runner = config["runner"]
     torch_cfg = runner.get("torch_profile", {})
     torch_enabled = torch_cfg.get("enabled", False)
+    hw_cfg = runner.get("hw_perf", {})
+    hw_enabled = hw_cfg.get("enabled", False)
 
     profiler = None
-    if torch_enabled:
+    if torch_enabled or hw_enabled:
         import torch
     if torch_enabled:
         activities = [torch.profiler.ProfilerActivity.CPU]
@@ -211,6 +230,20 @@ def _run_profiled(config: dict, config_path: Path) -> None:
 
     try:
         with contextlib.ExitStack() as stack:
+            if hw_enabled:
+                import rpu_backend  # noqa: F401 - installs the torch.rpu API
+
+                if not hasattr(torch.rpu, "hw_perf_trace"):
+                    raise RuntimeError(
+                        "the installed RhinoForge build lacks r4 hardware "
+                        "trace support; rebuild and reinstall this source tree"
+                    )
+                stack.enter_context(
+                    torch.rpu.hw_perf_trace(
+                        hw_cfg.get("output_dir", "profiles/rpu_hwperf"),
+                        max_dumps=hw_cfg.get("max_dumps", 32),
+                    )
+                )
             if profiler is not None:
                 stack.enter_context(profiler)
             _run_target(runner["target"], config_path, check_config=False)
@@ -220,6 +253,11 @@ def _run_profiled(config: dict, config_path: Path) -> None:
             output.parent.mkdir(parents=True, exist_ok=True)
             profiler.export_chrome_trace(str(output))
             print(f"torch profile: {output}")
+        if hw_enabled:
+            output_dir = Path(
+                hw_cfg.get("output_dir", "profiles/rpu_hwperf")
+            ).expanduser().absolute()
+            print(f"RPU hardware profiles: {output_dir}")
 
 
 def main() -> int:

@@ -151,13 +151,29 @@ The following classes are exported from `rpu_backend.api`:
 | `Pi05Policy` | `from_pretrained(...)` or `from_lerobot_policy(...)`; `to("rpu")`; `prepare_graphs(...)`; `predict_action_chunk(...)`; `select_action(...)` |
 | `RhinoVLAPolicy` | `from_runtime(...)`, `from_factory(...)`, or `from_pretrained(..., runtime_factory=...)`; `prepare_graphs(...)`; `predict(...)`; `predict_action_chunk(...)` |
 | `WallOssPolicy` | `from_checkpoint(...)` or `from_pretrained(...)`; `to("rpu")`; `prepare_graphs(...)`; `infer(...)`; `predict_action_chunk(...)` |
+| `WallQwen35Policy` | `from_checkpoint(...)`; `to("rpu")`; `predict_action_chunk(...)` / `infer(...)`; `close()` |
 | `Lingbot2Policy` | `from_checkpoint(...)`; `to("rpu")`; `prepare_graphs(...)`; `infer(...)`; `predict_action_chunk(...)`; `close()` |
 | `HyEmbodiedPolicy` | `from_checkpoint(...)`; `to("rpu")`; `infer(...)`; `predict_action_chunk(...)`; `close()` |
 
-`WallOssActionOutput`, `Lingbot2ActionOutput`, and
+`WallOssActionOutput`, `WallQwen35ActionOutput`, `Lingbot2ActionOutput`, and
 `HyEmbodiedActionOutput` are the corresponding structured return types. A
 physical-unit action field only means that the configured normalization was
 applied; it is not a robot-safety or coordinate-frame certification.
+
+`WallQwen35Policy` is a Source-only controlled-evaluation API bound to one
+exact locally admitted checkpoint. Its initial envelope is FP16 batch 1 with
+exactly the three canonical cameras, an initial multimodal prefix no longer
+than 384 tokens, Dataset-V2 single-stage BICUBIC image preprocessing, robot ID
+`10070`, normalizer `x2_normal`, state/action masks `[1]*20+[0]*6`, an action
+shape of `[1,32,26]`, and 10 Euler steps.
+`from_checkpoint(..., allow_numeric_blocked_vision=True)` is the required
+explicit opt-in before `.to("rpu")`, because its Qwen3.5 vision path remains
+numeric-blocked. `WallQwen35ActionOutput.actions` is a fresh contiguous CPU
+FP32 tensor in physical units with shape `[1,32,26]`. The runtime owns the cold
+multi-handle setting `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`; an explicitly
+false value is rejected before weight loading and execution must start in a
+fresh process. On-board numerical parity, independent Graph-lifecycle, and
+thresholded task validation remain pending.
 
 `RhinoVLAPolicy` deliberately delegates checkpoint composition and preprocessing
 to an explicit model-repository runtime factory. The runtime must expose the
@@ -326,11 +342,26 @@ Developer diagnostics are also available through `torch.rpu`:
 - `set_debug_export`, `get_debug_export`, `list_debug_tensors`,
   `get_debug_tensor`, and `clear_debug_tensors`;
 - `set_spm_debug`, `get_spm_debug`, and `spm_alloc_dump`.
+- `set_hw_perf_trace(enabled, output_dir, max_dumps)`,
+  `get_hw_perf_trace()`, and the
+  `hw_perf_trace(output_dir, max_dumps=32)` context manager for r4 hardware
+  kernel/DMA Chrome traces.
 
 Debug tensor exports may contain model inputs or intermediate activations.
 Store diagnostics as sensitive application artifacts and do not attach them to
 public issue reports. These APIs do not expose raw Graph register, resource, or
 plan payloads.
+
+Hardware trace configuration is process-global and may change only between
+forwards. Each change invalidates every registered Graph because Rhino Launch
+bakes instrumentation into `build_batch()`. Enable it before the first forward,
+preferably in a fresh process. `get_hw_perf_trace()` returns `enabled`,
+`output_dir`, `max_dumps`, and `dump_count`. Files are timestamped
+`rpu_hwperf_*_<graph>_{build,replay,oneshot}_segN.json`; analyze all segments for a
+Graph, and use replay files for steady-state structure. r4 Release traces retain
+kernel/DMA timing and scheduling metadata but intentionally omit readable
+kernel names, operation types, and raw addresses. They are sensitive
+application diagnostics, not full cache/stall/utilization PMU profiles.
 
 CPU/RPU boundary flushing is enabled by default and should not be disabled in
 normal inference. Chunk size is a per-handle `rpu_execution` setting, not a

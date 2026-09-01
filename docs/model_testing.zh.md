@@ -28,6 +28,7 @@ RhinoForge 提供两层手工执行入口：
 | Pi0.5 减步数/闭环 | 公开策略 API | 无 | Source-only 且验证 pending；不提供公开冒烟声明，也不继承精确 FP16 或量化路径的结论 |
 | Pi0.5 base | 无 | 无 | 仅源码别名；没有独立任务配置或冒烟声明 |
 | Wall-OSS FP16/W8A16/W4A16 | `examples/wall_oss.py` | `wall_oss` | 公开 `wall-x` source-only 接入 |
+| Wall Qwen3.5 精确 flow policy | `examples/wall_qwen35.py`；`run_wall_qwen35_openloop.sh` | 无 | 一个本地准入 checkpoint 的 Source-only 受控评估入口：FP16 batch 1、robot ID `10070`、`x2_normal`、固定 mask `[1]*20+[0]*6`、三个规范 Dataset-V2 相机输入、初始 prefix `<=384`、action `[1,32,26]`、10 个 Euler step；板上数值、Graph 生命周期和任务验证仍为 pending |
 | Hy-Embodied-0.5-VLA FP16/W16 | `examples/hy_embodied.py` | `hy_embodied` | 精确公开 profile 的可运行归一化 action 入口 |
 | Hy-Embodied-0.5-VLA W8/W4 | `examples/hy_embodied.py` | `hy_embodied` | Source-only runtime 转换入口；未绑定公开不可变派生 checkpoint 身份或 hash |
 | RhinoVLA | `examples/rhinovla.py` | `rhinovla` | 集成入口；模型仓库提供运行时工厂 |
@@ -65,7 +66,7 @@ checkpoint 身份，也不会改变 Source-only 状态。
 
 ## 直接示例
 
-所有直接示例都接受 TOML，并可在不加载权重的情况下验证配置：
+所有由统一 runner 管理的直接示例都接受 TOML，并可在不加载权重的情况下验证配置：
 
 ```bash
 python examples/qwen3_vl.py --config examples/configs/qwen3_vl_2b.toml --check-config
@@ -75,6 +76,79 @@ python examples/qwen3_vl.py --config qwen3_vl.local.toml
 复制 `examples/configs/` 下最接近的文件，再设置本地权重和输入路径。权重获取与哈希方式见[模型资产](model_assets.zh.md)。
 
 通用视觉和 VLM 模板使用 `assets/example.ppm`；这是仓库内的极小合成图，只用于让公开入口不依赖私有图片即可运行。数值或任务验证前必须替换为代表性图像。VLA 相机输入仍由调用方提供，因为相机名和预处理属于精确模型 profile。
+
+Wall Qwen3.5 入口是独立的精确 checkpoint CLI，不是 TOML runner 目标。必须提供
+精确三个规范相机和 26 个数值的 state：
+
+```bash
+python examples/wall_qwen35.py \
+  --checkpoint /path/to/exact/checkpoint \
+  --image face_view=/path/to/face.png \
+  --image left_wrist_view=/path/to/left.png \
+  --image right_wrist_view=/path/to/right.png \
+  --instruction "perform the requested action" \
+  --state-json /path/to/state-26.json \
+  --allow-numeric-blocked-vision
+```
+
+该 flag 是 numeric-blocked Qwen3.5 vision 路径的显式受控评估 opt-in，不会提升
+Source-only 状态。可选 state mask 和自由度 mask 必须都精确等于
+`[1]*20+[0]*6`。
+增加 `--check-config` 会检查已提供的命令行路径和输入 shape；不带 request 参数时，
+它只执行仓库约定的无依赖 CLI 探测。两种模式都不验证 checkpoint 准入、RPU 执行、
+数值对齐、Graph 生命周期或任务质量。
+
+对于固定的 put-spoon-to-bowl episode，仓库根目录 wrapper 对齐 Harrix 的数据、prompt、
+分段和 action 解码合同，并且不会向机器人发送命令：
+
+```bash
+bash run_wall_qwen35_openloop.sh --check --no-sudo
+bash run_wall_qwen35_openloop.sh --max-requests 1
+bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile \
+  --torch-profile-output /tmp/qwen35-openloop-ready-profile
+bash run_wall_qwen35_openloop.sh --max-events 1 \
+  --torch-profile-dir /tmp/qwen35-openloop-profile
+bash run_wall_qwen35_openloop.sh --max-events 1 \
+  --hw-perf-output /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
+bash run_wall_qwen35_openloop.sh
+```
+
+板上命令默认使用 `sudo`，并 source `/home/hx/miyaa/work/env.sh`。输出包含与参考脚本
+兼容的 NumPy 文件名、物理单位指标、精确 profile provenance 和 retained-Graph
+诊断。脚本会在 Python 启动前固定多 handle 所需的冷配置
+`RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`。确定性 CPU noise seed schedule 会明确记录
+为不与参考 CUDA RNG stream 逐位一致。
+
+默认 `--torch-profile` 路径是 READY 探测：先在 profiler 外运行第一个准入请求，
+然后只记录同一请求的一次重复执行；`--torch-profile-output DIR` 指定输出目录。
+脚本生成带时间戳和 PID 的 `.trace.json` 以及配套 `.summary.json`，不会覆盖旧文件。
+summary 包含精简的 Torch key averages、warmup/重复执行 action 的精确一致性，以及
+各组件 Graph 生命周期证据。只有 Vision、Base Prefill 和 Action 都证明稳定 retained
+replay 时才会标记 `accepted`；生成 trace 本身不等于 READY。trace 中会直接出现
+`wall_qwen35_preprocess`、`wall_qwen35_vision_text_prefill`、
+`wall_qwen35_action_denoise_loop` 和 `wall_qwen35_action_decoder` 阶段。
+
+与旧参考实现兼容的 `--torch-profile-dir DIR` 模式仍会请求 CPU 与 `PrivateUse1`
+activity，并把安装完成后的每个 action request 分别导出为
+`qwen35_generate_flow_action_batch_*.trace.json.gz`；它保留
+`generate_flow_action_batch` range，并默认记录 shape 和 stack。可选的
+`--torch-profile-record-shapes`、
+`--torch-profile-memory` 和 `--torch-profile-with-stack` 与通用 runner 的诊断开关
+一致。两种模式互斥；profile 目标会在 checkpoint 加载或 RPU 初始化前完成校验；
+profiling 不能与 `--check` 组合，不会覆盖已有 trace 或 summary，且其延迟只可用于
+诊断。trace 可能包含应用 shape、源码路径和算子元数据，必须保存在仓库外。显式的
+`policy.to("rpu")` 安装和 READY 探测 warmup 都不在默认 trace 内。旧逐请求模式的
+首请求中，按设计延迟执行的 Vision handle
+准备仍会记录在第一个 profiled request 中。当前组件缺口和按 release 匹配的厂商接口
+需求见 [Wall Qwen3.5 READY-profile assessment](wall_qwen35_ready_profile_assessment.md)。
+
+`--hw-perf-output DIR` 会在 policy 安装前启用 r4 设备 trace；`--hw-perf` 使用
+`OUTPUT_DIR/rpu_hwperf`。wrapper 会将 `LKN_RPU_FREQ_MHZ` 透传给 sudo（默认
+800 MHz），并用 `--hw-perf-max-dumps` 限制 segment JSON 文件数。文件名包含时间戳、
+PID、BUILD/REPLAY/oneshot 阶段和 segment 序号。在 Perfetto 中主要查看
+`*_replay_segN.json`，并合并推理区域对应的全部 segment。r4 Release runtime 会按设计
+脱敏这些 trace，采集本身也会扰动延迟；最终 latency 必须关闭硬件 trace 后另跑。
 
 Pi0.5 的 `batch_file` 不随仓库分发。请使用与权重匹配的 LeRobot policy 预处理流水线生成它，再用 `torch.save` 保存张量字典。该字典至少包含权重 `image_features` 配置中每个 key 对应的一份 batched image tensor，以及 `observation.language.tokens` 和 `observation.language.attention_mask`；预处理流水线也可保留该配置拥有的其他字段。相机名称、分辨率和 token 长度属于具体配置，应从权重/配置读取，不要照搬其他配置的 shape。
 
@@ -87,7 +161,7 @@ QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 \
   python examples/run_model.py --config examples/configs/qwen3_5_vision_2b.toml
 ```
 
-该取值不豁免已失败的官方真实图数值门，也不启用视频。Qwen3-VL 32B 模板保留显式 opt-in，只用于复现已知 Graph 硬失败；它不代表硬门通过或可运行支持。LingBot2 和 InternVLA/NavDP 模板包含明确的 source-only 或受控评估确认项；删除门禁时必须失败，不能退化为普通配置。G0.5 没有稳定的独立公开 policy 构造器：其示例验证配置后，会明确给出正式模型仓库需要完成的集成步骤并停止。对这些入口执行成功的 `--check-config` 只验证配置结构，不会提升支持状态。
+该取值不豁免已失败的官方真实图数值门，也不启用视频。Wall Qwen3.5 CLI 通过专用 flag 采用同样的 fail-closed 受控评估原则；它不使用统一 runner，也不表示 pending 的板上门禁已经通过。Qwen3-VL 32B 模板保留显式 opt-in，只用于复现已知 Graph 硬失败；它不代表硬门通过或可运行支持。LingBot2 和 InternVLA/NavDP 模板包含明确的 source-only 或受控评估确认项；删除门禁时必须失败，不能退化为普通配置。G0.5 没有稳定的独立公开 policy 构造器：其示例验证配置后，会明确给出正式模型仓库需要完成的集成步骤并停止。对这些入口执行成功的 `--check-config` 只验证配置结构，不会提升支持状态。
 
 ## 完整 TOML runner
 
@@ -120,6 +194,11 @@ output = "profiles/torch.json"
 record_shapes = false
 profile_memory = false
 with_stack = false
+
+[runner.hw_perf]
+enabled = false
+output_dir = "profiles/rpu_hwperf"
+max_dumps = 32
 ```
 
 其余 `[model]`、`[generation]` 或 `[request]` 表由选中的直接示例读取。`[runner.env]` 只接受[运行时配置](runtime_config.zh.md)中记录的变量。TOML 布尔值会转换成可移植的环境值 `1`/`0`。runner 会在导入 `torch` 或 `rpu_backend` 前应用它们；每个进程只运行一个模型/配置。凭据、无关的进程加载器变量和 `RPU_KERNEL_LIB_PATH` 都不能写入 TOML；经批准的 Rhino Launch 库和合并算子资产应在部署环境中设置。“运行时配置”页面的**仅诊断变量清单**同样不能写入 runner；开发者必须在 shell 中逐项显式启用，并在分享前检查产生的本地文件。
@@ -153,6 +232,14 @@ padding_budget = 64
 `record_shapes`、`profile_memory` 和 `with_stack` 默认均为 `false`。只在需要时单独开启：shape、分配事件、栈帧和源码路径会向 trace 增加应用细节。
 
 可使用 Perfetto 或其他 Chrome trace 查看器打开 JSON。profiling 会增加开销，因此延迟测量应使用关闭 profiler 的运行。
+
+## RPU 硬件 profile
+
+只有在 r4 Rhino Launch 构建提供硬件 trace API 时，才设置
+`[runner.hw_perf].enabled = true`。输出目录可以已经存在；每次会话都写入不会覆盖旧文件
+的 `rpu_hwperf_*.json`。配置检查会在不初始化设备的前提下接受此表；真实执行时，如果
+安装的 RhinoForge extension 早于该集成，runner 会明确失败。上下文会在模型 target
+之前进入，并在开启和关闭采集时重置存活的 Graph batch。
 
 ## 调试错误或不稳定运行
 

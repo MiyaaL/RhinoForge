@@ -63,6 +63,7 @@ IMPORT、NATIVE、MODEL 或 BUILD 设置时应使用新进程；不要认为在�
 | `[runner]` | `target` | 选择 `examples/run_model.py --list-targets` 报告的一个 target。 |
 | `[runner.env]` | 本页记录的任意非诊断变量，但不包括 `RPU_KERNEL_LIB_PATH` 和类似凭据的名称 | 在导入 PyTorch 或 RhinoForge 前应用。省略的值继续从 shell 继承。只有在提供完整、已验证配置时才应更改模型配置 selector。 |
 | `[runner.torch_profile]` | `enabled`, `output`, `record_shapes`, `profile_memory`, `with_stack` | 配置覆盖整条命令的 Torch trace。 |
+| `[runner.hw_perf]` | `enabled`, `output_dir`, `max_dumps` | 配置有界的 r4 硬件 kernel/DMA Chrome trace。runner 会在 target 启动前进入上下文，并在退出时重置 Graph cache。 |
 | `[rpu_execution.<stage>]` | `chunk_size`；`prefill` 还接受 `padding_rows` 和 `padding_budget` | 冷态、按 handle 生效的规划。下面的 target 矩阵是 allowlist；不支持的 stage 或字段会在配置校验时失败。 |
 | `[model]`, `[generation]`, `[request]` | 下文列出的 target 特定字段 | 由所选直接 example 消费。路径和输入仍由部署方负责。 |
 | `[runtime]` | 仅限 RhinoVLA factory 定义的字段 | 非空 mapping 会原样传给受信任的外部 runtime factory。RhinoForge 无法安全地发明或校验模型仓库特定的名称。 |
@@ -467,6 +468,12 @@ envelope；如果公共 policy API 有记录，它也会公开 resolved executio
 |---|---|---|---|
 | `torch.rpu.set_profile(True)` | Backend wrapper 和累计 timing counter | 如果只需要 steady-state counter，在 warmup 后启用；测量窗口前调用 `reset_profile_accumulators()` | 轻量 console/counter 诊断；它不是 PyTorch operation trace。 |
 | `torch.profiler.profile(...)` | CPU 和 `PrivateUse1` operation scope，包括 Graph capture/replay range | 只包围要测量的调用；按 benchmark protocol 单独包含 warmup | 生成 operation-level trace/table，并增加 profiler 开销。 |
+| `torch.rpu.hw_perf_trace(output_dir, max_dumps=32)` | 按 Graph segment 记录 r4 设备 kernel/DMA duration，以及 stream/core/channel 调度元数据 | 在新进程第一次 forward 前启用；检查 `*_replay_segN.json` 并合并全部 segment | 生成有界的 Perfetto 兼容 JSON。Release 输出会移除可读 kernel 名、op type 和地址；它不是完整 PMU profiler。 |
+
+`LKN_RPU_FREQ_MHZ` 只控制 r4 硬件 trace 的 cycle-to-time 换算，不会开启采集。
+未设置时 runtime 使用 800 MHz；必须填写板卡实际频率，否则所有 trace duration 都会按
+同一错误比例缩放。硬件采集会扰动执行，因此最终 latency 应在另一个新进程中关闭硬件
+trace 后测量。
 
 ## 清单维护
 

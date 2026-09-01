@@ -14,6 +14,7 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
 | SigLIP | [`patch_siglip_model_for_rpu_all_layers_once`](../../python/rpu_backend/adapters/siglip.py); component status in [Model support](../../docs/model_support.md) | [SigLIP adapter](../../python/rpu_backend/adapters/siglip.py) | Vision-component weight conversion, Graph ownership, and independent output lifetime |
 | Pi0.5 | [`Pi05Policy`](../../docs/api_reference.md#policy-apis) | [Pi0.5 policy loader](../../python/rpu_backend/api/policy.py) and [adapter package](../../python/rpu_backend/adapters/pi05/__init__.py) | Multi-component SPM ownership, per-model Graph caches, and profile-specific quantization |
 | Wall-OSS | [`WallOssPolicy`](../../docs/api_reference.md#policy-apis) | [Wall-OSS facade](../../python/rpu_backend/api/wall_oss.py) and [adapter package](../../python/rpu_backend/adapters/wall_oss/__init__.py) | Multimodal prefix construction, vision/text/action handoff, and exact-profile execution settings |
+| Wall Qwen3.5 exact flow policy | [`WallQwen35Policy`](../../docs/api_reference.md#policy-apis); Source-only controlled status in [Model support](../../docs/model_support.md) | [Wall Qwen3.5 facade](../../python/rpu_backend/api/wall_qwen35.py) and [adapter package](../../python/rpu_backend/adapters/wall_qwen35/__init__.py) | Exact local-checkpoint admission, fail-closed numeric-blocked vision, multimodal prefix/cache ownership, and fixed action-flow semantics |
 | Hy-Embodied | [`HyEmbodiedPolicy`](../../docs/api_reference.md#policy-apis); exact status in [Model support](../../docs/model_support.md) | [Hy-Embodied facade](../../python/rpu_backend/api/hy_embodied.py) and [adapter package](../../python/rpu_backend/adapters/hy_vla/__init__.py) | [Multi-component handoff](../concepts/component-handoff.md), exact input ownership, and normalized-action output contract |
 | Gemma4 | [`Gemma4Adapter`](../../python/rpu_backend/adapters/gemma4/__init__.py); current status in [Model support](../../docs/model_support.md) | [Gemma4 adapter](../../python/rpu_backend/adapters/gemma4/__init__.py) | Mixed decoder geometry, adapter admission, and shared Graph/cache lifecycle |
 | GR00T | [`build_gr00t_vla`](../../python/rpu_backend/adapters/gr00t/runtime.py); current status in [Model support](../../docs/model_support.md) | [GR00T adapter package](../../python/rpu_backend/adapters/gr00t/__init__.py) | Qwen3-VL backbone, component handoff, and profile-owned action Graphs |
@@ -116,6 +117,42 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
   quantization, treat the result as a new runtime profile until semantic and
   task-level equivalence are demonstrated.
   [Runtime profiles](../concepts/runtime-profiles.md)
+
+### Wall Qwen3.5
+
+- Construct the controlled-evaluation policy only through
+  `WallQwen35Policy.from_checkpoint(...)`. The constructor admits the exact
+  local checkpoint profile before installation, and
+  `allow_numeric_blocked_vision=True` is required explicitly before moving the
+  policy to RPU. A failed irreversible installation requires a fresh policy.
+  [Policy API](../../docs/api_reference.md#policy-apis)
+- The initial profile is FP16 batch 1 with exactly `face_view`,
+  `left_wrist_view`, and `right_wrist_view`; its initial multimodal prefix must
+  be `<=384`. Robot ID `10070`, normalizer `x2_normal`, fixed state/action mask
+  `[1]*20+[0]*6`, and Dataset-V2 single-stage BICUBIC image preprocessing are
+  part of the exact input profile. The action flow returns a
+  fresh CPU FP32 physical-action tensor
+  with shape `[1,32,26]` after exactly 10 Euler steps. Neighboring camera,
+  prefix, batch, precision, horizon, action-dimension, and step profiles do not
+  inherit admission.
+  [Wall Qwen3.5 facade](../../python/rpu_backend/api/wall_qwen35.py)
+- Vision, base text, and action own three live fused handles. The policy binds
+  the cold `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1` setting before any handle
+  installation so their persistent generations can coexist; an explicit
+  conflicting value fails before weight loading. Multimodal action RoPE
+  positions remain distinct from the larger physical KV-cache prefix length.
+- This entry remains Source-only controlled evaluation because its Qwen3.5
+  vision path is numeric-blocked and on-board numerical, Graph-lifecycle, and
+  representative task gates are pending. The standalone example is a direct
+  exact-checkpoint CLI, not a full-runner target, and its explicit opt-in does
+  not promote the support status. The repository-root open-loop wrapper has a
+  reference-compatible per-request trace-directory mode plus a focused CPU and
+  `PrivateUse1` READY probe. The focused probe warms one request outside the
+  profiler, records one identical repeat, and writes a lifecycle/key-average
+  summary; a failed component admission remains explicit. These diagnostic
+  artifacts stay outside the repository and do not establish a performance or
+  support claim.
+  [Wall Qwen3.5 example](../../examples/wall_qwen35.py)
 
 ### RhinoVLA
 

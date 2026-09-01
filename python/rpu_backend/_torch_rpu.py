@@ -17,6 +17,7 @@ def configure_torch_rpu(
     """
     from rpu_backend.runtime import control
     from rpu_backend.runtime import debug
+    from rpu_backend.runtime import hw_perf
     from rpu_backend.runtime import log
 
     # FakeTensor/Dynamo probes follow the torch.cuda-shaped device protocol.
@@ -60,6 +61,13 @@ def configure_torch_rpu(
 
     # Most convenience ops are pybind-only; SDPA uses dispatcher registration.
     if cpp_loaded:
+        if (
+            hasattr(cpp_ext, "set_hw_perf_trace")
+            and hasattr(cpp_ext, "get_hw_perf_trace")
+        ):
+            rpu_module.set_hw_perf_trace = hw_perf.set_hw_perf_trace
+            rpu_module.get_hw_perf_trace = hw_perf.get_hw_perf_trace
+            rpu_module.hw_perf_trace = hw_perf.hw_perf_trace
         for name in (
             "rms_norm apply_rotary_pos_emb "
             "insert_vcache insert_kcache "

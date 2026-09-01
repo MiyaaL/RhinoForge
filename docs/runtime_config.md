@@ -70,6 +70,7 @@ The complete runner keeps four configuration layers separate:
 | `[runner]` | `target` | Selects one of the targets reported by `examples/run_model.py --list-targets`. |
 | `[runner.env]` | Any non-diagnostic variable documented on this page except `RPU_KERNEL_LIB_PATH` and credential-like names | Applied before importing PyTorch or RhinoForge. Omitted values remain inherited from the shell. Model-profile selectors should be changed only as a complete validated profile. |
 | `[runner.torch_profile]` | `enabled`, `output`, `record_shapes`, `profile_memory`, `with_stack` | Configures the command-wide Torch trace. |
+| `[runner.hw_perf]` | `enabled`, `output_dir`, `max_dumps` | Configures bounded r4 hardware kernel/DMA Chrome traces. The runner enters the context before the target starts and resets Graph caches when it exits. |
 | `[rpu_execution.<stage>]` | `chunk_size`; `prefill` also accepts `padding_rows` and `padding_budget` | Cold per-handle planning. The target matrix below is an allowlist; unsupported stages or fields fail during configuration validation. |
 | `[model]`, `[generation]`, `[request]` | Target-specific fields listed below | Consumed by the selected direct example. Paths and inputs remain deployment-owned. |
 | `[runtime]` | RhinoVLA factory-defined fields only | A non-empty mapping is passed unchanged to the trusted external runtime factory. RhinoForge cannot safely invent or validate model-repository-specific names. |
@@ -493,6 +494,13 @@ one.
 |---|---|---|---|
 | `torch.rpu.set_profile(True)` | Backend wrapper and accumulated timing counters | After warmup if only steady-state counters are wanted; call `reset_profile_accumulators()` before the measured window | Lightweight console/counter diagnostics; it is not a PyTorch operation trace. |
 | `torch.profiler.profile(...)` | CPU and `PrivateUse1` operation scopes, including Graph capture/replay ranges | Wrap only the calls to measure; include warmup separately according to the benchmark protocol | Produces an operation-level trace/table and adds profiler overhead. |
+| `torch.rpu.hw_perf_trace(output_dir, max_dumps=32)` | r4 device kernel/DMA durations per Graph segment, plus stream/core/channel scheduling metadata | Enable before the first forward in a fresh process; inspect `*_replay_segN.json` and combine all segments | Produces bounded Perfetto-compatible JSON. Release output redacts readable kernel names, op types, and addresses; it is not a full PMU profiler. |
+
+`LKN_RPU_FREQ_MHZ` controls only cycle-to-time conversion in the r4 hardware
+trace. It does not enable collection. If unset, the runtime uses 800 MHz; set it
+to the board's actual frequency or every trace duration will be scaled by the
+same wrong ratio. Hardware collection perturbs execution, so measure final
+latency in a separate fresh process with hardware tracing disabled.
 
 ## Inventory maintenance
 

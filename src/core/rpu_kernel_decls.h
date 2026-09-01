@@ -1251,6 +1251,8 @@ void rpu_qwen3_5_set_chunk_envelope(int64_t handle, int64_t max_kv_len,
 void rpu_qwen3_5_set_linear_acc32(int64_t handle, bool enabled);
 void rpu_qwen3_5_set_fast_replay(int64_t handle, bool enabled);
 void rpu_qwen3_5_enable_action_mode(int64_t handle);
+void rpu_qwen3_5_enable_wall_action_mode(
+    int64_t handle, at::IntArrayRef full_layers);
 void rpu_qwen3_5_set_action_io_weights(
     int64_t handle,
     const at::Tensor& input_w,

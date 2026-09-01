@@ -9,6 +9,9 @@
 #include <ATen/record_function.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cctype>
+#include <ctime>
 #include <cstring>
 #include <cstdlib>
 #include <iomanip>
@@ -19,6 +22,8 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+
+#include <unistd.h>
 
 // =============================================================================
 // 静态成员初始化
@@ -853,6 +858,80 @@ RegisteredGraphRegistry& registered_graph_registry() {
     // shutdown. Entries are weak and therefore do not extend graph lifetime.
     static auto* registry = new RegisteredGraphRegistry();
     return *registry;
+}
+
+struct HwPerfTraceState {
+    std::mutex mutex;
+    std::atomic<bool> enabled{false};
+    RpuHwPerfTraceConfig config;
+    uint64_t generation = 0;
+    std::string session_prefix;
+};
+
+HwPerfTraceState& hw_perf_trace_state() {
+    static auto* state = new HwPerfTraceState();
+    return *state;
+}
+
+std::string make_hw_perf_session_prefix(uint64_t generation) {
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const auto micros = duration_cast<microseconds>(now.time_since_epoch());
+    const std::time_t wall = system_clock::to_time_t(now);
+    std::tm utc{};
+    gmtime_r(&wall, &utc);
+
+    std::ostringstream oss;
+    oss << "rpu_hwperf_" << std::put_time(&utc, "%Y%m%d_%H%M%S")
+        << "_" << std::setfill('0') << std::setw(6)
+        << (micros.count() % 1'000'000)
+        << "_pid" << static_cast<unsigned long>(::getpid())
+        << "_g" << generation;
+    return oss.str();
+}
+
+std::string sanitize_hw_perf_graph_label(const std::string& label) {
+    std::string sanitized;
+    sanitized.reserve(std::min<size_t>(label.size(), 96));
+    for (const unsigned char ch : label) {
+        if (sanitized.size() == 96) break;
+        sanitized.push_back(
+            std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.'
+                ? static_cast<char>(ch) : '_');
+    }
+    return sanitized.empty() || sanitized == "_unlabeled_"
+        ? std::string("graph") : sanitized;
+}
+
+void invalidate_registered_rpu_kernel_graphs_uncoordinated() {
+    std::vector<std::shared_ptr<RpuKernelGraph>> live;
+    auto& registry = registered_graph_registry();
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        std::vector<std::weak_ptr<RpuKernelGraph>> retained;
+        retained.reserve(registry.graphs.size());
+        live.reserve(registry.graphs.size());
+        for (const auto& weak : registry.graphs) {
+            if (auto graph = weak.lock()) {
+                retained.emplace_back(graph);
+                live.emplace_back(std::move(graph));
+            }
+        }
+        registry.graphs.swap(retained);
+    }
+
+    // Public reset is a between-forwards operation. Reject an open scope before
+    // mutating any graph so the operation remains all-or-nothing.
+    for (const auto& graph : live) {
+        const auto state = graph->state();
+        TORCH_CHECK(
+            state != RpuKernelGraph::State::RECORDING &&
+                state != RpuKernelGraph::State::REPLAYING,
+            "reset_graph_cache() cannot run while a graph scope is active");
+    }
+    for (const auto& graph : live) {
+        graph->invalidate();
+    }
 }
 
 }  // namespace
@@ -1853,34 +1932,85 @@ std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph() {
 void invalidate_registered_rpu_kernel_graphs() {
     RpuExecutionCleanupGuard cleanup(
         "reset_graph_cache registered-Graph invalidation");
-    std::vector<std::shared_ptr<RpuKernelGraph>> live;
-    auto& registry = registered_graph_registry();
-    {
-        std::lock_guard<std::mutex> lock(registry.mutex);
-        std::vector<std::weak_ptr<RpuKernelGraph>> retained;
-        retained.reserve(registry.graphs.size());
-        live.reserve(registry.graphs.size());
-        for (const auto& weak : registry.graphs) {
-            if (auto graph = weak.lock()) {
-                retained.emplace_back(graph);
-                live.emplace_back(std::move(graph));
-            }
-        }
-        registry.graphs.swap(retained);
+    invalidate_registered_rpu_kernel_graphs_uncoordinated();
+}
+
+void rpu_set_hw_perf_trace(
+        bool enabled, const std::string& output_dir, uint64_t max_dumps) {
+    TORCH_CHECK(
+        output_dir.find('\0') == std::string::npos,
+        "set_hw_perf_trace: output_dir contains a NUL byte");
+    if (enabled) {
+        TORCH_CHECK(!output_dir.empty(),
+                    "set_hw_perf_trace: output_dir must be non-empty when enabled");
+        TORCH_CHECK(max_dumps > 0,
+                    "set_hw_perf_trace: max_dumps must be greater than zero when enabled");
     }
 
-    // Public reset is a between-forwards operation. Reject an open scope
-    // before mutating any graph so the operation is all-or-nothing.
-    for (const auto& graph : live) {
-        const auto state = graph->state();
-        TORCH_CHECK(
-            state != RpuKernelGraph::State::RECORDING &&
-                state != RpuKernelGraph::State::REPLAYING,
-            "reset_graph_cache() cannot run while a graph scope is active");
+    // Configuration and Graph invalidation share one exclusive process claim.
+    // Enabling cannot race a BUILD that misses instrumentation, and disabling
+    // cannot leave a previously built perf-enabled batch alive.
+    RpuExecutionCleanupGuard cleanup(
+        "set_hw_perf_trace registered-Graph invalidation");
+    auto& state = hw_perf_trace_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::string canonical_dir = enabled ? output_dir : std::string{};
+        const uint64_t canonical_max = enabled ? max_dumps : 0;
+        if (state.config.enabled == enabled &&
+            state.config.output_dir == canonical_dir &&
+            state.config.max_dumps == canonical_max) {
+            return;
+        }
     }
-    for (const auto& graph : live) {
-        graph->invalidate();
+
+    invalidate_registered_rpu_kernel_graphs_uncoordinated();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.config.enabled = enabled;
+        state.config.output_dir = enabled ? output_dir : std::string{};
+        state.config.max_dumps = enabled ? max_dumps : 0;
+        state.config.dump_count = 0;
+        state.enabled.store(enabled, std::memory_order_release);
+        ++state.generation;
+        state.session_prefix = enabled
+            ? make_hw_perf_session_prefix(state.generation) : std::string{};
     }
+}
+
+RpuHwPerfTraceConfig rpu_get_hw_perf_trace() {
+    auto& state = hw_perf_trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.config;
+}
+
+bool rpu_hw_perf_trace_enabled() {
+    auto& state = hw_perf_trace_state();
+    return state.enabled.load(std::memory_order_acquire);
+}
+
+std::optional<std::string> rpu_reserve_hw_perf_trace_path(
+        const std::string& graph_label, const char* phase, size_t segment_idx) {
+    TORCH_INTERNAL_ASSERT(
+        phase != nullptr &&
+            (std::strcmp(phase, "build") == 0 ||
+             std::strcmp(phase, "replay") == 0 ||
+             std::strcmp(phase, "oneshot") == 0),
+        "invalid internal hwperf phase");
+    auto& state = hw_perf_trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.config.enabled ||
+        state.config.dump_count >= state.config.max_dumps) {
+        return std::nullopt;
+    }
+    const uint64_t dump_index = ++state.config.dump_count;
+    std::ostringstream path;
+    path << state.config.output_dir;
+    if (state.config.output_dir.back() != '/') path << '/';
+    path << state.session_prefix << "_" << std::setfill('0') << std::setw(6)
+         << dump_index << "_" << sanitize_hw_perf_graph_label(graph_label)
+         << "_" << phase << "_seg" << segment_idx << ".json";
+    return path.str();
 }
 
 // =============================================================================

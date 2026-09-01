@@ -26,6 +26,18 @@ PYBIND11_MODULE(rpu_backend, m) {
   m.def("set_profile", &rpu_set_profile, "Enable/disable profile timing output");
   m.def("get_debug", &rpu_get_debug, "Get debug logging state");
   m.def("get_profile", &rpu_get_profile, "Get profile timing state");
+  m.def("set_hw_perf_trace", &rpu_set_hw_perf_trace,
+        "Configure r4 hardware kernel/DMA Chrome trace capture and invalidate live Graph batches",
+        py::arg("enabled"), py::arg("output_dir"), py::arg("max_dumps"));
+  m.def("get_hw_perf_trace", []() {
+        const auto config = rpu_get_hw_perf_trace();
+        py::dict result;
+        result["enabled"] = config.enabled;
+        result["output_dir"] = config.output_dir;
+        result["max_dumps"] = config.max_dumps;
+        result["dump_count"] = config.dump_count;
+        return result;
+      }, "Get the current r4 hardware trace configuration and dump count");
 
   // Caching allocator switch
   m.def("set_caching_allocator", &rpu_set_caching_allocator, "Enable/disable caching allocator");

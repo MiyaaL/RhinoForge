@@ -106,6 +106,11 @@ public:
     // G0.5 action expert: all-full-attention Qwen3.5 with host-precomputed
     // AdaLN modulation and sparse per-layer read-only prefix KV.
     void enable_action_mode();
+    // Wall Qwen3.5 action expert: the certified 24-layer profile has six
+    // full-attention mixers and eighteen identity mixers.  The adapter still
+    // installs an all-full/no-GDN weight shell; full_layers is therefore an
+    // explicit, deny-by-default execution contract rather than layer metadata.
+    void enable_wall_action_mode(at::IntArrayRef full_layers);
     void set_action_io_weights(
         const at::Tensor& input_w, const at::Tensor& input_b,
         const at::Tensor& output_w, const at::Tensor& output_b,
@@ -166,6 +171,11 @@ private:
     void apply_raw_residual_gate(
         uint32_t output, uint32_t residual, uint32_t gate,
         int64_t seq_len);
+    void apply_wall_residual_gate(
+        uint32_t output, uint32_t residual, const ChunkInfo& chunk);
+    void emit_wall_mlp_pipeline(
+        const at::Tensor& gate_w, const at::Tensor& up_w,
+        const at::Tensor& down_w, const ChunkInfo& chunk);
     void emit_action_input_projection();
     void emit_action_output_projection();
 
@@ -230,6 +240,8 @@ private:
     bool                       linear_acc32_ = false;          // cold per-handle GEMM accumulation mode
     bool                       has_gdn_ = false;
     bool                       action_mode_ = false;
+    bool                       wall_action_mode_ = false;
+    std::vector<uint8_t>       wall_action_full_mask_;
     bool                       fast_replay_enabled_ = false;
     bool                       fast_replay_active_ = false;
     at::Tensor                 adaptive_mod_ref_;
@@ -252,6 +264,9 @@ private:
     bool                       action_loop_active_ = false;
     int64_t                    action_num_steps_ = 1;
     double                     eps_         = 1e-6;
+    // Wall stores the residual stream as x/4.  Ada/final RMSNorm therefore
+    // uses eps/16; Q/K RMSNorm deliberately continues to use eps_.
+    double                     action_residual_eps_ = 1e-6;
     bool                       has_qk_norm_ = false;
     bool                       use_silu_    = true;
     SdpaKernelType             sdpa_kernel_ = SdpaKernelType::FLASH_ATTN_SPM;

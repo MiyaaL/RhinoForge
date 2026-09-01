@@ -94,6 +94,8 @@ TORCH_LIBRARY(rpu, m) {
   m.def("qwen3_5_set_linear_acc32", TORCH_FN(rpu_qwen3_5_set_linear_acc32));
   m.def("qwen3_5_set_fast_replay", TORCH_FN(rpu_qwen3_5_set_fast_replay));
   m.def("qwen3_5_enable_action_mode", TORCH_FN(rpu_qwen3_5_enable_action_mode));
+  m.def("qwen3_5_enable_wall_action_mode(int handle, int[] full_layers) -> ()",
+        TORCH_FN(rpu_qwen3_5_enable_wall_action_mode));
   m.def("qwen3_5_set_action_io_weights(int handle, Tensor input_w, Tensor input_b, Tensor output_w, Tensor output_b, int action_dim, int action_dim_pad, int action_len) -> ()");
   m.def("qwen3_5_action_forward(int handle, Tensor hidden_states, Tensor adaptive_mod, Tensor[] k_caches, Tensor[] v_caches, int[] prefix_lens) -> Tensor");
   m.def("qwen3_5_action_step_forward(int handle, Tensor action, Tensor action_keep_mask, Tensor(a!) action_out, float delta_t, Tensor adaptive_mod, Tensor[] k_caches, Tensor[] v_caches, int[] prefix_lens, int num_steps) -> Tensor");
