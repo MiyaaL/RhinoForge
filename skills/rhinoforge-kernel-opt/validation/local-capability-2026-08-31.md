@@ -145,6 +145,16 @@ An independent delegated CPU-only signal pass (`cpu-signal-v4`, receipt
 `/tmp/rhinoforge-kernel-opt-cpu-signal-v4.json`, SHA-256
 `a4ed8a5c88df06d6ff8cc9cb31331d3f2d7a299874c478c7ea5824c88b39cf7a`) then
 ran four interleaved candidate/bare timing samples for each requested profile.
+The preceding contract-gated iteration summary
+(`/tmp/rhinoforge-forward-iteration-summary-v2.json`, SHA-256
+`b3138c7b75df31d847a925867d41915be76746135c9d830ef37e8eb9b0398329`) was
+kept as a failed-result record: GEMM exceeded the registered stability CV
+bound, the three fusion profiles exceeded the epilogue-tax CI bound (and also
+stability), and the portable quantized fixture failed its anchor/lifetime
+gates before timing. The v4 run was deliberately a cheaper signal protocol
+with those production stability/tax gates disabled; therefore “eligible” in
+the table below means eligible for this CPU signal only, never release or
+hardware eligibility.
 Every profile passed the correctness, same-dtype, FP32-anchor, input-lifetime,
 output-lifetime, and one-BUILD/stable-REPLAY gates (`BUILD=1`, `REPLAY=9`,
 fixed cache size, invariant true). The measured values below are CPU protocol
