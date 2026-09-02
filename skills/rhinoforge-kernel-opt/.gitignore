@@ -7,6 +7,9 @@ worktrees/
 *.o
 *.ref
 *.bin
+*.s
+*.bc
+*.rci
 *.pt
 *.pth
 *.trace

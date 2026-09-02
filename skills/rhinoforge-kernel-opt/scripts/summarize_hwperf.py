@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Produce a pointer-free public summary from a Chrome trace JSON file."""
+"""Produce a pointer-free public summary from a Chrome trace JSON file.
+
+The normalized RhinoForge schema uses complete ``ph=X`` events.  The official
+Rhino Launch SDK emits ``B``/``E`` duration pairs and ``s``/``f`` barrier-flow
+events; a trusted profiler adapter must balance and normalize those events
+before calling this sanitizer.  This module deliberately does not infer a
+duration from an unpaired native trace.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +17,7 @@ import math
 import os
 import re
 import statistics
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -19,7 +27,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from campaign_common import ValidationError, canonical_json, read_limited_bytes, strict_json_loads
+from campaign_common import (
+    ValidationError,
+    canonical_json,
+    read_limited_bytes,
+    safe_destination,
+    strict_json_loads,
+)
 
 
 MAX_TRACE_BYTES = 128 * 1024 * 1024
@@ -42,7 +56,10 @@ BANDWIDTH_KEYS = (
 def _number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{label} must be numeric")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValidationError(f"{label} must be finite and numeric") from error
     if not math.isfinite(result) or result < 0:
         raise ValidationError(f"{label} must be finite and non-negative")
     return result
@@ -174,7 +191,16 @@ def summarize_trace(
     for index, event in enumerate(events):
         if not isinstance(event, dict):
             raise ValidationError(f"trace event {index} is not an object")
-        if event.get("ph") != "X":
+        phase = event.get("ph")
+        if phase in {"B", "b", "E", "e"}:
+            # The sanitizer must never turn an unbalanced native duration
+            # stream into an apparently empty/valid result.  Native Launch
+            # input belongs to normalize_hwperf.py first; normalized traces
+            # contain only complete X events (plus optional s/f flows).
+            raise ValidationError(
+                "native B/E trace must be normalized before sanitization"
+            )
+        if phase != "X":
             ignored_event_count += 1
             continue
         if event_category is not None and event.get("cat") != event_category:
@@ -283,16 +309,70 @@ def summarize_trace(
     return result
 
 
-def _atomic_write(path: Path, data: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and (path.is_symlink() or not path.is_file()):
-        raise ValidationError("summary output must be a regular non-symlink file")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+def _file_state(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
     )
-    temporary = Path(temporary_name)
+
+
+def _optional_lstat(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise ValidationError("summary output cannot be inspected") from error
+
+
+def _atomic_write(
+    path: Path,
+    data: str,
+    *,
+    forbidden: tuple[Path | str | None, ...] = (),
+) -> None:
+    """Atomically write a summary without following output/input symlinks.
+
+    The destination and its parent are checked before and after creating the
+    temporary file.  A parent or existing destination replacement during the
+    write is treated as an integrity failure rather than silently redirecting
+    the result.
+    """
+
+    destination = safe_destination(
+        path,
+        forbidden=forbidden,
+        create_parent=True,
+        label="summary output",
+    )
+    parent = destination.parent
+    try:
+        parent_before = os.lstat(parent)
+    except (OSError, ValueError) as error:
+        raise ValidationError("summary output parent is unavailable") from error
+    if not stat.S_ISDIR(parent_before.st_mode):
+        raise ValidationError("summary output parent must be a regular directory")
+    destination_before = _optional_lstat(destination)
+    if destination_before is not None and (
+        stat.S_ISLNK(destination_before.st_mode)
+        or not stat.S_ISREG(destination_before.st_mode)
+    ):
+        raise ValidationError("summary output must be a regular non-symlink file")
+
     try:
         encoded = data.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValidationError("summary output is not UTF-8") from error
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    descriptor_state = os.fstat(descriptor)
+    try:
+        os.fchmod(descriptor, 0o644)
         view = memoryview(encoded)
         while view:
             written = os.write(descriptor, view)
@@ -300,15 +380,54 @@ def _atomic_write(path: Path, data: str) -> None:
                 raise OSError("short summary write")
             view = view[written:]
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, path)
+
+        # Verify the directory and destination identities immediately before
+        # replacement.  Directory mtime changes when the temporary is created,
+        # so identity is intentionally limited to device/inode for the parent.
+        try:
+            parent_after = os.lstat(parent)
+        except (OSError, ValueError) as error:
+            raise ValidationError("summary output parent changed") from error
+        if (parent_after.st_dev, parent_after.st_ino) != (
+            parent_before.st_dev,
+            parent_before.st_ino,
+        ) or stat.S_ISLNK(parent_after.st_mode) or not stat.S_ISDIR(parent_after.st_mode):
+            raise ValidationError("summary output parent changed")
+
+        destination_after = _optional_lstat(destination)
+        if destination_before is None:
+            if destination_after is not None:
+                raise ValidationError("summary output changed during write")
+        elif destination_after is None or _file_state(destination_after) != _file_state(
+            destination_before
+        ):
+            raise ValidationError("summary output changed during write")
+        temporary_after = _optional_lstat(temporary)
+        if temporary_after is None or not stat.S_ISREG(temporary_after.st_mode) or (
+            temporary_after.st_dev,
+            temporary_after.st_ino,
+        ) != (descriptor_state.st_dev, descriptor_state.st_ino):
+            raise ValidationError("summary temporary changed during write")
+
+        os.replace(temporary, destination)
+        try:
+            directory_descriptor = os.open(
+                parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+        except OSError:
+            directory_descriptor = -1
+        if directory_descriptor >= 0:
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary.exists():
+        try:
             temporary.unlink()
+        except OSError:
+            pass
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -351,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         encoded = canonical_json(summary) + "\n"
         if args.output:
-            _atomic_write(args.output, encoded)
+            _atomic_write(args.output, encoded, forbidden=(args.trace,))
         else:
             sys.stdout.write(encoded)
     except (OSError, ValidationError) as error:

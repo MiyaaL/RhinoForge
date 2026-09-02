@@ -15,6 +15,16 @@ keep the invariant true. The fusion itself is identified only by the resolved
 `runtime.fused_kernel`, which must exactly equal one entry in
 `runtime.required_kernels`; never infer fusion from name tokens or substrings.
 
+For source-level candidates, apply the device/loop/address rules in
+[the hxcc manual overlay](hxcc-manual.md) and attach an assembly inspection
+receipt. In particular, a pragma is not a hardware-loop result until the
+generated assembly has no unapproved `wjump`; Repeat consumes two loop levels,
+and async unit boundaries require matching fences. Count the DDR→SPM→VLM
+traffic implied by the exact residency contract when building a roofline.
+Use the [optimization playbook](hxcc-optimization-playbook.md) to order tile,
+pipeline, address, and epilogue hypotheses without changing more than one
+primary axis per candidate.
+
 ## GEMM
 
 Default mathematical contract:

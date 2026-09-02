@@ -1,6 +1,6 @@
 ---
 name: rhinoforge-kernel-opt
-description: Run evidence-driven optimization campaigns for RhinoForge RPU operators and fused inference paths. Use for exact-shape RPU kernel benchmarking, profiling, fusion-cost analysis, Graph/SPM/DMA tuning, candidate iteration, or theoretical/empirical roofline work. Do not use for CUDA-only kernels or for claiming a new device kernel when the authorized RPU compiler, source interface, board access, or release-matched operator asset is unavailable.
+description: Run evidence-driven optimization campaigns for RhinoForge RPU operators and fused inference paths, including the local hxcc/Rhino Launch toolchain and assembly-level loop/fusion checks. Use for exact-shape RPU kernel benchmarking, profiling, fusion-cost analysis, Graph/SPM/DMA tuning, candidate iteration, or theoretical/empirical roofline work. Do not use for CUDA-only kernels or for claiming a new device kernel when the authorized RPU compiler, source interface, board access, or release-matched operator asset is unavailable.
 ---
 
 # Optimize RhinoForge RPU kernels
@@ -28,6 +28,14 @@ hardware gates explicitly pending.
 Read [the RPU runtime boundary](references/runtime-boundary.md) for every mode.
 For Campaign or Resume, also read
 [the measurement and promotion protocol](references/benchmark-protocol.md).
+When a candidate compiles `.rc`, inspects generated RPU assembly, or uses
+Rhino Launch, also read the
+[hxcc/RPU developer-guide overlay](references/hxcc-manual.md).  It is a
+version-pinned, clean-room digest of the local official manual and does not
+widen RhinoForge's release profile.
+For the concrete tile → loop → pipeline → epilogue sequence and the five
+requested operation profiles, use the
+[hxcc optimization playbook](references/hxcc-optimization-playbook.md).
 Before any release selection, read
 [the external release-attestation boundary](references/release-attestation.md).
 Read [the kernel-family contracts](references/kernel-profiles.md) only for the
@@ -117,11 +125,15 @@ Record all of the following before the first candidate:
    payload/scale tree plus bit-exact and stride-exact encoded leaves; a single
    `allclose` is not sufficient.
 4. RhinoForge commit, PyTorch, board/driver, Rhino Launch, operator asset and
-   kernel-manifest identities, compiler identity, environment, and hashes.
+   kernel-manifest identities, plus the hxcc wrapper *and* underlying
+   `clang-17`/`rpuas`/`rhino_gen_oplib` identities, target triple, `-O2`, and
+   `-m r1` chain evidence.
 5. Correctness, lifecycle, performance, stability, roofline, and fusion-tax
    gates, including the commands that produce each receipt.
 6. The candidate-owned paths and evaluator-owned read-only paths.
-7. The external release authority's public key, signer identity, policy/build
+7. Assembly/source inspection receipts (hardware-loop/Repeat/`lpaddr`/fence/
+   `wjump` counts) and the selected Launch-vs-Graph lifecycle.
+8. The external release authority's public key, signer identity, policy/build
    hashes, and challenge/sequence owner. Never store its private key here.
 
 Use an approved contract rather than filling missing facts with nearby model
@@ -148,6 +160,86 @@ The preflight parses only the adjacent public `.kernels` manifest. It may stream
 the opaque `.ref` into SHA-256 to verify its frozen identity, but must never
 parse, decode, log, rewrite, split, or copy the asset.
 
+For an authorized `.rc` campaign, run the board-free compiler identity and
+end-to-end smoke before `preflight.py`:
+
+```bash
+python scripts/hxcc_preflight.py \
+  --compiler "${RHINOFORGE_HXCC:-hxcc}" \
+  --expected-host-arch "${RHINOFORGE_HXCC_HOST_ARCH:-aarch64}" \
+  --manual-archive "${RHINOFORGE_HXCC_ARCHIVE:-/home/hx/miyaa/work/src/hxcc.zip}" \
+  --output <workspace>/runs/hxcc-preflight.json
+```
+
+The helper discovers and hashes the wrapper, `clang-17`, `rpuas`, and
+`rhino_gen_oplib`, checks an input-bearing `-###` chain for
+`rpu-rhino-rpuhsa`, `-O2`, and `-m r1`, then compiles a tiny source in a private
+directory. The discovery command above intentionally leaves the expected
+hashes unset; before Campaign mode, rerun it with the four frozen values from
+the reviewed receipt, for example:
+
+```bash
+python scripts/hxcc_preflight.py --compiler /home/hx/.local/bin/hxcc \
+  --expected-host-arch aarch64 \
+  --expected-wrapper-sha256 <wrapper-sha256> \
+  --expected-clang-sha256 <clang-17-sha256> \
+  --expected-rpuas-sha256 <rpuas-sha256> \
+  --expected-oplib-sha256 <rhino_gen_oplib-sha256> \
+  --manual-archive /home/hx/miyaa/work/src/hxcc.zip \
+  --output <workspace>/runs/hxcc-preflight.json
+```
+
+Attach that pinned receipt (and an external authorization for any device
+program) to the contract. A wrapper version, an empty-input target query, or
+`rpuas --help` is not sufficient evidence. Keep generated `.o`, `.ref`, and
+assembly outside `candidate_root`.
+
+After an isolated compile with `-save-temps`, inspect the assembly before
+timing. For a regular GEMM hypothesis use, for example:
+
+```bash
+python scripts/inspect_rpu_asm.py <private-build>/kernel-host-rpu-rhino-rpuhsa.s \
+  --source <private-build>/kernel.rc --require-entry --strict --require-vmat --require-lpaddr \
+  --require-async-fence --output <workspace>/runs/asm-inspection.json
+```
+
+`--strict` rejects compiler-lowered software `wjump` loops; the report counts
+hardware loops, Repeat forms, `lpaddr`, VLD/VST/VMAT/VALU/VSFU, fences, tail
+strobes, and loop depth without publishing source or assembly. Relax a gate
+only when the contract explicitly admits a tail/software-loop path and record
+the reason. Source pragmas alone never prove a hardware loop. The source
+checks are a conservative lexical review, not a complete C++/ABI parser;
+successful inspection must still be paired with the hxcc compile and the
+release-matched header/asset review.
+
+For a standalone Rhino Launch profile, normalize its native `B`/`E` plus
+barrier `s`/`f` trace before the sanitizer:
+
+```bash
+python scripts/normalize_hwperf.py <private>/native.json <private>/normalized.json \
+  --producer-sha256 <frozen-adapter-sha256> --require-frequency \
+  --report <workspace>/runs/hwperf.json
+```
+
+The converter fails on unpaired boundaries/flows, strips private event args,
+and leaves `device_program_events_exhaustive=false` unless the verifier (or an
+external authority) explicitly supplies `--assert-exhaustive`. It is a format
+adapter, not a launch-count or manifest attestation; feed its normalized file
+to `summarize_hwperf.py` and retain the native hash/frequency/barrier evidence.
+
+The native field mapping is fixed: `cat=Compute` becomes
+`rpu_device_program`, `cat=DMA` becomes `rpu_dma` (DMA is not a device-program
+launch), and DMA `args.size_bytes` becomes normalized `args.bytes`. The native
+`bandwidth_GBps` value is rounded for display; derive the normalized byte rate
+from the exact byte count and `duration_us`. In the Launch SDK, the
+`Kernel_t` constructor name or `set_name()` is the exact Compute Chrome name;
+an omitted name falls back to `kernel_<batch_idx>`. `set_op_type()` only emits a
+coarse `args.op_type` label and cannot satisfy an exact manifest-name gate.
+Use `--require-frequency` only to require positive frequency metadata. Use
+`--assert-exhaustive` only after an independent verifier has checked every
+device launch and active-stream barrier; balanced pairs or metadata counters
+alone are not exhaustive coverage evidence.
+
 ## Establish evidence baselines
 
 Use a clean process and immutable inputs to establish:
@@ -159,6 +251,14 @@ Use a clean process and immutable inputs to establish:
 - output independence under two same-shape calls with different values; and
 - empirical compute, memory-bandwidth, and launch/Graph floors when an
   authoritative theoretical specification is unavailable.
+
+For the official Launch path, label the lifecycle explicitly: a
+`rhino_launch_batch` (`build_batch` → mutable patch/sync → `enqueu_batch`) is
+not the same evidence as a RhinoForge PyTorch Graph BUILD/REPLAY. Record queue
+core/warp/broadcast settings and DMA barriers separately. Use the manual's
+tuning order—`f16v16`/short address arithmetic, valid hardware loops, eligible
+Repeat, async pipeline plus matching fences, then `lpaddr`/tile search—before
+attributing a gain to an epilogue.
 
 Do not time a candidate that fails a hard semantic or lifecycle gate. Separate
 startup/build latency from steady REPLAY latency, and profile in a different
@@ -205,10 +305,11 @@ For a local full diagnostic, use the launcher below. It invokes the frozen
 runner must create the new path named by
 `RHINOFORGE_PROFILE_TRACE_OUTPUT`; caller-supplied trace files are forbidden.
 It reads the frozen `RHINOFORGE_PROFILE_EVENT_CATEGORY` and
-`RHINOFORGE_PROFILE_PRODUCER_SHA256`. The raw trace object contains exact
-`rhinoforgeTrace` metadata whose producer hash equals the contract-pinned
-`commands.benchmark_adapter_sha256`; see the measurement protocol for its
-schema. The contract requires trace schema `rhinoforge-rpu-chrome-v1` and
+`RHINOFORGE_PROFILE_PRODUCER_SHA256`. The trace object handed to the sanitizer
+contains exact `rhinoforgeTrace` metadata whose producer hash equals the
+contract-pinned `commands.benchmark_adapter_sha256`; a native SDK B/E trace
+must be normalized first (its root carries `otherData`, not this metadata).
+See the measurement protocol for the normalized schema. The contract requires trace schema `rhinoforge-rpu-chrome-v1` and
 category `rpu_device_program`; the frozen producer must put every and only RPU
 device-program launch in that category. Other-category complete events are
 host scopes and are ignored, except an allowlisted device-program name outside
@@ -306,6 +407,12 @@ The handoff identifies passed, failed, and unrun gates separately. Keep raw
 activation/weight dumps, opaque assets, device addresses, and full hardware
 traces out of Git; retain only reviewed summaries, hashes, and approved local
 artifact locations.
+
+For a source-level handoff, include the hxcc archive/toolchain hashes, isolated
+compile receipt, assembly inspection receipt, and any guide-vs-SDK ABI
+discrepancy (for example parameter-register or `LoopOutInfo` types). A clean
+compile of a corrected sample is not permission to ship a new `.ref`; the
+release owner must still integrate and sign the exact asset.
 
 For design/source audits, see [provenance](references/provenance.md). The
 checked-in [local capability receipt](validation/local-capability-2026-08-31.md)

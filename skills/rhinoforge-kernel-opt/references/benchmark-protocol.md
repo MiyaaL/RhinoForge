@@ -223,8 +223,43 @@ reads `RHINOFORGE_PROFILE_EVENT_CATEGORY` and
 `RHINOFORGE_PROFILE_PRODUCER_SHA256`. The latter equals the contract-pinned
 `commands.benchmark_adapter_sha256`. Both frozen runtime fields are exact:
 `runtime.trace_schema = "rhinoforge-rpu-chrome-v1"` and
-`runtime.trace_event_category = "rpu_device_program"`. The raw root must be an
-object with `traceEvents` and this exact four-field metadata object:
+`runtime.trace_event_category = "rpu_device_program"`. The normalized trace
+handed to the sanitizer (not the native SDK input) must have an object root
+with `traceEvents` and this exact four-field metadata object:
+
+The standalone Rhino Launch SDK is a native producer of `B`/`E` duration
+events and `s`/`f` barrier-flow events (and its raw buffer is paired 8-byte
+START/END records), whereas the schema below is the skill's normalized
+`ph=X` representation. The normalized file is still private diagnostic input
+(names and timestamps are retained until sanitization); only
+`summarize_hwperf.py` produces the pointer-free public summary. A trusted
+profiler adapter may perform that normalization in a private directory, but it
+must verify balanced pairs, stream barriers, and `LKN_RPU_FREQ_MHZ` (default
+800 MHz), bind the raw hash, and never fabricate a launch or silently drop a
+trailing stream. The native format is therefore an input format, not a reason
+to weaken the one-launch manifest gate.
+
+The supplied converter is intentionally explicit about the trust boundary:
+
+```bash
+python scripts/normalize_hwperf.py native.json normalized.json \
+  --producer-sha256 <frozen-adapter-sha256> --report hwperf-normalization.json
+```
+
+Without `--assert-exhaustive`, its metadata keeps
+`device_program_events_exhaustive=false` and the release sanitizer will reject
+it. Only a verifier/authority that has checked coverage may set that flag.
+
+For the native Launch input, normalize `Compute` to
+`rpu_device_program` and `DMA` to `rpu_dma`; map DMA `args.size_bytes` to
+`args.bytes`, and derive an exact byte-rate field from `bytes / duration_us`
+because native `bandwidth_GBps` is rounded. The SDK's `Kernel_t` constructor
+name and `set_name()` value are the exact Compute event name (otherwise the
+default is `kernel_<batch_idx>`); `set_op_type()` is only a coarse argument
+label, never a manifest identity. `--require-frequency` checks positive
+frequency metadata only. `--assert-exhaustive` is permitted only with an
+independent launch/barrier coverage audit, not merely balanced B/E or s/f pairs
+or `batch_events`/`records_captured` counters.
 
 ```json
 {

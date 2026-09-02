@@ -38,6 +38,14 @@ the exact compiler binary SHA-256, a sanitized compile receipt, and a hashed
 authorization receipt naming the release owner; then obtain an approved asset
 integration path before a device-kernel campaign.
 
+For the local hxcc release, read
+[the hxcc manual overlay](hxcc-manual.md) and run
+`scripts/hxcc_preflight.py`. It checks the wrapper plus the underlying
+`clang-17`/`rpuas`/`rhino_gen_oplib` chain, an input-bearing target triple, and
+an isolated `-O2` compile. The compiler and Launch header versions are part of
+the ABI: the guide's 0..61 compiler parameter range and the shipped SDK's
+0..67 comment must be resolved together, never guessed.
+
 ## Hardware and memory contract
 
 The current public runtime targets eight cores. Each core has 8 MiB SPM;
@@ -53,6 +61,10 @@ form into the other to satisfy a call.
 
 Immediate multi-core launches require host-parameter broadcast. Prefer the
 framework batch/Graph path, which owns broadcast and per-node core selection.
+When using the standalone Launch SDK, distinguish its
+`build_batch`/`sync_mutable_params`/`enqueu_batch` replay from a RhinoForge
+PyTorch Graph replay. Record SPM stride/alignment, DMA size/channel limits,
+stream barriers, core IDs, and queue warp/broadcast settings in the evidence.
 
 ## Graph, DMA, and output lifetime
 
@@ -106,11 +118,27 @@ Populate the reference field only with the supported public command:
 python scripts/hash_reference_tree.py <reference_root>
 ```
 
-The one-call raw trace also carries exact `rhinoforgeTrace` metadata: schema,
-device category, `device_program_events_exhaustive=true`, and a producer hash
-equal to `commands.benchmark_adapter_sha256`. This binds the declaration to the
-frozen producer; it does not replace the external authority's independent audit
-that device launches are exhaustively categorized.
+The one-call trace handed to the sanitizer carries exact `rhinoforgeTrace`
+metadata: schema, device category, `device_program_events_exhaustive=true`, and
+a producer hash equal to `commands.benchmark_adapter_sha256`. A native SDK
+B/E input instead carries `otherData` and must first pass the trusted
+normalizer. The normalized declaration binds the artifact to the frozen
+producer; it does not replace the external authority's independent audit that
+device launches are exhaustively categorized.
+
+The Launch SDK's native Chrome dump uses `B`/`E` duration records and `s`/`f`
+barrier-flow records, with cycle conversion controlled by
+`LKN_RPU_FREQ_MHZ` (800 MHz by default). A trusted adapter may normalize this
+to the skill's `ph=X` schema before sanitization, but must retain raw hash,
+frequency, pairing, and stream/barrier completeness. Never reject or count a
+launch solely because the native trace is not already `ph=X`.
+The adapter maps native `Compute`/`DMA` to `rpu_device_program`/`rpu_dma` and
+maps DMA `size_bytes` to `bytes`; its normalized byte rate must use exact bytes
+and duration rather than the rounded native `bandwidth_GBps`. The SDK
+`Kernel_t` name (`set_name()` included) is the exact Compute event name,
+whereas `set_op_type()` is only a coarse label and cannot identify a manifest
+kernel. Require positive frequency metadata with `--require-frequency`; reserve
+`--assert-exhaustive` for an independent launch-and-barrier coverage audit.
 
 Contract-driven signal and full verdicts run only on `rpu` and bound every
 child with finite timeouts. The included CPU adapter is for board-free protocol
@@ -129,7 +157,8 @@ runtime manifest, not to source presence. The inspected runtime-v1.0.0-r4
 manifest does not name MXFP8 or a GEMM+epilogue device kernel. Re-run preflight
 for every runtime update; do not inherit this snapshot into a new asset.
 
-On 2026-08-31, `/home/hx/.local/bin/hxcc` version `1.0+0a6ba7e4` completed a
-reproducible offline compile of an existing local `.rc` sample outside this
-repository. Its licensing and production asset integration authority were not
-established. This is compile-only evidence, not a support or performance claim.
+In the 2026-09-02 revalidated snapshot, `/home/hx/.local/bin/hxcc` version
+`1.0+0a6ba7e4` completed a reproducible offline compile of an existing local
+`.rc` sample outside this repository. Its licensing and production asset
+integration authority were not established. This is compile-only evidence, not
+a support or performance claim.

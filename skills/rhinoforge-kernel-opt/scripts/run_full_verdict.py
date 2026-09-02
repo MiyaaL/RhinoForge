@@ -211,7 +211,12 @@ def _trace_execution(
         ],
     )
     encoded_summary = canonical_json(summary) + "\n"
-    _atomic_write_summary(summary_path, encoded_summary)
+    # Never replace the raw trace while materializing its sanitized summary;
+    # this also rejects hard-link aliases through the sanitizer's checked
+    # destination path.
+    _atomic_write_summary(
+        summary_path, encoded_summary, forbidden=(raw_trace_path,)
+    )
     input_trace_hash = summary.get("trace_sha256")
     if (
         not isinstance(input_trace_hash, str)

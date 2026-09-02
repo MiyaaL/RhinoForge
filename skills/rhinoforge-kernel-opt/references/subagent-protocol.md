@@ -56,6 +56,14 @@ Every optimizer receives:
 - maximum attempts for the direction; and
 - the command that records a completed attempt.
 
+When the hypothesis changes device source, the assignment also names the
+manual-pinned hxcc receipt and the private assembly-inspection output. The
+optimizer may compile in parallel in its own temporary directory, but may not
+change the shared compiler, SDK headers, opaque REF, manifest, or profiler
+parser. A board runner still serializes Launch/Graph measurements; an
+assembly `wjump` or ABI mismatch is reported as a failed hypothesis rather
+than hidden by a host-only speedup.
+
 Do not ask an optimizer to "make GEMM fast" without exact shapes and semantics.
 One assignment changes one primary axis so its outcome is interpretable.
 

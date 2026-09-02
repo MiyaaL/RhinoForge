@@ -94,14 +94,25 @@ class ValidationError(ValueError):
 def content_tree_sha256(root: Path) -> str:
     """Hash a bounded, symlink-free reference tree while excluding Git metadata."""
 
-    supplied = root.expanduser()
-    if supplied.is_symlink():
+    # Inspect the lexical spelling before resolving it.  Otherwise an
+    # intermediate alias (or ``alias/../tree``) can be silently accepted even
+    # though the contract promises a symlink-free reference root.
+    lexical = _lexical_absolute(root)
+    _reject_symlink_components(lexical, "reference_root")
+    supplied = _absolute_path(lexical)
+    try:
+        supplied_info = os.lstat(supplied)
+    except (OSError, ValueError) as error:
+        raise ValidationError("reference_root is unavailable") from error
+    if stat.S_ISLNK(supplied_info.st_mode):
         raise ValidationError("reference_root must not be a symbolic link")
     try:
         resolved = supplied.resolve(strict=True)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise ValidationError("reference_root is unavailable") from error
-    if not resolved.is_dir():
+    if resolved != supplied:
+        raise ValidationError("reference_root must not contain symbolic links")
+    if not stat.S_ISDIR(supplied_info.st_mode):
         raise ValidationError("reference_root must be a directory")
 
     digest = hashlib.sha256(b"rhinoforge-reference-tree-v1\0")
@@ -165,6 +176,7 @@ def content_tree_sha256(root: Path) -> str:
                     observed_bytes != opened.st_size
                     or final_stat.st_size != opened.st_size
                     or final_stat.st_mtime_ns != opened.st_mtime_ns
+                    or final_stat.st_ctime_ns != opened.st_ctime_ns
                 ):
                     raise ValidationError("reference tree file changed while hashing")
             finally:
@@ -200,19 +212,277 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_limited_bytes(path: Path, maximum: int, label: str) -> bytes:
+def _lexical_absolute(path: Path | str) -> Path:
+    """Return an absolute path without collapsing ``..`` or following links.
+
+    ``Path.resolve``/``realpath`` are deliberately not used for the initial
+    check.  A spelling such as ``link/../input.json`` must not hide a symbolic
+    link component before we have had a chance to reject it.
+    """
+
+    value = os.path.expanduser(os.fspath(path))
+    if not os.path.isabs(value):
+        value = os.path.join(os.getcwd(), value)
+    return Path(value)
+
+
+def _reject_symlink_components(path: Path, label: str = "path") -> None:
+    """Reject symbolic links in every existing lexical path component.
+
+    Missing components are allowed here so callers can distinguish an
+    ordinary unavailable input from a destination whose parent should be
+    created.  Once a component is missing, however, a later ``..`` is rejected
+    rather than silently normalizing a pathname whose kernel resolution would
+    differ from the reviewed spelling.
+    """
+
+    current = Path(path.anchor) if path.anchor else Path(".")
+    parts = path.parts[1:] if path.anchor else path.parts
+    missing = False
+    for part in parts:
+        if part in {"", "."}:
+            continue
+        if missing:
+            if part == "..":
+                raise ValidationError(f"{label} contains an unavailable component")
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            missing = True
+            continue
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"{label} cannot be inspected") from error
+        if stat.S_ISLNK(info.st_mode):
+            raise ValidationError(f"{label} must not contain symbolic links")
+
+
+def _absolute_path(path: Path | str) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Identity used to detect replacement or same-size mutation races."""
+
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _ensure_regular_directory(path: Path, label: str) -> os.stat_result:
+    """Create missing destination directories one component at a time.
+
+    ``Path.mkdir(parents=True)`` follows a directory symlink if one is placed
+    between the preflight check and the call.  Walking and checking each
+    component keeps output writes inside the reviewed lexical directory.
+    """
+
+    current = Path(path.anchor) if path.anchor else Path(".")
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current, 0o755)
+            except FileExistsError:
+                # Re-stat below; a concurrent creator may have installed a
+                # symlink instead of the expected directory.
+                pass
+            except (OSError, ValueError) as error:
+                raise ValidationError(f"{label} is unavailable") from error
+            try:
+                info = os.lstat(current)
+            except (OSError, ValueError) as error:
+                raise ValidationError(f"{label} is unavailable") from error
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"{label} cannot be inspected") from error
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValidationError(f"{label} must be a regular directory")
     try:
-        stat_result = path.stat()
-    except OSError as error:
+        return os.lstat(path)
+    except (OSError, ValueError) as error:
         raise ValidationError(f"{label} is unavailable") from error
-    if not path.is_file():
-        raise ValidationError(f"{label} is not a regular file")
-    if stat_result.st_size > maximum:
-        raise ValidationError(f"{label} exceeds {maximum} bytes")
+
+
+def safe_destination(
+    path: Path | str,
+    *,
+    forbidden: Iterable[Path | str | None] = (),
+    create_parent: bool = True,
+    label: str = "output",
+) -> Path:
+    """Validate a destination without following lexical symlink components.
+
+    The returned path is absolute and may name a new regular file.  Existing
+    destinations must already be regular non-symlink files.  ``forbidden`` is
+    useful for preventing an atomic output from replacing its input (including
+    a hard link to that input).
+    """
+
+    lexical = _lexical_absolute(path)
+    _reject_symlink_components(lexical, label)
+    destination = _absolute_path(lexical)
     try:
-        return path.read_bytes()
-    except OSError as error:
+        destination_info = os.lstat(destination)
+    except FileNotFoundError:
+        destination_info = None
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"{label} cannot be inspected") from error
+    if destination_info is not None and (
+        stat.S_ISLNK(destination_info.st_mode)
+        or not stat.S_ISREG(destination_info.st_mode)
+    ):
+        raise ValidationError(f"{label} must be a regular non-symlink file")
+
+    parent = destination.parent
+    if create_parent:
+        _ensure_regular_directory(parent, f"{label} parent")
+    else:
+        try:
+            parent_info = os.lstat(parent)
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"{label} parent is unavailable") from error
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            raise ValidationError(f"{label} parent must be a regular directory")
+
+    # Re-check the final entry after parent creation and compare forbidden
+    # paths lexically before consulting samefile.  This also catches a broken
+    # symlink, which ``Path.exists`` would otherwise hide.
+    try:
+        current_info = os.lstat(destination)
+    except FileNotFoundError:
+        current_info = None
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"{label} cannot be inspected") from error
+    if current_info is not None and (
+        stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISREG(current_info.st_mode)
+    ):
+        raise ValidationError(f"{label} must be a regular non-symlink file")
+
+    for candidate in forbidden:
+        if candidate is None:
+            continue
+        candidate_lexical = _lexical_absolute(candidate)
+        _reject_symlink_components(candidate_lexical, f"{label} input")
+        candidate_abs = _absolute_path(candidate_lexical)
+        if destination == candidate_abs:
+            raise ValidationError(f"{label} must differ from input files")
+        try:
+            if os.path.exists(destination) and os.path.exists(candidate_abs):
+                if os.path.samefile(destination, candidate_abs):
+                    raise ValidationError(f"{label} must differ from input files")
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"{label} identity cannot be checked") from error
+    return destination
+
+
+def read_limited_bytes(path: Path, maximum: int, label: str) -> bytes:
+    """Read a bounded regular file through a checked descriptor.
+
+    A simple ``Path.stat`` followed by ``read_bytes`` is vulnerable to both
+    symlink traversal and same-size replacement/mutation races.  Keep the
+    descriptor open while reading and compare device/inode/size/timestamps
+    before and after the read.  On Linux, also compare the descriptor's procfs
+    target with the reviewed real path to catch an intermediate directory swap.
+    """
+
+    if type(maximum) is not int or maximum < 0:
+        raise ValidationError(f"{label} byte limit must be a non-negative integer")
+    lexical = _lexical_absolute(path)
+    _reject_symlink_components(lexical, label)
+    absolute = _absolute_path(lexical)
+    try:
+        initial = os.lstat(absolute)
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"{label} is unavailable") from error
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
+        raise ValidationError(f"{label} is not a regular file")
+    if initial.st_size > maximum:
+        raise ValidationError(f"{label} exceeds {maximum} bytes")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(absolute, flags)
+    except (OSError, ValueError) as error:
         raise ValidationError(f"{label} is unreadable") from error
+    initial_identity = _stat_identity(initial)
+    try:
+        try:
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            raise ValidationError(f"{label} is unreadable") from error
+        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != initial_identity:
+            raise ValidationError(f"{label} changed before reading")
+
+        proc_fd = f"/proc/self/fd/{descriptor}"
+        try:
+            fd_target = os.path.realpath(proc_fd)
+            expected_target = os.path.realpath(os.fspath(absolute))
+        except (OSError, ValueError):
+            fd_target = expected_target = ""
+        if fd_target and fd_target != expected_target:
+            raise ValidationError(f"{label} path changed before reading")
+
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            try:
+                block = os.read(descriptor, min(1024 * 1024, maximum - observed + 1))
+            except OSError as error:
+                raise ValidationError(f"{label} is unreadable") from error
+            if not block:
+                break
+            observed += len(block)
+            if observed > maximum:
+                raise ValidationError(f"{label} exceeds {maximum} bytes")
+            chunks.append(block)
+        try:
+            final = os.fstat(descriptor)
+        except OSError as error:
+            raise ValidationError(f"{label} is unreadable") from error
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or observed != opened.st_size
+            or _stat_identity(final) != initial_identity
+        ):
+            raise ValidationError(f"{label} changed while reading")
+        # Re-check the pathname itself after the descriptor read.  A caller
+        # may replace/unlink the path after ``os.open`` while the old inode
+        # remains readable; accepting that stale inode would violate the
+        # path-bound identity expected by contract and trace inputs.
+        _reject_symlink_components(lexical, label)
+        try:
+            current_path = os.lstat(absolute)
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"{label} changed while reading") from error
+        if (
+            stat.S_ISLNK(current_path.st_mode)
+            or not stat.S_ISREG(current_path.st_mode)
+            or _stat_identity(current_path) != initial_identity
+        ):
+            raise ValidationError(f"{label} path changed while reading")
+        return b"".join(chunks)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def load_json(path: Path, maximum: int = MAX_RESULT_BYTES) -> Any:
@@ -494,7 +764,10 @@ def _integer(value: Any, label: str, *, minimum: int = 0) -> int:
 def _number(value: Any, label: str, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{label} must be numeric")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValidationError(f"{label} must be finite and numeric") from error
     if not math.isfinite(result) or (positive and result <= 0) or (
         not positive and result < 0
     ):
@@ -506,7 +779,10 @@ def _number(value: Any, label: str, *, positive: bool = False) -> float:
 def _finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{label} must be numeric")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValidationError(f"{label} must be finite and numeric") from error
     if not math.isfinite(result):
         raise ValidationError(f"{label} must be finite")
     return result

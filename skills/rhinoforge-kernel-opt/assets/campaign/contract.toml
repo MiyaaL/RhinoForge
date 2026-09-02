@@ -45,6 +45,11 @@ requires_device_compiler = false
 device_compiler_authorized = false
 device_compiler_id = "not-required"
 device_compiler_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# When requires_device_compiler=true, compiler_authorization_receipt should be
+# an externally authorized hxcc_preflight.json.  That receipt must pin the
+# wrapper and the underlying clang-17/rpuas/rhino_gen_oplib hashes, host wheel
+# architecture, input-bearing target triple rpu-rhino-rpuhsa, -O2, and -m r1.
+# Keep this draft sentinel until the release owner reviews that evidence.
 compiler_authorization_receipt = "not-required"
 compiler_authorization_receipt_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 asset_release_owner = "not-required"

@@ -1,4 +1,4 @@
 interface:
   display_name: "RhinoForge Kernel Optimizer"
   short_description: "Evidence-driven RPU kernel optimization campaigns"
-  default_prompt: "Use $rhinoforge-kernel-opt to assess and optimize this exact RPU kernel profile."
+  default_prompt: "Use $rhinoforge-kernel-opt to assess and optimize this exact RPU kernel profile; run the pinned hxcc/assembly checks when device source is involved."

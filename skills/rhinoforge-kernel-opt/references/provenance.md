@@ -4,6 +4,13 @@ This skill was independently written for RhinoForge. It uses public workflow
 ideas from the following frozen sources; it does not vendor their repositories,
 prompts, evaluator, or generated artifacts.
 
+The local hxcc manual/toolchain archive was used as a separate implementation
+reference (archive SHA-256
+`21e8ed1462620b84e4d818eae24b8507817cbeca1a39105cf3863d8c8287eeba`).  Its
+distilled constraints and artifact hashes live in
+[hxcc-manual.md](hxcc-manual.md); the wheel, SDK binaries, `.ref` files, and
+raw traces are deliberately not copied into this skill.
+
 ## Kernel Design Agents
 
 - Repository: <https://github.com/mit-han-lab/kernel-design-agents>
