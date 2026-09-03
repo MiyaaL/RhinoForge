@@ -106,13 +106,13 @@ the stated FP16 tolerance).  Held-out seeds/shapes, FP32-anchor, Graph
 lifecycle, release ABI admission, and signed asset integration are still
 pending; passing this table does not promote a candidate.
 
-| candidate | strict assembly summary | parity | native Compute | host replay p50 |
+| candidate | strict assembly summary | parity | native Compute | host replay p50 (trace off) |
 |---|---|---:|---:|---:|
 | column GEMM, `RF_N_TILES=2,RF_GROUPS=4` | 110 instructions, 6 HW loops, 4 Repeat, 4 `lpaddr`, 0 `wjump`, VLD/VMAT/VST fences `2/1/1` | 0 mismatches, max-abs `2.179146e-4` | `35.179 us` (`3.815 TOPS`) | `68.270 us` |
 | column GEMM, `RF_N_TILES=4,RF_GROUPS=2` | 108 instructions, 6 HW loops, 4 Repeat, 4 `lpaddr`, 0 `wjump`, VLD/VMAT/VST fences `2/1/1` | 0 mismatches, max-abs `2.179146e-4` | `35.305 us` (`3.802 TOPS`) | `67.348 us` |
 | row GEMM, default | 95 instructions, 5 HW loops, 4 Repeat, 4 `lpaddr`, 0 `wjump`, VLD/VMAT/VST fences `2/1/1` | 0 mismatches, max-abs `1.949668e-4` | `33.987 us` (`3.949 TOPS`) | `67.616 us` |
 | production-shaped GEMM+SiLU-mul, 8-core broadcast | 150 instructions, 12 HW loops, 7 Repeat, 9 `lpaddr`, 0 `wjump`, 7 fences | 0 mismatches, max-abs `3.05772e-5` | `70.441 us` | `99.848 us` |
-| production-shaped GEMM+residual-add, 8-core broadcast | 132 instructions, 7 HW loops, 5 Repeat, 6 `lpaddr`, 0 `wjump`, 4 fences | 0 mismatches, max-abs `6.10352e-5` | `35.680 us` (`3.761 TOPS`) | `70.848 us` |
+| production-shaped GEMM+residual-add, 8-core broadcast | 132 instructions, 7 HW loops, 5 Repeat, 6 `lpaddr`, 0 `wjump`, 4 fences | 0 mismatches, max-abs `6.10352e-5` | `35.680 us` (`3.761 TOPS`) | `69.116 us` |
 | residual-add microkernel | 72 instructions, 6 HW loops, 5 Repeat, 6 `lpaddr`, 0 `wjump` | 0 mismatches, max-abs `3.05176e-5` | `446 cycles = 0.557 us` | `37.193 us` |
 | SiLU-mul microkernel | 103 instructions, 11 HW loops, 9 Repeat, 9 `lpaddr`, 0 `wjump` | 0 mismatches, max-abs `2.86102e-6` | `574 cycles = 0.718 us` | `37.308 us` |
 
@@ -122,6 +122,11 @@ two cycles (`~0.45%`) at that resolution.  This does not establish zero cost
 for a Wall-sized residual or a different rounding/layout contract.  The SiLU
 row keeps both projections in VLM and therefore does not spill an intermediate,
 but its three VALU stages are real device work.
+
+The residual host p50 above comes from a separate trace-off replay (40 timed
+iterations).  Its trace-on run was `70.848 us` p50 and is intentionally not
+used for the cross-candidate host comparison; the native `35.680 us` value is
+from that separate trace capture.
 
 The column N=4 result is a compile-flag variant of the same source.  It fits
 the documented all-`f16v16` VLM budget for this fixed shape, but it has not
