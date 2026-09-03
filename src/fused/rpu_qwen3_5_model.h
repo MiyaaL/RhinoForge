@@ -156,7 +156,8 @@ private:
     void launch_linear(
         uint32_t input, const at::Tensor& weight, uint32_t output,
         int64_t m, int64_t n, int64_t k, int partition, int num_cores,
-        uint32_t bias_spm_addr = 0);
+        uint32_t bias_spm_addr = 0,
+        int tile_override_n = 0);
     // Full-attention layer emission (Qwen3 causal-decoder path; mirrors
     // CausalDecoderModel::build_layer_subgraph minus M-RoPE / DeepStack).
     void build_full_attention(int layer_idx, const ChunkInfo& chunk);

@@ -831,7 +831,8 @@ void rpu_launch_linear_spm_to_spm_kernel(
     int64_t K,                         // in_features
     int partition,                     // 0=row, 1=col
     int num_cores,                     // number of cores for partition (attn_tp or tp)
-    uint32_t bias_spm_addr)
+    uint32_t bias_spm_addr,
+    int tile_override_n)
 {
   if (M == 1) {
     validate_m1_partitioned_bias(bias_spm_addr, partition, num_cores);
@@ -856,6 +857,19 @@ void rpu_launch_linear_spm_to_spm_kernel(
   auto tile = rpu_pl_tiling::select_tile_acc32(
       static_cast<int>(local_m), static_cast<int>(local_n),
       static_cast<int>(local_k), /*is_fp16=*/true);
+  if (tile_override_n != 0) {
+    // The operator asset publishes exactly seven FP16 ACC32 variants. Keep
+    // this escape hatch deliberately narrow: unsupported values fail before
+    // Graph BUILD instead of silently falling back to a different kernel.
+    TORCH_CHECK(tile_override_n == 128 || tile_override_n == 112 ||
+                    tile_override_n == 96 || tile_override_n == 80 ||
+                    tile_override_n == 64 || tile_override_n == 48 ||
+                    tile_override_n == 32,
+                "FP16 ACC32 tile override must be one of 128,112,96,80,64,48,32; got ",
+                tile_override_n);
+    tile = rpu_pl_tiling::TilePick{
+        tile_override_n, rpu_pl_tiling::mtile_fp16_acc32(tile_override_n)};
+  }
   const size_t n_per_wrp = static_cast<size_t>(tile.n_tile);
   const size_t m_per_wrp = static_cast<size_t>(tile.m_tile);
   const KernelId kernel_id =
@@ -955,7 +969,8 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
     const at::Tensor &scale,           // quant scale (fp16 W8/INT4 or fp8 NVFP4)
     uint32_t nvfp4_tensor_scale_spm_addr,
     uint16_t nvfp4_layer_id,
-    bool force_acc32)
+    bool force_acc32,
+    int tile_override_n)
 {
   const bool register_census_active =
       RpuKernelGraph::active().kernel_register_census_active();
@@ -983,7 +998,7 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
     // FP16 ACC32 selects the accumulator-specific auto-tile table.
     rpu_launch_linear_spm_to_spm_kernel(
         input_spm_addr, weight, output_spm_addr,
-        M, N, K, partition, num_cores, bias_spm_addr);
+        M, N, K, partition, num_cores, bias_spm_addr, tile_override_n);
     return;
   }
 

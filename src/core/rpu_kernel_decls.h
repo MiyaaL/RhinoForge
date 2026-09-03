@@ -992,7 +992,11 @@ void rpu_launch_linear_spm_to_spm_kernel(
     int64_t M, int64_t N, int64_t K,
     int partition,
     int num_cores = 8,
-    uint32_t bias_spm_addr = 0);
+    uint32_t bias_spm_addr = 0,
+    // Diagnostic-only Wall tile search. Zero keeps the generated shape table.
+    // Non-zero values are accepted only for the release-admitted FP16 ACC32
+    // n-tile family; callers must gate this before the first Graph BUILD.
+    int tile_override_n = 0);
 
 void rpu_launch_linear_spm_to_spm_acc16_kernel(
     uint32_t input_spm_addr,
@@ -1010,7 +1014,9 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
     uint16_t nvfp4_layer_id = 0,
     // Per-handle precision override; the process-wide RPU_LINEAR_ACC32 switch
     // remains authoritative for callers that leave this false.
-    bool force_acc32 = false);
+    bool force_acc32 = false,
+    // Diagnostic-only Wall tile search; zero preserves generated auto-tiling.
+    int tile_override_n = 0);
 
 // =============================================================================
 // SPM Binary Kernels

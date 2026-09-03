@@ -29,6 +29,7 @@
 #include <c10/util/Half.h>
 #include <algorithm>
 #include <cmath>     // std::sqrt (GDN qk_scale)
+#include <cstdio>    // std::sscanf (diagnostic tile-search spec)
 #include <cstdlib>   // std::getenv (diagnostic Wall decode fusion toggle)
 #include <cstring>   // std::strcmp
 
@@ -64,6 +65,40 @@ bool wall_action_prereduce_residual_gate_enabled() {
     const char* value =
         std::getenv("RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE");
     return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+// Cold, Wall-only tile-search hook. The generated Linear planner remains the
+// default; a spec such as ``32x256x1024=128`` selects one release-admitted
+// FP16 ACC32 n-tile for exactly that local shape. Multiple entries may be
+// separated by ',' or ';'. This is intentionally parsed while graph nodes are
+// being built and is never consulted by non-Wall models.
+int wall_action_gemm_tile_override(int64_t m, int64_t n, int64_t k) {
+    const char* spec = std::getenv("RPU_QWEN35_WALL_GEMM_TILES");
+    if (spec == nullptr || *spec == '\0') return 0;
+    const char* cursor = spec;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ',' ||
+               *cursor == ';') {
+            ++cursor;
+        }
+        if (*cursor == '\0') break;
+        long long em = 0, en = 0, ek = 0;
+        int et = 0, consumed = 0;
+        const int fields = std::sscanf(
+            cursor, "%lldx%lldx%lld=%d%n", &em, &en, &ek, &et, &consumed);
+        TORCH_CHECK(fields == 4 && consumed > 0,
+                    "RPU_QWEN35_WALL_GEMM_TILES expects MxNxK=n entries, got ",
+                    spec);
+        if (em == m && en == n && ek == k) return et;
+        cursor += consumed;
+        if (*cursor != '\0' && *cursor != ',' && *cursor != ';' &&
+            *cursor != ' ' && *cursor != '\t') {
+            TORCH_CHECK(false,
+                        "RPU_QWEN35_WALL_GEMM_TILES has an invalid separator in ",
+                        spec);
+        }
+    }
+    return 0;
 }
 
 // PARTIAL_MROPE encodes DDR bases in 256-byte units (addr >> 8). The caching
@@ -679,12 +714,20 @@ void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
 void Qwen3_5Model::launch_linear(
     uint32_t input, const at::Tensor& weight, uint32_t output,
     int64_t m, int64_t n, int64_t k, int partition, int num_cores,
-    uint32_t bias_spm_addr) {
+    uint32_t bias_spm_addr, int tile_override_n) {
+    if (wall_action_mode_) {
+        // Explicit argument is useful for future in-tree experiments; the
+        // environment remains the only way to opt into a cold tile search.
+        const int env_tile = wall_action_gemm_tile_override(
+            m, partition == 0 ? n : n / num_cores,
+            partition == 0 ? k / num_cores : k);
+        if (env_tile != 0) tile_override_n = env_tile;
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         input, weight, output, m, n, k, partition, num_cores,
         bias_spm_addr, /*scale=*/{},
         /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
-        /*force_acc32=*/linear_acc32_);
+        /*force_acc32=*/linear_acc32_, tile_override_n);
 }
 
 void Qwen3_5Model::load_adaptive_mod_row(int64_t row) {
