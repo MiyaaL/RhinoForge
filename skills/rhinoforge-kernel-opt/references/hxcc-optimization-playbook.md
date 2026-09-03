@@ -154,9 +154,13 @@ unfrozen same-dtype parity review and remain diagnostic-only.  `silu_mul` is
 the only arm with the smaller observed numerical drift, but its FP16 rounding
 change also needs a profile-owned threshold and a larger repeated set before
 promotion.  A separate profiler-only 1/0 run reported
-`wall_qwen35_action_decoder` CPU 123.148 ms for ten steps versus the old 0/0
-diagnostic 128.537 ms; profiler/device time is diagnostic (`device_time=0`)
-and not a board latency gate.
+`wall_qwen35_action_denoise_loop` CPU 188.291 ms for ten steps (the
+screenshot/150 ms scope), while the nested `wall_qwen35_action_decoder`
+wrapper was 123.148 ms; the old 0/0 loop/decoder diagnostics were 210.173 /
+128.537 ms.  The complete repeated `predict_action_chunk` scope was 439.531
+ms.  Profiler/device time is diagnostic (`device_time=0`) and none of these
+values passes a board latency gate; the 150 ms denoise-loop goal remains
+unmet.
 
 A third candidate was explored in an isolated worktree,
 `RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1`, targets the capture-external prefix DMA
