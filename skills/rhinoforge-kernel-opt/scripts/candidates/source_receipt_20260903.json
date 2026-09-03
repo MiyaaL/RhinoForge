@@ -1,0 +1,109 @@
+{
+  "schema": "rhinoforge-source-receipt-v1",
+  "date": "2026-09-03",
+  "source_root": "/home/hx/miyaa/work/src/rhinoforge-rpu-candidates-20260903",
+  "release_baseline": {
+    "asset_sha256": "538f49e256814d104c98aa8df4b6d3af3d89b2d636a1fe22b0731df3ce39ac99",
+    "role": "comparison-only"
+  },
+  "toolchain": {
+    "compiler": "/home/hx/.local/bin/hxcc",
+    "version": "1.0+0a6ba7e4",
+    "wrapper_sha256": "b887d6686bf588ca173e965ff8ff97c6dda4e12b89717aca11eeab7eda5096cc",
+    "clang17_sha256": "999f36abd6b7920e9705c827ad12aa41dca9af5735df033e8af773a4d28ad72d",
+    "rpuas_sha256": "b43aeb9cedc19cdd80210ff59d5805aa3f1eec99f8e597a14c564abc94703e02",
+    "rhino_gen_oplib_sha256": "e502faf9958561a9e8240244ca3079d9d87db04f8a10a37d2345d0c891d70d45",
+    "manual_archive_sha256": "21e8ed1462620b84e4d818eae24b8507817cbeca1a39105cf3863d8c8287eeba",
+    "target": "rpu-rhino-rpuhsa",
+    "optimization": "-O2",
+    "oplib_mode": "-m r1"
+  },
+  "board": {
+    "frequency_hz": 800000000,
+    "user_supplied_fp16_peak_tops": 100,
+    "user_supplied_bandwidth_gbps": 140,
+    "lease_command": "python skills/rhinoforge-kernel-opt/scripts/board_lease.py -- <command>",
+    "evidence_roots": [
+      "/tmp/rhinoforge-source-sweep-VexSpG",
+      "/tmp/rhinoforge-source-fusion-receipts-20260903"
+    ]
+  },
+  "common_compile": {
+    "cwd": "private-build-dir",
+    "source_basename_preserved": true,
+    "generated_files_private": true,
+    "argv_prefix": ["/home/hx/.local/bin/hxcc", "-O2", "-save-temps"]
+  },
+  "common_asm_gate": [
+    "python skills/rhinoforge-kernel-opt/scripts/inspect_rpu_asm.py",
+    "--require-entry",
+    "--strict",
+    "--require-vmat",
+    "--require-lpaddr",
+    "--require-async-fence"
+  ],
+  "candidates": [
+    {
+      "id": "gemm_col_n2_g4",
+      "source": "gemm_ddr_col_m32n256k1024_acc32.rc",
+      "source_sha256": "4b69efe03c87fe5dc2d47b08c076ac17a8633e94f44248550dd006def6d9bebf",
+      "compile_argv": ["/home/hx/.local/bin/hxcc", "-O2", "-save-temps", "-DRF_N_TILES=2", "-DRF_GROUPS=4", "-c", "gemm_ddr_col_m32n256k1024_acc32.rc"],
+      "assembly_sha256": "66957a35b054c08cba47de0e8850734f8ebc109f153c2b7d5c6d6296b5a0bdd3",
+      "load_artifact_sha256": "c6de4e4e8c05bd30b8f3c7b8b8aaf2f7133954a4c5d1a4773cc152a89f06f216",
+      "strict_counts": {"instructions": 110, "hardware_loops": 6, "repeat": 4, "lpaddr": 4, "wjump": 0, "fences": 4},
+      "board": {"parity_mismatches": 0, "max_abs": 0.0002179146, "native_compute_us": 35.179, "host_p50_us": 68.270, "host_p95_us": 75.540, "iterations": 40, "trace_off_for_timing": true},
+      "release_admitted": false
+    },
+    {
+      "id": "gemm_col_n4_g2",
+      "source": "gemm_ddr_col_m32n256k1024_acc32.rc",
+      "source_sha256": "4b69efe03c87fe5dc2d47b08c076ac17a8633e94f44248550dd006def6d9bebf",
+      "compile_argv": ["/home/hx/.local/bin/hxcc", "-O2", "-save-temps", "-DRF_N_TILES=4", "-DRF_GROUPS=2", "-c", "gemm_ddr_col_m32n256k1024_acc32.rc"],
+      "assembly_sha256": "3c314ef4c01316fc84ab32d0181cb4db59cf8de306c0865966a7e60ff9acee4c",
+      "load_artifact_sha256": "90ac9db6cbc77cb371082cbbd9a253fc914bad41a7257b0975fdbc892303d1c8",
+      "strict_counts": {"instructions": 108, "hardware_loops": 6, "repeat": 4, "lpaddr": 4, "wjump": 0, "fences": 4},
+      "board": {"parity_mismatches": 0, "max_abs": 0.0002179146, "native_compute_us": 35.305, "host_p50_us": 67.348, "host_p95_us": 69.078, "iterations": 40, "trace_off_for_timing": true},
+      "release_admitted": false
+    },
+    {
+      "id": "gemm_row_default",
+      "source": "gemm_ddr_row_m32n1024k256_acc32.rc",
+      "source_sha256": "cbc6aba08b99604086c162b1b6a6a70a68450d2faeac821d4faf3dba1daf3218",
+      "compile_argv": ["/home/hx/.local/bin/hxcc", "-O2", "-save-temps", "-c", "gemm_ddr_row_m32n1024k256_acc32.rc"],
+      "assembly_sha256": "cda2039d1a0c901ea5590db5452d6b6c55d5d0cfa9a779668868b98ffc1d1f39",
+      "load_artifact_sha256": "60a995da6b1bf5675dbfb70ebb7d25f42eac3336c86b1b42641e551beb95bd74",
+      "strict_counts": {"instructions": 95, "hardware_loops": 5, "repeat": 4, "lpaddr": 4, "wjump": 0, "fences": 4},
+      "board": {"parity_mismatches": 0, "max_abs": 0.0001949668, "native_compute_us": 33.987, "host_p50_us": 67.616, "host_p95_us": 69.155, "iterations": 40, "trace_off_for_timing": true},
+      "release_admitted": false
+    },
+    {
+      "id": "gemm_silu_mul_production_shaped",
+      "source": "gemm_silu_mul_ddr_col_m32n256k1024_acc32.rc",
+      "source_sha256": "ee81bdd0be1523d9f36729fed6ced23d140fd1af5cca859724af02e5c18050f8",
+      "compile_argv": ["/home/hx/.local/bin/hxcc", "-O2", "-save-temps", "-c", "gemm_silu_mul_ddr_col_m32n256k1024_acc32.rc"],
+      "assembly_sha256": "1acaabb05e693b9f10b4cf00d77e0795a3c2bad102b63fe95682ab75e330ddec",
+      "load_artifact_sha256": "772143f0956245b5e824367d48206c78ae39c654b1cb348b4ac89f55c6132d2f",
+      "strict_counts": {"instructions": 150, "hardware_loops": 12, "repeat": 7, "lpaddr": 9, "wjump": 0, "fences": 7},
+      "verifier_source": "scripts/candidates/full_silu_ddr_multicore_runner.cpp",
+      "verifier_sha256": "d79639b31e5945940ebb8a0472bf07802cf125d9cd92cf81708a5ee2729a63bf",
+      "board": {"parity_mismatches": 0, "max_abs": 0.0000305772, "native_compute_us": 70.441, "host_p50_us": 99.848, "host_p95_us": 101.886, "iterations": 40, "trace_off_for_timing": true, "cores": 8, "broadcast": true},
+      "release_admitted": false,
+      "abi_note": "regs6/7 are a second DDR_large weight, not the release bias slot"
+    },
+    {
+      "id": "gemm_residual_add_production_shaped",
+      "source": "gemm_residual_add_ddr_col_m32n256k1024_acc32.rc",
+      "source_sha256": "44e2e1eaf06b78460e79c601f1b8221a2b8eacb875dbc4dca41af343d7dd4616",
+      "compile_argv": ["/home/hx/.local/bin/hxcc", "-O2", "-save-temps", "-c", "gemm_residual_add_ddr_col_m32n256k1024_acc32.rc"],
+      "assembly_sha256": "67f29b4f2443c610f666c099349eaadaa2c197024cb37e5a8635e712a5c0ae24",
+      "load_artifact_sha256": "df4a305f4f8fafed8b8b365680a5e54c8473b3ab5a1054257e87544755b584e2",
+      "strict_counts": {"instructions": 132, "hardware_loops": 7, "repeat": 5, "lpaddr": 6, "wjump": 0, "fences": 4},
+      "verifier_source_sha256": "c458f415f24e3775babcbee2e1b3704b8150cb426928efd4c225e6391d5e9919",
+      "board": {"parity_mismatches": 0, "max_abs": 0.0000610352, "native_compute_us": 35.680, "host_p50_us": 69.116, "host_p95_us": 87.193, "iterations": 40, "trace_off_for_timing": true, "cores": 8, "broadcast": true},
+      "release_admitted": false,
+      "abi_note": "regs6/7 are a residual LocalSPM slice, not the release bias slot"
+    }
+  ],
+  "promotion_status": "diagnostic-only",
+  "pending_gates": ["held-out seeds/shapes", "FP32 anchor", "Graph lifecycle", "release ABI/manifest admission", "signed asset integration"]
+}

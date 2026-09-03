@@ -24,6 +24,9 @@ For every source-derived run, preserve the source SHA-256, hxcc/toolchain
 receipt, assembly inspection JSON, parity result, and native/host timing in an
 external evidence store.  Keep `.ref`, `.o`, `.s`, `.bc`, `.rci`, traces,
 weights, and addresses outside Git.
+The checked-in machine-readable pointer-free receipt is
+`source_receipt_20260903.json`; its evidence-root paths are local diagnostic
+locations, not release artifacts.
 
 ## Source inventory
 
