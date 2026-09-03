@@ -260,6 +260,15 @@ tuning order—`f16v16`/short address arithmetic, valid hardware loops, eligible
 Repeat, async pipeline plus matching fences, then `lpaddr`/tile search—before
 attributing a gain to an epilogue.
 
+For GEMM-backed paths, a release-manifest tile is a legal starting point, not a
+proof of optimality. Freeze each exact `(M, N_local, K, dtype, accumulation,
+core/warp)` shape, enumerate every manifest or compiler-authorized tile that
+can implement it, and compare generated loop/Repeat/fence evidence before
+choosing a winner. Keep GEMM tile/loop search independent from epilogue or
+attention-fusion search so a tile change cannot be misattributed to fusion;
+promote only a clean candidate whose same-dtype parity and Graph lifecycle
+remain unchanged.
+
 Do not time a candidate that fails a hard semantic or lifecycle gate. Separate
 startup/build latency from steady REPLAY latency, and profile in a different
 process from the reported latency run.
