@@ -136,6 +136,28 @@ Because the gate is applied before cross-core FP16 reduction, its rounding
 order is intentionally treated as a separate candidate and requires the same
 parity gate; it is not enabled by default.
 
+The paired r4 campaign (same six-request flow-noise artifact, fresh process per
+arm) measured the following action Graph census and steady whole-request
+times:
+
+| Arm | Action kernels/call | Steady request mean | Output parity vs 0/0 |
+|---|---:|---:|---|
+| 0/0 baseline | 429 | 455.860 ms | reference |
+| `FUSED_SILU_MUL=1` | 405 | 433.797 ms | max_abs 0.002417; mean_abs 3.42e-5 |
+| `PREREDUCE_RESIDUAL_GATE=1` | 398 | 432.922 ms | max_abs 0.009149; mean_abs 1.62e-4 |
+| both arms | 374 | 450.859 ms | max_abs 0.006916; mean_abs 1.50e-4 |
+
+All four arms kept one action Graph entry, 59 replays, zero recaptures, and
+`cache_invariant_ok=true`; all outputs were finite and used the same
+`flow_noise` SHA-256 `078e697b…`.  The pre-reduce arms fail the current
+unfrozen same-dtype parity review and remain diagnostic-only.  `silu_mul` is
+the only arm with the smaller observed numerical drift, but its FP16 rounding
+change also needs a profile-owned threshold and a larger repeated set before
+promotion.  A separate profiler-only 1/0 run reported
+`wall_qwen35_action_decoder` CPU 123.148 ms for ten steps versus the old 0/0
+diagnostic 128.537 ms; profiler/device time is diagnostic (`device_time=0`)
+and not a board latency gate.
+
 A third diagnostic arm,
 `RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1`, targets the capture-external prefix DMA
 boundary rather than the device Graph.  The fixed Wall action contract writes
