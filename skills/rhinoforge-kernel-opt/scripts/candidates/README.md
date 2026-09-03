@@ -97,6 +97,9 @@ The non-sensitive external evidence roots for these rows are
 fusion runs).  They contain the source copy, strict inspection JSON, board
 stdout, and native trace; generated binaries and traces are intentionally not
 copied into Git.
+The checked-in SiLU verifier is compiled from this repository; the residual
+receipt used the external verifier source SHA-256
+`c458f415f24e3775babcbee2e1b3704b8150cb426928efd4c225e6391d5e9919`.
 
 The parity figures are signal checks on one fixed seed (the fused checks use
 the stated FP16 tolerance).  Held-out seeds/shapes, FP32-anchor, Graph
