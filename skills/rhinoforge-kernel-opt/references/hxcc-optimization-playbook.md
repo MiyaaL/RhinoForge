@@ -186,6 +186,31 @@ must remain disabled and is not present in the release path; the suffix-write so
 prove that the complete action cache state is safe to reuse.  Preserve the
 failure receipt and do not report the theoretical DMA saving as achieved.
 
+### Independent Wall GEMM tile search (2026-09-03)
+
+The release-manifest tile is only a legal starting point.  A separate cold
+process sweep was run for each exact local GEMM shape, keeping the compiler,
+runtime-v1.0.0-r4 asset, 800 MHz board mode, flow-noise SHA-256
+`078e697b…`, request sequence, and Graph checks fixed.  The candidate hook is
+default-off (`RPU_QWEN35_WALL_GEMM_TILES`) and accepts only the release-admitted
+ACC32 `n_tile` values `{128,112,96,80,64,48,32}`.  Candidate chain:
+`93cd5a3` (hook), `b248508` (contract tests), and `b075efd` (runtime-config
+documentation), all based on ABI-clean `1413c7f`.
+
+| local GEMM shape | n=128 | n=112 | n=96 | n=80 | n=64 | n=48 | n=32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `[32,256,1024]` | 439.0 | 434.7 | 434.0 | 434.3 | 437.1 | 435.9 | 439.6 |
+| `[32,1024,256]` | 440.2 | 435.7 | 434.5 | 434.7 | 431.1 | 434.9 | 439.7 |
+
+Values are steady whole-request means in ms from requests 2–6; the unset
+baseline was 431.926 ms.  Every arm was finite, kept the action census at 429
+kernels/call, and passed the one-BUILD/REPLAY, fixed-cache, and invariant
+checks.  The apparent `[32,1024,256]`, `n=64` lead was not reproducible in a
+fresh confirmation (437.2 ms), so no tile is promoted.  This is a negative
+optimization result, not evidence that the manifest tile is theoretically
+optimal: the remaining uncertainty is below the run-to-run board noise and
+requires a longer interleaved campaign before changing the default.
+
 Do not call this GEMM-epilogue fusion: `llama_silu_mul` is a standalone
 elementwise device program placed between two existing GEMMs.  The release
 manifest currently has no authorized one-launch GEMM+add, GEMM+RoPE, or
