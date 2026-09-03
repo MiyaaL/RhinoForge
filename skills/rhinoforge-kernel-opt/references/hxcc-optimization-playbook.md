@@ -152,6 +152,14 @@ the six-layer K/V prefix DMA per public request; this is a request-boundary
 optimization, not a fused GEMM epilogue and not a reason to change the Graph
 kernel census.
 
+The r4 board smoke falsified this optimization: with the exact first-request
+noise, `RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1` kept the expected 429-kernel Graph
+but changed the action result from `abs14 L1=0.039562` to `0.202670`
+(`max_abs=1.52877`, `mean_abs=0.114975`).  The arm is therefore rejected and
+must remain disabled; the suffix-write source inspection was insufficient to
+prove that the complete action cache state is safe to reuse.  Preserve the
+failure receipt and do not report the theoretical DMA saving as achieved.
+
 Do not call this GEMM-epilogue fusion: `llama_silu_mul` is a standalone
 elementwise device program placed between two existing GEMMs.  The release
 manifest currently has no authorized one-launch GEMM+add, GEMM+RoPE, or
