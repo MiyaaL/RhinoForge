@@ -158,7 +158,7 @@ promotion.  A separate profiler-only 1/0 run reported
 diagnostic 128.537 ms; profiler/device time is diagnostic (`device_time=0`)
 and not a board latency gate.
 
-A third diagnostic arm,
+A third candidate was explored in an isolated worktree,
 `RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1`, targets the capture-external prefix DMA
 boundary rather than the device Graph.  The fixed Wall action contract writes
 only the 32-token suffix at `prefix + chunk.offset` (`chunk.offset=0`) for the
@@ -178,7 +178,7 @@ The r4 board smoke falsified this optimization: with the exact first-request
 noise, `RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1` kept the expected 429-kernel Graph
 but changed the action result from `abs14 L1=0.039562` to `0.202670`
 (`max_abs=1.52877`, `mean_abs=0.114975`).  The arm is therefore rejected and
-must remain disabled; the suffix-write source inspection was insufficient to
+must remain disabled and is not present in the release path; the suffix-write source inspection was insufficient to
 prove that the complete action cache state is safe to reuse.  Preserve the
 failure receipt and do not report the theoretical DMA saving as achieved.
 

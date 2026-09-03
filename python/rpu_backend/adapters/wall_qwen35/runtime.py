@@ -368,13 +368,6 @@ class WallQwen35Runtime:
             )
 
     def _build_prefix(self, prepared: WallQwen35PreparedInput):
-        # Stamp before reset/prefill so a failed or partial rebuild cannot
-        # accidentally reuse the previous request's action-owned prefix.
-        action_state = getattr(self.action_expert, "_rpu_qwen3_5", None)
-        if action_state is not None:
-            action_state.action_prefix_generation = (
-                int(getattr(action_state, "action_prefix_generation", 0)) + 1
-            )
         self.base_cache.reset()
         # Qwen3.5 vision STEP0 accepts host folded patches and performs the
         # explicit CPU/RPU handoff itself.  Keep this pointer off RPU before

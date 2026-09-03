@@ -1521,9 +1521,6 @@ def main() -> int:
             "RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE": os.environ.get(
                 "RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE"
             ),
-            "RPU_QWEN35_WALL_PREFIX_COPY_ONCE": os.environ.get(
-                "RPU_QWEN35_WALL_PREFIX_COPY_ONCE"
-            ),
         },
         "torch_profile": torch_profile_meta,
         "hw_perf": hw_perf_meta,
