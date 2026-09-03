@@ -143,7 +143,7 @@ void rpu_launch_memset_spm_multicore(
 // the fused graph, so get_program requires it to be preloaded.
 void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
                                 c10::Half value, int num_cores,
-                                int core_begin) {
+                                int core_begin, int64_t grid_num_elements) {
     TORCH_CHECK(num_elements > 0,
                 "fill_spm: num_elements must be > 0");
     TORCH_CHECK(core_begin >= 0 && num_cores >= 1 &&
@@ -154,6 +154,12 @@ void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
     TORCH_CHECK(SPM_ALLOC.is_initialized(),
                 "fill_spm: SPM allocator is not initialized");
     const uint64_t element_count = static_cast<uint64_t>(num_elements);
+    const uint64_t grid_element_count = grid_num_elements > 0
+        ? static_cast<uint64_t>(grid_num_elements)
+        : element_count;
+    TORCH_CHECK(grid_element_count >= element_count,
+                "fill_spm: grid_num_elements (", grid_num_elements,
+                ") must cover num_elements (", num_elements, ")");
     TORCH_CHECK(element_count <=
                     SpmAllocator::SPM_USABLE / sizeof(c10::Half),
                 "fill_spm: write byte count exceeds one core's usable SPM");
@@ -175,7 +181,7 @@ void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
     TORCH_CHECK(kernel != nullptr, "fill_spm: failed to get fill kernel");
     const int64_t VAL_NUM_PER_WRP = 2048;
     const uint16_t gx = (uint16_t)(
-        (num_elements + VAL_NUM_PER_WRP - 1) / VAL_NUM_PER_WRP);
+        (grid_element_count + VAL_NUM_PER_WRP - 1) / VAL_NUM_PER_WRP);
     kernel->set_regs(0, (uint16_t)(spm_addr & 0xFFFF));
     kernel->set_regs(1, (uint16_t)(spm_addr >> 16));
     kernel->set_regs(2, (uint16_t)(num_elements & 0xFFFF));

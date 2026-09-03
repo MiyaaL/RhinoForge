@@ -2968,7 +2968,12 @@ void rpu_launch_memset_spm_multicore(
 // `core_begin` fills cores [core_begin, core_begin+num_cores) instead of [0,n).
 void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
                                 c10::Half value, int num_cores,
-                                int core_begin = 0);
+                                int core_begin = 0,
+                                // Optional fixed launch envelope.  When set,
+                                // the fill count remains mutable but grid.x is
+                                // derived from this upper bound, which keeps a
+                                // retained prefix-bucket graph topology stable.
+                                int64_t grid_num_elements = 0);
 
 // Strict exactly-k FP16 MoE selector. `correction_bias` affects selection only;
 // `dense_weights` are gathered from the unbiased scores and normalised over k.
