@@ -211,6 +211,80 @@ optimization result, not evidence that the manifest tile is theoretically
 optimal: the remaining uncertainty is below the run-to-run board noise and
 requires a longer interleaved campaign before changing the default.
 
+The table above is **whole-request E2E evidence only**.  It includes the Wall
+action graph, attention, launches, synchronization, and host-side request
+work; it is not a GEMM operator timing and must not be used as one.
+
+### Corrected standalone pure-GEMM panel (2026-09-03)
+
+The operator-only measurement was rerun with the Launch SDK harness
+`scripts/pure_gemm_bench.cpp`.  Inputs/outputs were mapped once to per-core
+`LocalSPM_t` windows, transformed weights were placed once in `HostDDR`, one
+Launch batch was built, and only synchronous resident replays were timed.
+Host replay and native Compute duration were recorded separately; `build_us`
+and any host materialization were excluded from steady samples.  Every sample
+below had zero parity mismatches.  Each tile was run in a fresh process with
+five warmups and 40 timed replays at 800 MHz; the Compute column is the
+critical path (the maximum of overlapping core streams), not a sum.  The
+packet is bias-free (`bias_addr=0`): these rows are GEMM only, not a projection
+plus bias/activation result.
+The harness can persist unrounded replay samples with `--raw <path>` for
+interleaved/paired analysis; those files remain private diagnostic artifacts.
+
+For q/k/v/gate/up (global `[32,2048,1024]`, column partition, local
+`[32,256,1024]`, FP16-weight ACC32):
+
+Here q/k/v use the effective post-replication width consumed by the eight-core
+Wall asset; the raw logical K/V head width is smaller.
+
+| `n_tile` | `m_tile` | host replay p50 (µs) | Compute critical (µs) |
+|---:|---:|---:|---:|
+| 128 | 208 | 69.771 | 36.263 |
+| 112 | 240 | 68.194 | 35.111 |
+| 96 | 272 | 70.578 | 36.028 |
+| 80 | 304 | 68.232 | 34.943 |
+| 64 | 352 | 71.578 | 36.133 |
+| 48 | 416 | 70.309 | 35.020 |
+| 32 | 496 | 68.347 | 34.693 |
+
+For o/down (global `[32,1024,2048]`, row partition, local `[32,1024,256]`):
+
+| `n_tile` | `m_tile` | host replay p50 (µs) | Compute critical (µs) |
+|---:|---:|---:|---:|
+| 128 | 208 | 69.924 | 34.288 |
+| 112 | 240 | 69.347 | 34.140 |
+| 96 | 272 | 67.232 | 34.182 |
+| 80 | 304 | 71.155 | 34.106 |
+| 64 | 352 | 68.540 | 34.014 |
+| 48 | 416 | 67.040 | 33.754 |
+| 32 | 496 | 67.886 | 33.761 |
+
+The current release selector remains `n=112/m=240` for q/k/v and
+`n=32/m=496` for o/down.  Across two diagnostic trace rounds, the individual
+minima alternate between qkv `n=32`/`n=48` and o/down `n=48`/`n=32`; the
+spread versus the release choice is below about 1.2% and is within observed
+board/run noise, so no override is promoted.  These are seven prebuilt
+release variants, not a proof that every source-level loop, pipeline, or
+address schedule has been searched.  The board has no frozen authoritative
+peak in this campaign, so the achieved TFLOP figures and any roofline are
+empirical.
+
+As a three-GEMM sanity check, q, k, and v were run independently with the
+selected qkv tile (`n=112/m=240`, 30 replays, fresh process, deterministic
+seeds; a separate 50-replay panel was consistent):
+
+| projection (seed) | parity max-abs | host replay p50 (µs) | Compute critical (µs) |
+|---|---:|---:|---:|
+| q (11) | 2.43187e-4 | 67.924 | 35.005 |
+| k (17) | 2.17915e-4 | 69.002 | 35.292 |
+| v (23) | 2.33114e-4 | 69.232 | 35.015 |
+
+The seeds change synthetic operand values only; q/k/v use the same shape,
+layout, ABI, and device program.  Therefore these three rows are independent
+operator measurements, not three different kernel implementations.  They also
+do not establish GEMM+SiLU, GEMM+add, GEMM+RoPE, or attention fusion: the
+release asset currently contains no authorized one-launch epilogue fusion.
+
 ### Independent Wall attention candidate (2026-09-03)
 
 Attention was measured as a separate task, not folded into either GEMM

@@ -89,6 +89,44 @@ profile lifecycle.
 6. Collect hardware profiling in a separate diagnostic process. Verify that
    actual named operations, bytes, and launches match the claimed work.
 
+### Standalone operator timing (Launch SDK)
+
+For a pure operator question, define the boundary before collecting samples.
+Whole-model or whole-request wall time is an end-to-end diagnostic and must
+never be reported as operator latency.  For the current Wall decode GEMM,
+freeze the global/local shape, partition, core count, accumulation mode, and
+release kernel name (q/k/v: `[32,2048,1024]` → `[32,256,1024]` by column;
+o/down: `[32,1024,2048]` → `[32,1024,256]` by row).
+
+Stage transformed weights in `HostDDR` and per-core input/output in
+`LocalSPM_t` once, issue the required host memory barrier, then build one
+Launch batch.  A correctness replay and registered warmups precede timed,
+synchronous `enqueue_batch` replays.  Exclude host staging and output copies,
+but do not hide traffic that is part of the kernel's declared DDR/SPM
+residency.  Report startup/build separately from two steady-state metrics:
+the host replay (enqueue plus synchronization) and the native Compute critical
+path (maximum overlapping Compute duration across active cores).
+The standalone GEMM packet uses `bias_addr=0`; bias, activation, residual,
+RoPE, and other epilogues are outside this pure-GEMM boundary.
+
+The SDK's `rhino_launch_batch` lifecycle is not a PyTorch Graph lifecycle:
+`build_batch_count=1` and `enqueue_count` are valid Launch evidence, while
+`cache_size`, `replay_count`, and `cache_invariant_ok` must come from a Graph
+executor and must not be invented by a standalone harness.
+
+On the observed release, use a distinct `LocalSPM_t` mapping for every core
+and direct mapped writes with a host barrier.  Do not use repeated
+`CopyToDevice`/`CopyFromDevice` calls on a shared `GlobalSPM_t` as a substitute:
+the packet ABI can route those writes to one bank, producing a core-0-only
+parity pass.  Any parity failure invalidates the corresponding latency
+samples.
+
+Enumerate all release-admitted tile variants for the exact shape and run each
+in a clean process.  A one-pass minimum is a measured candidate only; promote
+it only after interleaved repeats and the loop/Repeat/fence/address evidence
+required by the contract.  If the board's exact peak is not authoritative,
+the resulting roofline is empirical rather than theoretical.
+
 The per-iteration signal may use fewer trials, but it must keep the same input
 regime and timing boundary. Schema-v1 signal receipts require at least three
 paired positive raw samples per measured arm, and their summaries are

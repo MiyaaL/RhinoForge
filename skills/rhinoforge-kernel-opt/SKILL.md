@@ -273,6 +273,64 @@ Do not time a candidate that fails a hard semantic or lifecycle gate. Separate
 startup/build latency from steady REPLAY latency, and profile in a different
 process from the reported latency run.
 
+## Standalone pure-GEMM measurement boundary
+
+When the question is an operator comparison, do not substitute a model or
+request wall time.  A Wall Qwen3.5 decode GEMM has two exact contracts:
+
+- q/k/v (and gate/up): global `[M,N,K]=[32,2048,1024]`, column partition over
+  eight cores, local `[32,256,1024]`;
+- o/down: global `[32,1024,2048]`, row partition over eight cores, local
+  `[32,1024,256]`.
+
+The q/k/v dimensions above are the effective post-replication tensor-parallel
+width used by the Wall asset (raw logical KV-head widths are smaller).
+
+The current Wall setup explicitly enables FP16-weight ACC32.  The pure-op
+protocol is therefore: transform and place the weight in `HostDDR` once;
+place each core's input/output windows in its `LocalSPM_t` once; publish the
+direct mapped writes with a host barrier; load the exact release kernel; build
+one Launch batch; perform one correctness replay, registered warmups, and
+synchronous timed replays.  DDR↔SPM staging and host output materialization
+must be outside the timed boundary.  Report both `replay_host_us` (API launch
+plus wait) and the native Compute critical path (device work); report
+`build_us` separately.  The Compute path still includes the operand traffic
+required by the kernel's frozen DDR/SPM residency contract.  The standalone
+GEMM ABI sets `bias_addr=0`; bias, activation, residual, RoPE, and other
+epilogues are intentionally separate operations.
+
+For this Launch SDK release, multi-core staging uses one `LocalSPM_t` per core
+and direct mapped `memcpy` plus a barrier.  Repeated `CopyToDevice`/
+`CopyFromDevice` calls on a `GlobalSPM_t` do not select independent banks in
+this packet ABI and can leave core 0 apparently correct while other cores read
+overwritten data.  A parity failure invalidates all timing from that run.
+
+Enumerate every legal release tile (`n_tile` `{128,112,96,80,64,48,32}`),
+check same-dtype parity before timing, and keep q/k/v as independent fresh
+process measurements even though their shape and kernel are identical.  A
+standalone `build_batch`/`enqueue_batch` is Launch-batch evidence, not a
+PyTorch Graph BUILD/REPLAY receipt; never print Graph cache or invariant
+claims for it.  A tile with the lowest single-run latency is only a measured
+candidate.  Without an authoritative board peak plus source/assembly
+evidence for all loop, pipeline, and address variants, label the result
+“best measured candidate,” never “theoretical optimum.”
+
+Reproduce the board-free build and board run with the checked-in harness:
+
+```bash
+scripts/build_pure_gemm_bench.sh /tmp/rhinoforge-pure-gemm-build/pure_gemm_bench
+python scripts/board_lease.py -- \
+  sudo -n env /tmp/rhinoforge-pure-gemm-build/pure_gemm_bench \
+  --ref <release-matched-rhinoOpLib.ref> --m 32 --n 2048 --k 1024 \
+  --partition 1 --cores 8 --acc32 --tile 112 --warmup 5 --iters 30 \
+  --trace /tmp/pure-gemm-qkv.json --raw /tmp/pure-gemm-qkv.raw.json
+```
+
+The `--raw` file contains the unrounded host replay samples and parity/trace
+summary, but no addresses or tensor data.  Keep raw files, traces, addresses,
+weights, and activation dumps outside Git; commit only the harness, reviewed
+summaries, and hashes.
+
 ## Delegate safely
 
 The orchestrator freezes the contract, harness, and promotion rule. Give each
