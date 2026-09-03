@@ -85,8 +85,10 @@ wrapper hash alone does not identify the compiler that it execs.
 The assembly/source inspector in this skill is intentionally a conservative
 lexical/structural check rather than a complete C++ parser or an ABI proof.
 Treat a passing report as a necessary review receipt only after the exact
-source has compiled with the pinned headers and the resulting asset has been
-admitted by the release manifest.
+source has compiled with the pinned headers. For a release handoff, the
+resulting asset must additionally be admitted by the release manifest. A
+source-derived diagnostic may keep the passing assembly receipt before that
+admission, but it is not a promotion or production-runtime claim.
 
 ## Device source and ABI rules
 

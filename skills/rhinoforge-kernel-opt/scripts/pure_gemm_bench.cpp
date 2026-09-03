@@ -1,9 +1,10 @@
 // Standalone, device-resident FP16 GEMM benchmark for the Rhino Launch SDK.
 //
 // This is intentionally independent of torch.rpu and of RhinoForge's Graph
-// wrapper.  It loads one kernel from an already released operator-library REF,
-// places the transformed weight in HostDDR and the per-core input/output
-// windows in directly mapped LocalSPM once, builds one Launch batch, and
+// wrapper.  It loads one kernel from a release asset or a private hxcc
+// source-build binary, places the transformed weight in HostDDR and the
+// per-core input/output windows in directly mapped LocalSPM once, builds one
+// Launch batch, and
 // measures only synchronous batch replays.  Consequently the reported replay
 // samples are not end-to-end model timings and do not include DDR↔SPM staging
 // or output materialization.  The optional Chrome trace is collected in a
@@ -92,7 +93,9 @@ struct Options {
   std::FILE *out = status == 0 ? stdout : stderr;
   std::fprintf(
       out,
-      "Usage: %s --ref FILE [options]\n"
+      "Usage: %s --binary FILE [options]\n"
+      "  --binary FILE             binary to load (source-built or release)\n"
+      "  --ref FILE                legacy alias for --binary\n"
       "  --m M --n N --k K        global GEMM dimensions (default 32,2048,1024)\n"
       "  --partition 0|1          0=row (split K), 1=col (split N)\n"
       "  --cores C                active cores, 1..8 (default 8)\n"
@@ -182,14 +185,15 @@ Options parse_options(int argc, char **argv) {
     }
     else if (arg == "--address-mode") o.address_mode = v;
     else if (arg == "--submit-mode") o.submit_mode = v;
-    else if (arg == "--ref") o.ref = v;
+    else if (arg == "--ref" || arg == "--binary") o.ref = v;
     else if (arg == "--kernel") o.kernel = v;
     else if (arg == "--trace") o.trace = v;
     else if (arg == "--raw") o.raw = v;
     else if (arg == "--seed") o.seed = parse_u64(v, "seed");
     else throw std::runtime_error("unknown option: " + arg);
   }
-  if (o.ref.empty()) throw std::runtime_error("--ref (or RPU_OPLIB_REF) is required");
+  if (o.ref.empty())
+    throw std::runtime_error("--binary/--ref (or RPU_OPLIB_REF) is required");
   if (o.partition != 0 && o.partition != 1)
     throw std::runtime_error("partition must be 0 or 1");
   if (o.cores < 1 || o.cores > static_cast<int>(kMaxCores))
@@ -722,7 +726,7 @@ int main(int argc, char **argv) try {
 
   Program_t program;
   check_status(program.create_with_binary_file(o.ref, kernel_name.c_str()),
-               "load operator-library REF/kernel");
+               "load kernel binary");
   const std::size_t weight_bytes = transformed_w.size() * sizeof(std::uint16_t);
   HostDDR_t weight(weight_bytes, read_write, kStride256B, 256);
   std::memcpy(weight.get_cpu_ptr(), transformed_w.data(), weight_bytes);

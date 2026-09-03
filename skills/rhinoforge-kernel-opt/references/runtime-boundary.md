@@ -13,10 +13,14 @@ Graph capture/replay, and named-kernel lookup. Those are valid campaign targets
 when the exact release asset already contains the required device operation.
 
 Device-program implementation and the combined operator asset are outside the
-public repository. The `.ref` file is opaque. Its adjacent `.kernels` file is a
-release-generated list of size and public kernel names, not source and not a
-compiler input. Never inspect the `.ref` payload, generate a replacement
-manifest, rename or split the pair, or commit either file.
+public repository. The installed release `.ref`/`.kernels` pair is opaque: its
+`.kernels` file is a release-generated list of size and public kernel names,
+not source and not a compiler input. Never inspect that release `.ref` payload,
+generate a replacement release manifest, rename or split the release pair, or
+commit either release file. A private `.ref` emitted by an authorized hxcc
+compile is only a temporary load artifact for a source-derived diagnostic; it
+must remain outside the repository and is covered by the source-first rule in
+the parent skill.
 
 A genuinely new device kernel requires all of these before Campaign mode:
 

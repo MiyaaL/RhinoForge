@@ -160,6 +160,68 @@ The preflight parses only the adjacent public `.kernels` manifest. It may stream
 the opaque `.ref` into SHA-256 to verify its frozen identity, but must never
 parse, decode, log, rewrite, split, or copy the asset.
 
+## Source-first kernel rule
+
+Do not conflate an executable binary with the implementation that produced it.
+There are two deliberately different `.ref` roles in a campaign:
+
+1. The release `.ref` is an immutable, owner-signed reference asset. It is a
+   comparator for the production ABI, layout, parity, and timing; it is never
+   edited, decompiled, copied into a candidate, or used as evidence that a
+   source hypothesis was implemented.
+2. hxcc emits a temporary `.ref` when it compiles a reviewed `.rc` source. That
+   binary is only the board-load artifact for that source candidate. Generate
+   it in a private temporary directory, delete it after the run unless a
+   restricted external evidence store explicitly retains its hash-bound copy,
+   and never put it in Git. The pure-GEMM harness keeps its historical `--ref`
+   spelling as a compatibility alias for “binary to load”; source-derived
+   commands should use the unambiguous `--binary` spelling, and every result
+   must state which role was used.
+
+Call a kernel *handwritten/source-derived* only when the receipt binds all of
+the following to the same clean source snapshot: source SHA-256, exact hxcc
+argv and toolchain hashes, generated-assembly SHA-256 plus strict loop/address/
+fence counts, a zero-mismatch board parity run, and steady host/native timing.
+A run that points `--ref` at the release asset is baseline evidence only, even
+if the surrounding host code was changed. A compiled source candidate is still
+not a shippable runtime kernel until the release owner admits its symbol,
+parameter/grid ABI, manifest entry, asset signature, and held-out profile.
+Keep the `.rc` snapshot in an external candidate workspace; this repository may
+track the host verifier and pointer-free receipt, but must not become a store
+for device-program implementation details or generated operator assets.
+
+The following is an exact column-GEMM example of that source-to-board order;
+fusion profiles use their own source entry point and four-pointer verifier.
+For every profile, preserve the source basename so hxcc's generated symbol
+name remains deterministic:
+
+```bash
+src=/path/to/candidates/gemm_ddr_col_m32n256k1024_acc32.rc
+build=$(mktemp -d /dev/shm/rhinoforge-rc-XXXXXX)
+cp "$src" "$build/$(basename "$src")"
+(cd "$build" && hxcc -O2 -save-temps -DRF_N_TILES=4 \
+    -DRF_GROUPS=2 -c "$(basename "$src")")
+scripts/build_pure_gemm_bench.sh "$build/pure_gemm_bench"
+python scripts/inspect_rpu_asm.py \
+  "$build"/*-host-rpu-rhino-rpuhsa.s \
+  --source "$build/$(basename "$src")" --require-entry --strict \
+  --require-vmat --require-lpaddr --require-async-fence
+python scripts/board_lease.py -- \
+  sudo -n env "$build/pure_gemm_bench" \
+  --binary "$build/$(basename "$src" .rc).ref" \
+  --kernel gemm_ddr_col_m32n256k1024_acc32 --m 32 --n 2048 --k 1024 \
+  --partition 1 --cores 8 --acc32 --tile 128 --typed-weight \
+  --warmup 5 --iters 40
+rm -rf "$build"
+```
+
+For a production `ParallelLinear` packet, verify the source declaration and
+host register packing together: the transformed weight pointer is a
+`DDR_large` value encoded in 256-byte units, and any `LoopStepInfo` steps from
+that base must use the reviewed explicit address granularity (the observed
+ABI requires `a_g1B`). A source that compiles with a plain `__DDR` pointer but
+has not passed this address-unit/parity test is not a valid replacement.
+
 For an authorized `.rc` campaign, run the board-free compiler identity and
 end-to-end smoke before `preflight.py`:
 
@@ -321,7 +383,7 @@ Reproduce the board-free build and board run with the checked-in harness:
 scripts/build_pure_gemm_bench.sh /tmp/rhinoforge-pure-gemm-build/pure_gemm_bench
 python scripts/board_lease.py -- \
   sudo -n env /tmp/rhinoforge-pure-gemm-build/pure_gemm_bench \
-  --ref <release-matched-rhinoOpLib.ref> --m 32 --n 2048 --k 1024 \
+  --binary <release-matched-rhinoOpLib.ref> --m 32 --n 2048 --k 1024 \
   --partition 1 --cores 8 --acc32 --tile 112 --warmup 5 --iters 30 \
   --trace /tmp/pure-gemm-qkv.json --raw /tmp/pure-gemm-qkv.raw.json
 ```
