@@ -211,6 +211,30 @@ optimization result, not evidence that the manifest tile is theoretically
 optimal: the remaining uncertainty is below the run-to-run board noise and
 requires a longer interleaved campaign before changing the default.
 
+### Independent Wall attention candidate (2026-09-03)
+
+Attention was measured as a separate task, not folded into either GEMM
+epilogue arm.  Candidate `2ba4620` selects the release asset
+`llm_fp16_32b_prefill_flash_attn_univ_vctxlen` only during cold Wall handle
+setup (`RPU_QWEN35_WALL_SDPA_VCTXLEN=1`); its candidate object receipt was
+`32a5b29c…`.  With the same r4 runtime, 800 MHz mode, six-request flow-noise
+artifact, and fresh process per arm:
+
+| arm | steady requests 2–6 | overall abs14 L1 | action Graph |
+|---|---:|---:|---|
+| standard DP SDPA | 431.520 ms | 0.120425233669 | 429 kernels, 59 replays |
+| vctxlen SDPA | 433.721 ms | 0.120425233669 | 429 kernels, 59 replays |
+
+The vctxlen output was bit-exact to the baseline (`max_abs=0`, `mean_abs=0`,
+finite outputs); both arms had zero recaptures, cache size one, and true cache
+invariants.  It is nevertheless rejected: the wrapper writes K/V DDR
+registers directly (`set_regs(50/53)`) and has no typed
+`stage_kernel_ddr_registers()` provenance receipt.  It also loses 2.201 ms
+(+0.51%), so neither performance nor the ABI/provenance gate supports changing
+the default.  Keep the environment opt-in and the source-contract test as a
+regression guard until the missing provenance path is implemented and a new
+interleaved campaign proves a gain.
+
 Do not call this GEMM-epilogue fusion: `llama_silu_mul` is a standalone
 elementwise device program placed between two existing GEMMs.  The release
 manifest currently has no authorized one-launch GEMM+add, GEMM+RoPE, or
