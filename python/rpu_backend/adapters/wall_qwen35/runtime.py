@@ -27,6 +27,7 @@ from .preprocessing import (
     MAX_SEQ_LENGTH,
     STATE_DIM,
     SPECIAL_TOKENS,
+    WALL_PREFIX_BUCKETS,
     WallQwen35PreparedInput,
     prepare_wall_qwen35_input,
 )
@@ -34,9 +35,9 @@ from .preprocessing import (
 
 _INSTALL_LOCK = threading.Lock()
 _VISION_OPT_IN = "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED"
+_VISION_GRAPH_MAX_ENTRIES = "QWEN3_5_VISION_GRAPH_MAX_ENTRIES"
 _COEXIST_PERSISTENT_ENV = "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "True", "on"})
-
 
 def _profile_scope(name: str):
     """Return a stable model-stage range for Torch profiler attribution.
@@ -180,6 +181,7 @@ class WallQwen35Runtime:
         self._closed = False
         self._installed = False
         self._owned_vision_env = False
+        self._owned_vision_graph_entries_env = False
         self._owned_coexist_persistent_env = False
         self._base_adapter = None
         self.base_model = None
@@ -241,6 +243,29 @@ class WallQwen35Runtime:
             if os.environ.get(_VISION_OPT_IN) != "1":
                 os.environ[_VISION_OPT_IN] = "1"
                 self._owned_vision_env = True
+            # Wall's exact prefix has two distinct image geometries (face and
+            # wrist).  The shared Qwen3.5 installer defaults to one retained
+            # Vision graph for generic workloads; that setting would evict one
+            # geometry on every request and make a repeated profile call BUILD
+            # again.  Require a bounded two-entry cache for this controlled
+            # profile, while honoring a larger caller-provided budget.
+            vision_entries = os.environ.get(_VISION_GRAPH_MAX_ENTRIES)
+            if vision_entries is None:
+                os.environ[_VISION_GRAPH_MAX_ENTRIES] = "2"
+                self._owned_vision_graph_entries_env = True
+            else:
+                try:
+                    parsed_entries = int(vision_entries)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Wall Qwen3.5 requires "
+                        f"{_VISION_GRAPH_MAX_ENTRIES} to be a positive integer"
+                    ) from exc
+                if parsed_entries < 2:
+                    raise RuntimeError(
+                        "Wall Qwen3.5 requires at least two retained Vision "
+                        "graph entries; unset the variable or set it to >=2"
+                    )
             self._processor = _load_processor(self.checkpoint, checkpoint_module)
             self.base_model = _load_base_model(
                 self.checkpoint, checkpoint_module, manifest=self._manifest
@@ -255,6 +280,33 @@ class WallQwen35Runtime:
             self.base_model._wall_qwen35_cache_only_no_lm_head = True
             self._base_adapter = Qwen3_5Adapter(self.base_model)
             self._base_adapter.to_rpu(max_seq_len=self.max_seq_len)
+            # The generic adapter deliberately keeps variable-length prefill as
+            # a one-shot graph.  Wall has a finite <=384 prefix envelope, so
+            # opt into a retained bucket cache after the text handle is fully
+            # installed.  This is process-local policy state, not a public
+            # Qwen3.5 execution option.
+            import rpu_backend as _rb
+
+            text_owner = getattr(
+                getattr(self.base_model, "model", None),
+                "language_model",
+                None,
+            )
+            text_state = getattr(text_owner, "_rpu_qwen3_5", None)
+            if text_state is None:
+                raise RuntimeError(
+                    "Wall Qwen3.5 base install did not publish text runtime state"
+                )
+            text_state.prefill_graph_cache = _rb.graph.GraphCache(
+                max_entries=len(WALL_PREFIX_BUCKETS)
+            )
+            text_state.prefill_graph_sig = None
+            text_state.prefill_bucket_sizes = WALL_PREFIX_BUCKETS
+            text_state.prefill_graph_op_id = "rpu_wall_qwen35_prefill"
+            # Enable exact same-shape M-RoPE table reuse where the prompt
+            # position tensor repeats; tables are still refreshed outside graph
+            # capture whenever a request has different positions.
+            text_state.prefill_rope_cache = None
             self.base_cache = Qwen3_5Cache.from_config(
                 _text_config(self.base_model.config),
                 max_seq_len=self.max_seq_len,
@@ -278,6 +330,12 @@ class WallQwen35Runtime:
             )
             if patched is not None:
                 self.action_expert = patched
+            action_state = getattr(self.action_expert, "_rpu_qwen3_5", None)
+            if action_state is None:
+                raise RuntimeError(
+                    "Wall Qwen3.5 action install did not publish runtime state"
+                )
+            action_state.action_prefix_bucket_sizes = WALL_PREFIX_BUCKETS
             self._installed = True
             return self
         except BaseException:
@@ -310,6 +368,13 @@ class WallQwen35Runtime:
             )
 
     def _build_prefix(self, prepared: WallQwen35PreparedInput):
+        # Stamp before reset/prefill so a failed or partial rebuild cannot
+        # accidentally reuse the previous request's action-owned prefix.
+        action_state = getattr(self.action_expert, "_rpu_qwen3_5", None)
+        if action_state is not None:
+            action_state.action_prefix_generation = (
+                int(getattr(action_state, "action_prefix_generation", 0)) + 1
+            )
         self.base_cache.reset()
         # Qwen3.5 vision STEP0 accepts host folded patches and performs the
         # explicit CPU/RPU handoff itself.  Keep this pointer off RPU before
@@ -468,6 +533,15 @@ class WallQwen35Runtime:
         actions = result.to(
             device="cpu", dtype=torch.float32
         ).contiguous().clone()
+        base_owner = getattr(
+            getattr(self.base_model, "model", None), "language_model", None
+        )
+        base_plan = getattr(base_owner, "_rpu_last_execution_plan", None)
+        plan_extra = {}
+        if isinstance(base_plan, dict):
+            for key in ("bucket_len", "execution_len", "padding_rows", "chunk_size"):
+                if key in base_plan:
+                    plan_extra[key] = base_plan[key]
         return {
             "actions": actions,
             "actions_norm": action.to(
@@ -477,6 +551,8 @@ class WallQwen35Runtime:
             "extra": {
                 "noise_seed": resolved_noise_seed,
                 "noise_source": noise_source,
+                "prefix_bucket": plan_extra.pop("bucket_len", None),
+                "base_prefill": plan_extra,
             },
         }
 
@@ -519,7 +595,11 @@ class WallQwen35Runtime:
                     "language_model",
                     None,
                 ),
-                ("graph_cache",),
+                (
+                    "graph_cache",
+                    "prefill_graph_cache",
+                    "prefill_debug_graph_cache",
+                ),
             ),
         ):
             state = getattr(owner, "_rpu_qwen3_5", None)
@@ -548,6 +628,9 @@ class WallQwen35Runtime:
         if getattr(self, "_owned_vision_env", False):
             os.environ.pop(_VISION_OPT_IN, None)
             self._owned_vision_env = False
+        if getattr(self, "_owned_vision_graph_entries_env", False):
+            os.environ.pop(_VISION_GRAPH_MAX_ENTRIES, None)
+            self._owned_vision_graph_entries_env = False
         if getattr(self, "_owned_coexist_persistent_env", False):
             os.environ.pop(_COEXIST_PERSISTENT_ENV, None)
             self._owned_coexist_persistent_env = False

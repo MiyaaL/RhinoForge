@@ -105,6 +105,62 @@ Use these as separate assignments; do not combine them into an unconstrained
   independent FP32 anchor.  The portable int8 fixture in this skill is not
   evidence for MXFP8 hardware support.
 
+### Wall Qwen3.5 action decode (current RPU path)
+
+Treat the Wall action path as its own exact-shape campaign, not as generic
+one-token text decode.  The admitted action graph is batch `1`, action length
+`32`, hidden `1024`, intermediate `2048`, `24` layers, and full-attention
+layers `{3,7,11,15,19,23}`.  A public action request performs ten Euler steps;
+the latency target therefore needs an explicit scope (for example, the ten
+`wall_qwen35_action_decoder` calls) and must not be mixed with cold model load,
+vision, or host preprocessing.
+
+The current graph emits 429 device-program events per action call.  The first
+board-free candidate reuses the installed `llama_silu_mul` asset for the Wall
+SwiGLU gate/up pair.  It is guarded by the cold process variable
+`RPU_QWEN35_WALL_FUSED_SILU_MUL=1`; the default remains the certified
+GEMM → SILU → MUL sequence.  The candidate is expected to remove one unary
+launch per MLP site (405 events per call, 240 fewer over ten steps), but this
+is a hypothesis until a paired board trace confirms numerical parity, DMA
+bytes, replay invariants, and fusion tax.
+
+A second, independent diagnostic arm,
+`RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE=1`, gates each row-partitioned
+`down`/`o_proj` partial before the existing ring all-reduce and supplies the
+real residual to that ring's terminal epilogue.  With the exact six full-
+attention layers and 24 MLPs this would remove 30 post-reduce ADD launches;
+it also skips the now-unused Wall `zero_resid` memset.  The structural
+estimate is therefore 398 events per call for pre-reduce alone, or 374 with
+`silu_mul` enabled as well.
+Because the gate is applied before cross-core FP16 reduction, its rounding
+order is intentionally treated as a separate candidate and requires the same
+parity gate; it is not enabled by default.
+
+A third diagnostic arm,
+`RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1`, targets the capture-external prefix DMA
+boundary rather than the device Graph.  The fixed Wall action contract writes
+only the 32-token suffix at `prefix + chunk.offset` (`chunk.offset=0`) for the
+six full-attention layers; the independent action K/V cache therefore retains
+the physical prefix across the ten Euler steps.  The arm stamps a generation
+before each public base-prefill rebuild, copies the six K/V prefixes once, and
+keeps the default copy-on-every-call path for direct low-level callers.  It
+must retain the independent destination cache, the mutable `prefix_lens`
+input, and the existing bucketed Graph signature.  A board-free fake-tensor
+test proves 12 copies on the first call, zero on the next nine calls, and 12
+again after a generation change.  The expected saving is nine repetitions of
+the six-layer K/V prefix DMA per public request; this is a request-boundary
+optimization, not a fused GEMM epilogue and not a reason to change the Graph
+kernel census.
+
+Do not call this GEMM-epilogue fusion: `llama_silu_mul` is a standalone
+elementwise device program placed between two existing GEMMs.  The release
+manifest currently has no authorized one-launch GEMM+add, GEMM+RoPE, or
+GEMM+epilogue asset.  A host Graph that keeps intermediates in SPM is a
+transfer-saving schedule, not proof of a fused device kernel.  Promotion of
+the Wall arm requires a clean candidate commit, release-matched Launch/asset
+receipt, interleaved bare/candidate measurements under one board lease, and a
+reported upper confidence bound on the epilogue tax.
+
 ## What “near-zero epilogue” means
 
 Use a paired, interleaved comparison with the same shape, output tree,

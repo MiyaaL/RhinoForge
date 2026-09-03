@@ -29,6 +29,8 @@
 #include <c10/util/Half.h>
 #include <algorithm>
 #include <cmath>     // std::sqrt (GDN qk_scale)
+#include <cstdlib>   // std::getenv (diagnostic Wall decode fusion toggle)
+#include <cstring>   // std::strcmp
 
 using namespace at;
 using namespace ::rhino_lkn;
@@ -46,6 +48,23 @@ constexpr int64_t kWallActionEffectiveKvHeads = 8;
 constexpr int64_t kWallActionHeadDim = 256;
 constexpr int64_t kWallActionLen = 32;
 constexpr int64_t kWallActionFullLayers[] = {3, 7, 11, 15, 19, 23};
+
+// This is intentionally a cold, process-level diagnostic switch.  It is read
+// while the action graph is being built, so changing it after BUILD requires a
+// fresh process (or an explicit graph invalidation).  The default keeps the
+// certified two-launch path; the fused arm reuses the release asset's
+// llama_silu_mul operator and must be A/B validated before being enabled by a
+// production profile.
+bool wall_action_fused_silu_mul_enabled() {
+    const char* value = std::getenv("RPU_QWEN35_WALL_FUSED_SILU_MUL");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool wall_action_prereduce_residual_gate_enabled() {
+    const char* value =
+        std::getenv("RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 // PARTIAL_MROPE encodes DDR bases in 256-byte units (addr >> 8). The caching
 // allocator guarantees only 32-byte alignment, so retain an aligned view when
@@ -612,9 +631,12 @@ void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
 
     // A layer = input DMA → input_layernorm → token mixer → post_norm + MLP + output.
     // The Wall residual bridge is Persistent so every layer can read the same
-    // address.  Record a deterministic zero-fill in the graph before its first
-    // use; this executes on BUILD and every REPLAY and no later node writes it.
-    if (wall_action_mode_ && layer_idx == 0) {
+    // address.  The ordinary arm records a deterministic zero-fill before its
+    // first use; pre-reduce mode supplies the real residual directly and never
+    // reads this bridge, so it skips the otherwise-useless memset launch.
+    if (wall_action_mode_ &&
+        !wall_action_prereduce_residual_gate_enabled() &&
+        layer_idx == 0) {
         rpu_launch_memset_spm_multicore(
             addr(0, "zero_resid"), chunk.len * h);
     }
@@ -736,11 +758,13 @@ void Qwen3_5Model::emit_wall_mlp_pipeline(
     const int64_t h = hidden_size();
     const int64_t is = intermediate_size();
     const int64_t local_elems = chunk.len * (is / NUM_CORES);
+    const bool fused_silu_mul = use_silu_ &&
+        wall_action_fused_silu_mul_enabled();
 
     launch_linear(
         addr(0, "residual1"), gate_w, addr(0, "gate"),
         chunk.len, is, h, /*partition=*/1, NUM_CORES);
-    if (use_silu_) {
+    if (use_silu_ && !fused_silu_mul) {
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "gate"), addr(0, "gate"), local_elems,
             ValuOpType::SILU);
@@ -748,17 +772,44 @@ void Qwen3_5Model::emit_wall_mlp_pipeline(
     launch_linear(
         addr(0, "residual1"), up_w, addr(0, "up"),
         chunk.len, is, h, /*partition=*/1, NUM_CORES);
-    rpu_launch_eltwise_binary_spm_kernel(
-        addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-        local_elems, ValuOpType::MUL, c10::Half(1.0), NUM_CORES);
+    if (fused_silu_mul) {
+        // The existing release asset evaluates out = silu(x) * y in one SPM
+        // launch.  Pass the gate projection as x and the up projection as y;
+        // this preserves the Wall SwiGLU ordering while removing the
+        // standalone SILU launch and its intermediate read/write.
+        rpu_launch_silu_mul_spm_kernel(
+            addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+            local_elems, NUM_CORES);
+    } else {
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+            local_elems, ValuOpType::MUL, c10::Half(1.0), NUM_CORES);
+    }
     launch_linear(
         addr(0, "gate"), down_w, addr(0, "down"),
         chunk.len, h, is, /*partition=*/0, NUM_CORES);
-    rpu_launch_all_reduce_sum_residual_kernel(
-        addr(0, "down"), addr(0, "zero_resid"), addr(0, "residual1"),
-        chunk.len, h, NUM_CORES, NUM_CORES);
-    apply_wall_residual_gate(
-        addr(0, "residual1"), addr(0, "residual2"), chunk);
+    if (wall_action_prereduce_residual_gate_enabled()) {
+        // gate * sum(partial_i) == sum(gate * partial_i): adaptive_mod is
+        // replicated on all eight cores, so gate each row-partitioned down
+        // partial before the ring and let the ring's residual epilogue add the
+        // incoming stream.  This removes the standalone post-ring ADD.  FP16
+        // rounding order differs from the certified arm, hence the cold guard.
+        const uint32_t residual_gate = addr(0, "adaptive_mod")
+            + static_cast<uint32_t>(2 * h * DWIDTH);
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            residual_gate, addr(0, "down"), addr(0, "down"),
+            chunk.len, h, c10::Half(1.0), ValuOpType::MUL,
+            /*is_bopa=*/false);
+        rpu_launch_all_reduce_sum_residual_kernel(
+            addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
+            chunk.len, h, NUM_CORES, NUM_CORES);
+    } else {
+        rpu_launch_all_reduce_sum_residual_kernel(
+            addr(0, "down"), addr(0, "zero_resid"), addr(0, "residual1"),
+            chunk.len, h, NUM_CORES, NUM_CORES);
+        apply_wall_residual_gate(
+            addr(0, "residual1"), addr(0, "residual2"), chunk);
+    }
 }
 
 void Qwen3_5Model::emit_action_input_projection() {
@@ -975,17 +1026,29 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
         addr(0, "output"), lw.o_w, addr(0, "oproj"), seq_len, h, nq * hd, 0, tp);
 
     // Phase 5: attention reduce + residual (tp inputs → NUM_CORES out).
-    // Wall first materializes only the mixed branch against deterministic zero,
-    // then performs gate MUL and residual ADD as distinct FP16 operations.
+    // In the diagnostic Wall arm, gate each row-partitioned partial before the
+    // ring so its existing residual epilogue can absorb the final ADD.  The
+    // default keeps the certified reduce-then-gate ordering.
+    const bool wall_prereduce_gate = wall_action_mode_ &&
+        wall_action_prereduce_residual_gate_enabled();
+    if (wall_prereduce_gate) {
+        const uint32_t residual_gate = addr(0, "adaptive_mod")
+            + static_cast<uint32_t>(2 * h * DWIDTH);
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            residual_gate, addr(0, "oproj"), addr(0, "oproj"),
+            seq_len, h, c10::Half(1.0), ValuOpType::MUL,
+            /*is_bopa=*/false);
+    }
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "oproj"),
-        wall_action_mode_ ? addr(0, "zero_resid") : addr(0, "residual1"),
+        (wall_action_mode_ && !wall_prereduce_gate)
+            ? addr(0, "zero_resid") : addr(0, "residual1"),
         addr(0, "residual2"), seq_len, h,
         tp, NUM_CORES);
-    if (wall_action_mode_) {
+    if (wall_action_mode_ && !wall_prereduce_gate) {
         apply_wall_residual_gate(
             addr(0, "residual2"), addr(0, "residual1"), chunk);
-    } else if (action_mode_) {
+    } else if (action_mode_ && !wall_action_mode_) {
         apply_adaptive_residual_gate(
             addr(0, "residual2"), addr(0, "residual1"), chunk);
     }
@@ -1159,23 +1222,24 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
         rpu_launch_eltwise_binary_spm_kernel(D("gdn_cs") + (uint32_t)(Kc * 2 * lkey * 2), D("gdn_cs") + (uint32_t)(Kc * 2 * lkey * 2), D("gdn_c_v_pad"), hist * lval, ValuOpType::MAX, c10::Half(1.0f), nc);
         if (N_seg > 1) {  // halo[bz] = pad[_seg_lo(bz)]: the L%8 remainder goes ENTIRELY to seg0
             // (base=L/8, rem=L%8; kernel/launcher reg[22]=seg_rem), so the 8 halo starts are
-            // {0, rem+base, rem+2base, …} — equidistant ONLY when rem==0. A single strided slice
-            // cuts equidistant starts, so rem==0 keeps the original one-slice form; rem!=0 needs
-            // TWO slices: seg0 = pad[0:hist] (conv history), seg1..N-1 = pad[rem+bz*base] (stride
-            // base from row rem+base → halo rows [hist:]). This matches the admitted
-            // ragged-L operator contract.
+            // {0, rem+base, rem+2base, …}.  Always emit the same TWO slice nodes:
+            // seg0 = pad[0:hist] (conv history), seg1..N-1 = pad[rem+bz*base]
+            // (stride base from row rem+base → halo rows [hist:]).  For rem==0
+            // this is equivalent to the old single strided slice, but the fixed
+            // node topology lets different real lengths in one prefix bucket
+            // replay without a graph cursor shift.
             // PER-CORE: slice uses an explicit global per-core base+offset address,
             // so issue one single-core launch per core at addr(c,·); otherwise cores
             // 1..nc-1's halo stays UNWRITTEN (conv reads NaN).
             auto emit_halo = [&](int c, const char* pad_n, const char* halo_n, int64_t l) {
-                if (seg_rem == 0) {
-                    rpu_launch_slice_spm_kernel(addr(c, pad_n), addr(c, halo_n), {N_seg, seg_len, l}, {N_seg, hist, l}, {0, 0, 0}, 1);
-                } else {
-                    rpu_launch_slice_spm_kernel(addr(c, pad_n), addr(c, halo_n), {1, seg_len, l}, {1, hist, l}, {0, 0, 0}, 1);
-                    rpu_launch_slice_spm_kernel(addr(c, pad_n) + (uint32_t)((seg_rem + seg_len) * l * 2),
-                                                addr(c, halo_n) + (uint32_t)(hist * l * 2),
-                                                {N_seg - 1, seg_len, l}, {N_seg - 1, hist, l}, {0, 0, 0}, 1);
-                }
+                rpu_launch_slice_spm_kernel(addr(c, pad_n), addr(c, halo_n),
+                                            {1, seg_len, l}, {1, hist, l},
+                                            {0, 0, 0}, 1);
+                rpu_launch_slice_spm_kernel(
+                    addr(c, pad_n) + (uint32_t)((seg_rem + seg_len) * l * 2),
+                    addr(c, halo_n) + (uint32_t)(hist * l * 2),
+                    {N_seg - 1, seg_len, l}, {N_seg - 1, hist, l},
+                    {0, 0, 0}, 1);
             };
             for (int c = 0; c < nc; ++c) {
                 emit_halo(c, "gdn_c_q_pad", "gdn_c_q_halo", lkey);
@@ -1236,14 +1300,41 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
     // Zero the pad rows [Lv:L] of the chunk-core inputs (route B: the last chunk's [valid:L] are pad
     // tokens). k/β/g=0 makes the pad positions contribute NOTHING to the carried recurrent_state
     // (exact, not approx); q/v zeroed too so no NaN leaks through the chunk attn (their outputs get
-    // sliced off the padded logits by the adapter).
-    if (Lv < L) {
-        const int64_t np = L - Lv;
-        rpu_launch_fill_spm_kernel(rq              + (uint32_t)(Lv * Hc * Dk * 2), np * Hc * Dk, c10::Half(0.0f), nc);
-        rpu_launch_fill_spm_kernel(rk              + (uint32_t)(Lv * Hc * Dk * 2), np * Hc * Dk, c10::Half(0.0f), nc);
-        rpu_launch_fill_spm_kernel(a_v             + (uint32_t)(Lv * lval * 2),    np * lval,    c10::Half(0.0f), nc);
-        rpu_launch_fill_spm_kernel(D("gdn_c_beta") + (uint32_t)(Lv * vg_c * 2),    np * vg_c,    c10::Half(0.0f), nc);
-        rpu_launch_fill_spm_kernel(D("gdn_c_g")    + (uint32_t)(Lv * vg_c * 2),    np * vg_c,    c10::Half(0.0f), nc);
+    // sliced off the padded logits by the adapter).  Keep the same five fill
+    // nodes even when Lv==L: those exact-length calls write one harmless row of
+    // the already-scratch gdn_c_decay buffer.  Their element-count registers
+    // remain mutable and grid.x is fixed to the bucket, so all lengths in one
+    // retained Graph share the same topology.
+    {
+        const bool has_pad = Lv < L;
+        const int64_t np = has_pad ? (L - Lv) : 1;
+        const uint32_t q_zero = has_pad
+            ? rq + (uint32_t)(Lv * Hc * Dk * 2) : D("gdn_c_decay");
+        const uint32_t k_zero = has_pad
+            ? rk + (uint32_t)(Lv * Hc * Dk * 2) : D("gdn_c_decay");
+        const uint32_t v_zero = has_pad
+            ? a_v + (uint32_t)(Lv * lval * 2) : D("gdn_c_decay");
+        const uint32_t beta_zero = has_pad
+            ? D("gdn_c_beta") + (uint32_t)(Lv * vg_c * 2)
+            : D("gdn_c_decay");
+        const uint32_t g_zero = has_pad
+            ? D("gdn_c_g") + (uint32_t)(Lv * vg_c * 2)
+            : D("gdn_c_decay");
+        rpu_launch_fill_spm_kernel(
+            q_zero, np * Hc * Dk, c10::Half(0.0f), nc, 0,
+            L * Hc * Dk);
+        rpu_launch_fill_spm_kernel(
+            k_zero, np * Hc * Dk, c10::Half(0.0f), nc, 0,
+            L * Hc * Dk);
+        rpu_launch_fill_spm_kernel(
+            v_zero, np * lval, c10::Half(0.0f), nc, 0,
+            L * lval);
+        rpu_launch_fill_spm_kernel(
+            beta_zero, np * vg_c, c10::Half(0.0f), nc, 0,
+            L * vg_c);
+        rpu_launch_fill_spm_kernel(
+            g_zero, np * vg_c, c10::Half(0.0f), nc, 0,
+            L * vg_c);
     }
 
     // ===== Phase 4: CHUNK CORE (M-gen) — N-major [N,Hc,C,*] =====

@@ -20,6 +20,7 @@ No other input, output, or Euler helper applies scale-4.
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 import types
@@ -38,6 +39,7 @@ from .checkpoint import (
     _file_identity,
     _is_action_tensor,
 )
+from .preprocessing import WALL_PREFIX_BUCKETS
 
 
 ACTION_BATCH_SIZE = 1
@@ -59,6 +61,7 @@ _FULL_LAYER_SET = frozenset(_FULL_LAYERS)
 _MODULATION_ROWS = 2 * ACTION_NUM_LAYERS + 1
 _MODULATION_WIDTH = 3 * ACTION_HIDDEN_SIZE
 _ACTION_INSTALL_LOCK = threading.Lock()
+_PREFIX_COPY_ONCE_ENV = "RPU_QWEN35_WALL_PREFIX_COPY_ONCE"
 _NORMALIZER_RE = re.compile(
     r"^model\.action_processor\.normalizer_(action|propri)\."
     r"(min|delta)\.(.+)$"
@@ -696,6 +699,12 @@ def _drop_installed_shell_weights(expert: WallQwen35ActionModule) -> None:
         parameter.data = torch.empty(0, dtype=torch.float16, device="cpu")
 
 
+def _wall_prefix_copy_once_enabled() -> bool:
+    """Return the cold diagnostic selector for one-copy-per-request prefixes."""
+
+    return os.environ.get(_PREFIX_COPY_ONCE_ENV) == "1"
+
+
 def patch_wall_qwen35_action_for_rpu(
     expert: WallQwen35ActionModule,
     *,
@@ -753,7 +762,14 @@ def patch_wall_qwen35_action_for_rpu(
         import rpu_backend as rpu_backend
 
         state = expert._rpu_qwen3_5
-        state.action_graph_cache = rpu_backend.graph.GraphCache(max_entries=1)
+        # The generic action adapter keeps one signature because ordinary
+        # callers use a fixed prefix.  Wall's finite <=384 profile uses the
+        # same prefix buckets as the base text path, so retain one action Graph
+        # per bucket instead of clearing the cache whenever the real prefix
+        # length changes.
+        state.action_graph_cache = rpu_backend.graph.GraphCache(
+            max_entries=len(WALL_PREFIX_BUCKETS)
+        )
         state.action_cache = Qwen3_5Cache.from_config(
             expert.config,
             max_seq_len=int(max_seq_len),
@@ -769,9 +785,12 @@ def patch_wall_qwen35_action_for_rpu(
         state.action_v_caches = state.action_cache.v_caches
         state.action_prefix_lens = [0] * ACTION_NUM_LAYERS
         state.action_prefix_len = None
+        state.action_prefix_generation = 0
+        state.action_prefix_copy_generation = -1
         state.action_rope_cache = None
         state.action_modulation_cache = {}
         state.action_graph_signature = None
+        state.action_prefix_bucket_sizes = WALL_PREFIX_BUCKETS
         _drop_installed_shell_weights(expert)
         expert._wall_qwen35_action_ready = True
         return expert
@@ -1078,6 +1097,25 @@ def _copy_physical_prefix(state, prefix_cache, prefix_len: int) -> list[int]:
     if len(source_k) != ACTION_NUM_LAYERS or len(source_v) != ACTION_NUM_LAYERS:
         raise ValueError("Wall base physical cache must contain 24 layers")
 
+    # The base cache is rebuilt once per public request, while the action
+    # decoder replays ten Euler steps against the same read-only prefix.  In
+    # the diagnostic arm the runtime stamps that request generation before
+    # rebuilding the base prefix; retain the independent action copy for the
+    # remaining nine steps.  Direct low-level callers do not stamp a
+    # generation and therefore keep the historical copy-on-every-call behavior.
+    generation = int(getattr(state, "action_prefix_generation", 0))
+    if (
+        _wall_prefix_copy_once_enabled()
+        and generation > 0
+        and int(getattr(state, "action_prefix_copy_generation", -1)) == generation
+        and int(getattr(state, "action_prefix_len", -1) or -1) == prefix_len
+        and all(
+            int(state.action_prefix_lens[index]) == prefix_len
+            for index in _FULL_LAYERS
+        )
+    ):
+        return list(state.action_prefix_lens)
+
     blocks = (prefix_len + 15) // 16
     prefix_lens = [0] * ACTION_NUM_LAYERS
     for index in _FULL_LAYERS:
@@ -1115,6 +1153,7 @@ def _copy_physical_prefix(state, prefix_cache, prefix_len: int) -> list[int]:
         prefix_lens[index] = prefix_len
     state.action_prefix_lens = prefix_lens
     state.action_prefix_len = prefix_len
+    state.action_prefix_copy_generation = generation if generation > 0 else -1
     return prefix_lens
 
 
@@ -1134,10 +1173,12 @@ def run_wall_qwen35_action(
 
     ``inputs_embeds``/``action_embeds`` is the *raw* host-FP32 ``w1`` output.
     This function owns its sole ``/4`` and the FP16 upload.  The base cache is
-    read-only; its six full-layer physical prefixes are copied on every call to
-    independent, address-stable action storage.  Same prefix shape replays the
-    single Graph entry while input and modulation addresses are refreshed by
-    the established Qwen3.5 action-forward path.
+    read-only; its six full-layer physical prefixes are copied to independent,
+    address-stable action storage.  The default copies on every call.  The
+    cold ``RPU_QWEN35_WALL_PREFIX_COPY_ONCE=1`` diagnostic arm copies once per
+    stamped public request and reuses that action-owned prefix for the other
+    nine steps.  Same prefix shape replays the single Graph entry while input
+    and modulation addresses are refreshed by the established path.
     """
 
     if not isinstance(expert, WallQwen35ActionModule) or not getattr(
@@ -1187,15 +1228,27 @@ def run_wall_qwen35_action(
 
     import rpu_backend as rpu_backend
 
+    bucket_sizes = getattr(state, "action_prefix_bucket_sizes", None)
+    if bucket_sizes is None:
+        execution_prefix_len = prefix_len
+    else:
+        from rpu_backend.adapters.qwen3_5.text import _select_prefill_bucket
+
+        execution_prefix_len = _select_prefill_bucket(prefix_len, bucket_sizes)
     signature = rpu_backend.graph.GraphSignature(
         op_id="rpu_wall_qwen35_action_decoder",
-        shapes=[ACTION_BATCH_SIZE, ACTION_HORIZON, ACTION_HIDDEN_SIZE, prefix_len],
+        shapes=[
+            ACTION_BATCH_SIZE,
+            ACTION_HORIZON,
+            ACTION_HIDDEN_SIZE,
+            execution_prefix_len,
+        ],
         dyn_dims=[ACTION_NUM_LAYERS, *_FULL_LAYERS],
         dtypes=[torch.float16],
     )
     cold = state.action_graph_cache.lookup(signature) is None
     if cold:
-        if state.action_graph_cache.size() != 0:
+        if bucket_sizes is None and state.action_graph_cache.size() != 0:
             state.action_graph_cache.clear()
         # Prime persistent SPM state before BUILD.  The action suffix is then
         # deterministically overwritten by the captured call.

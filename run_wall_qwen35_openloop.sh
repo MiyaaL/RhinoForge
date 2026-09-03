@@ -25,6 +25,9 @@ HW_PERF="${HW_PERF:-0}"
 HW_PERF_OUTPUT="${HW_PERF_OUTPUT:-}"
 HW_PERF_MAX_DUMPS="${HW_PERF_MAX_DUMPS:-32}"
 LKN_RPU_FREQ_MHZ="${LKN_RPU_FREQ_MHZ:-800}"
+WALL_FUSED_SILU_MUL="${RPU_QWEN35_WALL_FUSED_SILU_MUL:-0}"
+WALL_PREREDUCE_RESIDUAL_GATE="${RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE:-0}"
+WALL_PREFIX_COPY_ONCE="${RPU_QWEN35_WALL_PREFIX_COPY_ONCE:-0}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/wall_qwen35_openloop_${RUN_ID}}"
 
@@ -86,6 +89,8 @@ Environment overrides:
   RUN_WITH_SUDO, TORCH_PROFILE, TORCH_PROFILE_OUTPUT, TORCH_PROFILE_DIR,
   TORCH_PROFILE_RECORD_SHAPES, TORCH_PROFILE_MEMORY, TORCH_PROFILE_WITH_STACK,
   HW_PERF, HW_PERF_OUTPUT, HW_PERF_MAX_DUMPS, LKN_RPU_FREQ_MHZ,
+  RPU_QWEN35_WALL_FUSED_SILU_MUL, RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE,
+  RPU_QWEN35_WALL_PREFIX_COPY_ONCE,
   RPU_KERNEL_LIB_PATH, RHINO_LAUNCH_LIB_DIR, RUN_ID.
 
 Examples:
@@ -354,6 +359,18 @@ fi
 # shellcheck disable=SC1090
 source "$ENV_SH"
 [[ -n "${CONDA_PREFIX:-}" ]] || fatal "ENV_SH did not set CONDA_PREFIX"
+# ENV_SH is allowed to provide the local evaluation defaults.  Resolve the
+# cold candidate selectors after sourcing it, then normalize before preflight
+# so the explicit /usr/bin/env below (including sudo) cannot drop the arm.
+WALL_FUSED_SILU_MUL="${RPU_QWEN35_WALL_FUSED_SILU_MUL:-$WALL_FUSED_SILU_MUL}"
+WALL_PREREDUCE_RESIDUAL_GATE="${RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE:-$WALL_PREREDUCE_RESIDUAL_GATE}"
+WALL_PREFIX_COPY_ONCE="${RPU_QWEN35_WALL_PREFIX_COPY_ONCE:-$WALL_PREFIX_COPY_ONCE}"
+normalize_bool WALL_FUSED_SILU_MUL RPU_QWEN35_WALL_FUSED_SILU_MUL \
+    "$WALL_FUSED_SILU_MUL"
+normalize_bool WALL_PREREDUCE_RESIDUAL_GATE RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE \
+    "$WALL_PREREDUCE_RESIDUAL_GATE"
+normalize_bool WALL_PREFIX_COPY_ONCE RPU_QWEN35_WALL_PREFIX_COPY_ONCE \
+    "$WALL_PREFIX_COPY_ONCE"
 PYTHON_BIN="${PYTHON_BIN:-$CONDA_PREFIX/bin/python}"
 [[ -x "$PYTHON_BIN" ]] || fatal "python is not executable: $PYTHON_BIN"
 [[ -d "$DATASET_DIR" ]] || fatal "dataset directory is missing: $DATASET_DIR"
@@ -480,6 +497,9 @@ if ((hw_perf_enabled)); then
     printf '  %-22s %s\n' 'hwperf max dumps:' "$HW_PERF_MAX_DUMPS"
     printf '  %-22s %s MHz\n' 'RPU trace frequency:' "$LKN_RPU_FREQ_MHZ"
 fi
+printf '  %-22s %s\n' 'fused silu_mul arm:' "$WALL_FUSED_SILU_MUL"
+printf '  %-22s %s\n' 'pre-reduce gate arm:' "$WALL_PREREDUCE_RESIDUAL_GATE"
+printf '  %-22s %s\n' 'prefix-copy-once arm:' "$WALL_PREFIX_COPY_ONCE"
 printf '  %-22s %s\n' 'mode:' "$([[ $check_only == 1 ]] && printf check || printf controlled-RPU-evaluation)"
 printf '  %-22s %s\n' 'output:' "$([[ $check_only == 1 ]] && printf none || printf '%s' "$OUTPUT_DIR")"
 
@@ -490,6 +510,9 @@ ENV_ARGS=(
     "RHINO_LAUNCH_LIB_DIR=$RHINO_LAUNCH_LIB_DIR"
     "LKN_RPU_FREQ_MHZ=$LKN_RPU_FREQ_MHZ"
     "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1"
+    "RPU_QWEN35_WALL_FUSED_SILU_MUL=$WALL_FUSED_SILU_MUL"
+    "RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE=$WALL_PREREDUCE_RESIDUAL_GATE"
+    "RPU_QWEN35_WALL_PREFIX_COPY_ONCE=$WALL_PREFIX_COPY_ONCE"
     "PYTHONUNBUFFERED=1"
     "TOKENIZERS_PARALLELISM=false"
     "TRANSFORMERS_OFFLINE=1"

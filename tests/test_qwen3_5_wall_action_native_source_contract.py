@@ -69,7 +69,9 @@ def test_wall_zero_residual_is_persistent_and_graph_initialized():
         "void Qwen3_5Model::build_layer_subgraph(",
         "void Qwen3_5Model::launch_linear(",
     )
-    assert "wall_action_mode_ && layer_idx == 0" in layer
+    assert "wall_action_mode_ &&" in layer
+    assert "!wall_action_prereduce_residual_gate_enabled()" in layer
+    assert "layer_idx == 0" in layer
     assert "rpu_launch_memset_spm_multicore(" in layer
     assert 'addr(0, "zero_resid"), chunk.len * h' in layer
 
@@ -100,8 +102,8 @@ def test_wall_identity_attention_and_mlp_gate_before_residual_add():
         "void Qwen3_5Model::build_full_attention(",
         "void Qwen3_5Model::build_gdn(",
     )
-    assert 'wall_action_mode_ ? addr(0, "zero_resid")' in attention
-    assert "if (wall_action_mode_)" in attention
+    assert 'addr(0, "zero_resid")' in attention
+    assert "wall_action_mode_ && !wall_prereduce_gate" in attention
 
 
 def test_wall_rejects_native_io_and_set_weights_clears_mode():
@@ -153,3 +155,32 @@ def test_legacy_g05_add_sub_gate_path_remains_available():
     assert "ValuOpType::SUB" in legacy
     assert "ValuOpType::MUL" in legacy
     assert "ValuOpType::ADD" in legacy
+
+
+def test_wall_swiglu_has_cold_silu_mul_fusion_arm():
+    wall_mlp = _section(
+        "void Qwen3_5Model::emit_wall_mlp_pipeline(",
+        "void Qwen3_5Model::emit_action_input_projection(",
+    )
+    assert 'RPU_QWEN35_WALL_FUSED_SILU_MUL' in CPP
+    assert "wall_action_fused_silu_mul_enabled" in wall_mlp
+    assert "rpu_launch_silu_mul_spm_kernel(" in wall_mlp
+    assert "ValuOpType::SILU" in wall_mlp
+    assert "ValuOpType::MUL" in wall_mlp
+
+
+def test_wall_can_prereduce_gate_into_existing_ring_residual_epilogue():
+    attention = _section(
+        "void Qwen3_5Model::build_full_attention(",
+        "void Qwen3_5Model::build_gdn(",
+    )
+    wall_mlp = _section(
+        "void Qwen3_5Model::emit_wall_mlp_pipeline(",
+        "void Qwen3_5Model::emit_action_input_projection(",
+    )
+    assert 'RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE' in CPP
+    assert "wall_action_prereduce_residual_gate_enabled" in attention
+    assert "wall_action_prereduce_residual_gate_enabled" in wall_mlp
+    assert "else if (action_mode_ && !wall_action_mode_)" in attention
+    assert 'addr(0, "residual2"), addr(0, "residual1")' in wall_mlp
+    assert 'addr(0, "zero_resid"), addr(0, "residual1")' in wall_mlp

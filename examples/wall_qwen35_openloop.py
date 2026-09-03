@@ -1024,6 +1024,41 @@ def _graph_stats(cache: Any) -> dict[str, Any] | None:
     }
 
 
+def _validate_retained_graph_stats(
+    name: str, stats: dict[str, Any] | None, *, calls: int
+) -> None:
+    """Require one build per retained signature and replay for the rest.
+
+    Wall deliberately retains more than one signature for Vision geometry and
+    prefix buckets.  Therefore ``size == 1`` is not a valid lifecycle check;
+    with ``calls`` total invocations, the minimum replay count is
+    ``calls - size`` (one BUILD for each signature).
+    """
+    if stats is None:
+        raise RuntimeError(f"{name} Graph lifecycle is unavailable")
+    size = int(stats.get("size", 0))
+    max_entries = int(stats.get("max_entries", 0))
+    entries = list(stats.get("entries", ()))
+    if (
+        not bool(stats.get("invariant_ok", False))
+        or size <= 0
+        or size != len(entries)
+        or size > max_entries
+        or int(stats.get("recaptures", 0)) != 0
+        or int(stats.get("replays", 0)) < max(0, int(calls) - size)
+        or any(
+            int(entry.get("kernel_count", 0)) <= 0
+            or bool(entry.get("non_replayable_reason"))
+            or int(entry.get("recapture_count", 0)) != 0
+            for entry in entries
+        )
+    ):
+        raise RuntimeError(
+            f"{name} Graph lifecycle did not prove one BUILD per retained "
+            f"signature and stable replay: {stats}"
+        )
+
+
 def _oneshot_graph_stats(graph: Any) -> dict[str, Any] | None:
     if graph is None:
         return None
@@ -1056,12 +1091,17 @@ def _policy_graph_stats(policy: Any) -> dict[str, Any]:
     vision = getattr(fusion, "visual", None)
     text = getattr(fusion, "language_model", None)
     text_state = getattr(text, "_rpu_qwen3_5", None)
+    prefill_cache = getattr(text_state, "prefill_graph_cache", None)
+    if prefill_cache is not None:
+        base_prefill = _graph_stats(prefill_cache)
+    else:
+        base_prefill = _oneshot_graph_stats(
+            getattr(text_state, "prefill_graph", None)
+        )
     return {
         "action": _graph_stats(getattr(action_state, "action_graph_cache", None)),
         "vision": _graph_stats(getattr(vision, "_rpu_vision_graph_cache", None)),
-        "base_prefill": _oneshot_graph_stats(
-            getattr(text_state, "prefill_graph", None)
-        ),
+        "base_prefill": base_prefill,
     }
 
 
@@ -1121,14 +1161,28 @@ def _profile_output_parity(warm: Any, measured: Any) -> dict[str, Any]:
         device="cpu", dtype=torch.float32
     )
     same_shape = tuple(warm_actions.shape) == tuple(measured_actions.shape)
-    exact = bool(same_shape and torch.equal(warm_actions, measured_actions))
+    finite = bool(
+        same_shape
+        and torch.isfinite(warm_actions).all()
+        and torch.isfinite(measured_actions).all()
+    )
+    exact = bool(
+        same_shape and finite and torch.equal(warm_actions, measured_actions)
+    )
     max_abs = (
         float((warm_actions - measured_actions).abs().max())
         if same_shape and warm_actions.numel()
         else None
     )
     return {
+        # Keep the exact parity contract in the admission record.  Numerical
+        # repeatability is evidence, not a reason to discard an otherwise
+        # valid diagnostic trace; the caller separately hard-fails shape,
+        # prefix, or non-finite mismatches.
         "accepted": bool(exact and warm.prefix_length == measured.prefix_length),
+        "same_shape": same_shape,
+        "finite": finite,
+        "prefix_equal": bool(warm.prefix_length == measured.prefix_length),
         "actions_exact": exact,
         "actions_max_abs": max_abs,
         "warm_prefix_length": warm.prefix_length,
@@ -1151,12 +1205,25 @@ def _ready_replay_admission(
         before.get("vision"), after.get("vision"), expected_replays=3
     )
     parity = _profile_output_parity(warm, measured)
-    base_prefill = {
-        "accepted": False,
-        "contract": "bounded one-shot; no retained READY entry",
-        "before": before.get("base_prefill"),
-        "after": after.get("base_prefill"),
-    }
+    base_before = before.get("base_prefill")
+    base_after = after.get("base_prefill")
+    if (
+        isinstance(base_before, dict)
+        and isinstance(base_after, dict)
+        and "entries" in base_before
+        and "entries" in base_after
+    ):
+        base_prefill = _retained_replay_admission(
+            base_before, base_after, expected_replays=1
+        )
+        base_prefill["contract"] = "retained prefix bucket Graph"
+    else:
+        base_prefill = {
+            "accepted": False,
+            "contract": "bounded one-shot; no retained READY entry",
+            "before": base_before,
+            "after": base_after,
+        }
     full_ready = bool(
         parity["accepted"]
         and action["accepted"]
@@ -1169,7 +1236,9 @@ def _ready_replay_admission(
             "Vision did not replay all three calls from stable retained signatures"
         )
     if not base_prefill["accepted"]:
-        blockers.append("Base Prefill is an explicit bounded one-shot graph")
+        blockers.append(
+            "Base Prefill did not replay a stable retained prefix bucket Graph"
+        )
     if not action["accepted"]:
         blockers.append("Action decoder did not prove ten stable replay calls")
     if not parity["accepted"]:
@@ -1443,6 +1512,18 @@ def main() -> int:
             "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN": os.environ.get(
                 "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
             ),
+            # Wall decode fusion arms are cold process-level selectors.  Keep
+            # their effective values in every run receipt so an A/B result is
+            # auditable even when the launcher rebuilds its environment.
+            "RPU_QWEN35_WALL_FUSED_SILU_MUL": os.environ.get(
+                "RPU_QWEN35_WALL_FUSED_SILU_MUL"
+            ),
+            "RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE": os.environ.get(
+                "RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE"
+            ),
+            "RPU_QWEN35_WALL_PREFIX_COPY_ONCE": os.environ.get(
+                "RPU_QWEN35_WALL_PREFIX_COPY_ONCE"
+            ),
         },
         "torch_profile": torch_profile_meta,
         "hw_perf": hw_perf_meta,
@@ -1569,10 +1650,23 @@ def main() -> int:
                     f"{admission['status']}",
                     flush=True,
                 )
-                if not admission["output_parity"]["accepted"]:
+                parity = admission["output_parity"]
+                if (
+                    not parity["same_shape"]
+                    or not parity["prefix_equal"]
+                    or not parity["finite"]
+                ):
                     raise RuntimeError(
-                        "profile warmup/repeat output parity failed: "
-                        f"{admission['output_parity']}"
+                        "profile warmup/repeat output shape/prefix/finite "
+                        f"contract failed: {parity}"
+                    )
+                if not parity["accepted"]:
+                    print(
+                        "[wall-qwen35-openloop] WARNING: warmup/repeat "
+                        "action values are not bit-exact; keeping the exported "
+                        "profile as diagnostic evidence "
+                        f"(max_abs={parity['actions_max_abs']})",
+                        flush=True,
                     )
             elif torch_profile_meta["mode"] == "per_request":
                 request_profiler = _new_torch_profiler(
@@ -1625,38 +1719,16 @@ def main() -> int:
             graph = _policy_graph_stats(policy)
             action_graph = graph["action"]
             vision_graph = graph["vision"]
-            if (
-                action_graph is None
-                or not action_graph["invariant_ok"]
-                or action_graph["size"] != 1
-                or action_graph["replays"] < 9
-                or action_graph["recaptures"] != 0
-                or any(
-                    entry["kernel_count"] <= 0
-                    or bool(entry["non_replayable_reason"])
-                    for entry in action_graph["entries"]
-                )
-            ):
-                raise RuntimeError(
-                    "action Graph lifecycle did not prove one BUILD plus nine "
-                    f"stable REPLAY calls: {action_graph}"
-                )
-            if (
-                vision_graph is None
-                or not vision_graph["invariant_ok"]
-                or vision_graph["size"] != 1
-                or vision_graph["replays"] < 1
-                or vision_graph["recaptures"] != 0
-                or any(
-                    entry["kernel_count"] <= 0
-                    or bool(entry["non_replayable_reason"])
-                    for entry in vision_graph["entries"]
-                )
-            ):
-                raise RuntimeError(
-                    "vision Graph lifecycle did not prove wrist-shape BUILD then "
-                    f"REPLAY with a valid retained entry: {vision_graph}"
-                )
+            completed_requests = request_index + 1
+            _validate_retained_graph_stats(
+                "action", action_graph, calls=10 * completed_requests
+            )
+            _validate_retained_graph_stats(
+                "vision", vision_graph, calls=3 * completed_requests
+            )
+            _validate_retained_graph_stats(
+                "base prefill", graph["base_prefill"], calls=completed_requests
+            )
             predictions_relative.append(relative)
             predictions_absolute.append(predicted_eval)
             ground_truth_chunks.append(target)
