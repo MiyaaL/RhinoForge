@@ -124,8 +124,17 @@ bash run_wall_qwen35_openloop.sh
 然后只记录同一请求的一次重复执行；`--torch-profile-output DIR` 指定输出目录。
 脚本生成带时间戳和 PID 的 `.trace.json` 以及配套 `.summary.json`，不会覆盖旧文件。
 summary 包含精简的 Torch key averages、warmup/重复执行 action 的精确一致性，以及
-各组件 Graph 生命周期证据。只有 Vision、Base Prefill 和 Action 都证明稳定 retained
-replay 时才会标记 `accepted`；生成 trace 本身不等于 READY。trace 中会直接出现
+各组件 Graph 生命周期证据。只有两种 Vision geometry、base Prefill bucket/末块拓扑
+签名和精确 prefix Action 都已冻结为只查找 READY，并分别证明精确的 `3/1/10` replay
+增量时，才会标记 `accepted`；生成 trace 本身不等于 READY。base-text prefix 会映射到
+`64..384` 的固定 64 行 bucket，签名还区分末个 native chunk 的 1 行、2--31 行和 32+
+行拓扑，避免跨 node/grid 分支 replay。Action fast replay 会固化真实 prefix 的 KV 插入
+位置和 SDPA 长度，因此 prefix 改变时会重建。这个有界同请求探测结束后，cache 会回到
+WARMING，允许后续数据集 prefix 合法 BUILD；该探测不构成全数据集 frozen-READY 声明。
+若硬件上的 FP16 重复执行有数值漂移，仍会导出 trace，并在 summary 中保留
+`actions_exact=false` / `actions_norm_exact=false` 及各自的最大绝对差；只有物理/归一化
+输出的 shape、prefix、归一化输出缺失或非有限值不匹配才会中止。
+trace 中会直接出现
 `wall_qwen35_preprocess`、`wall_qwen35_vision_text_prefill`、
 `wall_qwen35_action_denoise_loop` 和 `wall_qwen35_action_decoder` 阶段。
 

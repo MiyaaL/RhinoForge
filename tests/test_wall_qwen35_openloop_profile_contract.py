@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import numpy as np
 from pathlib import Path
@@ -463,7 +464,7 @@ def test_ready_replay_admission_rejects_oneshot_prefill_and_vision_rebuild(
         return {
             "size": 1,
             "max_entries": 1,
-            "phase": "CONFIGURING",
+            "phase": "READY",
             "replays": replays,
             "recaptures": 0,
             "entries": [
@@ -493,12 +494,18 @@ def test_ready_replay_admission_rejects_oneshot_prefill_and_vision_rebuild(
         "vision": retained(1),
         "base_prefill": {"contract": "bounded one-shot; no replay claim"},
     }
-    output = SimpleNamespace(
+    warm_output = SimpleNamespace(
         actions=torch.zeros((1, 32, 26)),
+        actions_norm=torch.zeros((1, 32, 26)),
+        prefix_length=299,
+    )
+    measured_output = SimpleNamespace(
+        actions=warm_output.actions.clone(),
+        actions_norm=warm_output.actions_norm.clone(),
         prefix_length=299,
     )
 
-    admission = classify(before, after, output, output)
+    admission = classify(before, after, warm_output, measured_output)
 
     assert admission["status"] == "runtime_extension_required"
     assert admission["full_ready"] is False
@@ -506,6 +513,261 @@ def test_ready_replay_admission_rejects_oneshot_prefill_and_vision_rebuild(
     assert admission["components"]["vision"]["accepted"] is False
     assert admission["components"]["base_prefill"]["accepted"] is False
     assert admission["output_parity"]["accepted"] is True
+
+
+def test_ready_replay_admission_accepts_retained_prefix_bucket(
+    openloop_namespace,
+) -> None:
+    classify = openloop_namespace["_ready_replay_admission"]
+    torch = openloop_namespace["torch"]
+
+    def retained(replays: int, *, signature: str = "sig", phase: str = "READY"):
+        return {
+            "size": 1,
+            "max_entries": 7,
+            "phase": phase,
+            "replays": replays,
+            "recaptures": 0,
+            "entries": [
+                {
+                    "signature": signature,
+                    "kernel_count": 4,
+                    "segment_count": 1,
+                    "local_spm_slot_count": 0,
+                    "data_node_count": 2,
+                    "replay_count": replays,
+                    "recapture_count": 0,
+                    "non_replayable_reason": "",
+                }
+            ],
+            "invariant_ok": True,
+        }
+
+    before = {
+        "action": retained(9),
+        "vision": retained(1),
+        "base_prefill": retained(0, signature="bucket=320"),
+    }
+    after = {
+        "action": retained(19),
+        "vision": retained(4),
+        "base_prefill": retained(1, signature="bucket=320"),
+    }
+    warm_output = SimpleNamespace(
+        actions=torch.zeros((1, 32, 26)),
+        actions_norm=torch.zeros((1, 32, 26)),
+        prefix_length=299,
+    )
+    measured_output = SimpleNamespace(
+        actions=warm_output.actions.clone(),
+        actions_norm=warm_output.actions_norm.clone(),
+        prefix_length=299,
+    )
+
+    admission = classify(before, after, warm_output, measured_output)
+
+    assert admission["status"] == "accepted"
+    assert admission["full_ready"] is True
+    assert admission["output_parity"]["actions_norm_exact"] is True
+    assert admission["components"]["base_prefill"]["accepted"] is True
+    assert admission["components"]["base_prefill"]["contract"] == (
+        "retained prefix bucket Graph"
+    )
+
+    configuring_before = {
+        name: retained(
+            int(stats["replays"]),
+            signature=stats["entries"][0]["signature"],
+            phase="CONFIGURING",
+        )
+        for name, stats in before.items()
+    }
+    configuring = classify(
+        configuring_before, after, warm_output, measured_output
+    )
+    assert configuring["status"] == "runtime_extension_required"
+    assert configuring["full_ready"] is False
+    assert all(
+        component["ready_phase"] is False
+        for component in configuring["components"].values()
+    )
+
+    missing_normalized = SimpleNamespace(
+        actions=warm_output.actions.clone(),
+        actions_norm=None,
+        prefix_length=299,
+    )
+    missing = classify(before, after, warm_output, missing_normalized)
+    assert missing["full_ready"] is False
+    assert missing["output_parity"]["actions_norm_present"] is False
+
+    wrong_normalized_shape = SimpleNamespace(
+        actions=warm_output.actions.clone(),
+        actions_norm=torch.zeros((1, 31, 26)),
+        prefix_length=299,
+    )
+    wrong_shape_warm = SimpleNamespace(
+        actions=warm_output.actions.clone(),
+        actions_norm=wrong_normalized_shape.actions_norm.clone(),
+        prefix_length=299,
+    )
+    wrong_shape = classify(
+        before, after, wrong_shape_warm, wrong_normalized_shape
+    )
+    assert wrong_shape["full_ready"] is False
+    assert wrong_shape["output_parity"]["actions_norm_same_shape"] is False
+
+    drifted_normalized = SimpleNamespace(
+        actions=warm_output.actions.clone(),
+        actions_norm=warm_output.actions_norm.clone(),
+        prefix_length=299,
+    )
+    drifted_normalized.actions_norm[0, 0, 0] = 1.0
+    drifted = classify(before, after, warm_output, drifted_normalized)
+    assert drifted["full_ready"] is False
+    assert drifted["output_parity"]["actions_norm_same_shape"] is True
+    assert drifted["output_parity"]["actions_norm_finite"] is True
+    assert drifted["output_parity"]["actions_norm_exact"] is False
+    assert drifted["output_parity"]["actions_norm_max_abs"] == 1.0
+
+
+def test_ready_probe_freezes_then_restores_all_three_caches(
+    openloop_namespace,
+) -> None:
+    freeze = openloop_namespace["_frozen_policy_graph_caches"]
+    events = []
+
+    class Cache:
+        phase = "CONFIGURING"
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def freeze(self):
+            events.append(f"freeze:{self.name}")
+            self.phase = "READY"
+
+        def begin_warmup(self):
+            events.append(f"warm:{self.name}")
+            self.phase = "WARMING"
+
+    action = Cache("action")
+    vision = Cache("vision")
+    prefill = Cache("prefill")
+    policy = SimpleNamespace(
+        _runtime=SimpleNamespace(
+            action_expert=SimpleNamespace(
+                _rpu_qwen3_5=SimpleNamespace(action_graph_cache=action)
+            ),
+            base_model=SimpleNamespace(
+                model=SimpleNamespace(
+                    visual=SimpleNamespace(_rpu_vision_graph_cache=vision),
+                    language_model=SimpleNamespace(
+                        _rpu_qwen3_5=SimpleNamespace(
+                            prefill_graph_cache=prefill
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+
+    with freeze(policy) as caches:
+        assert all(cache.phase == "READY" for cache in caches.values())
+    assert all(cache.phase == "WARMING" for cache in caches.values())
+    assert events == [
+        "freeze:action",
+        "freeze:vision",
+        "freeze:prefill",
+        "warm:prefill",
+        "warm:vision",
+        "warm:action",
+    ]
+
+    events.clear()
+    action.phase = vision.phase = prefill.phase = "CONFIGURING"
+
+    def fail_freeze():
+        events.append("freeze:vision-failed")
+        raise RuntimeError("freeze failed")
+
+    vision.freeze = fail_freeze
+    with pytest.raises(RuntimeError, match="freeze failed"):
+        with freeze(policy):
+            pytest.fail("partial freeze must not enter the READY body")
+    assert action.phase == "WARMING"
+    assert vision.phase == "CONFIGURING"
+    assert prefill.phase == "CONFIGURING"
+    assert events == [
+        "freeze:action",
+        "freeze:vision-failed",
+        "warm:action",
+    ]
+
+
+def test_prefix_bucket_selection_and_plan_are_fixed_shape() -> None:
+    from rpu_backend.adapters.qwen3_5.text import (
+        _plan_prefill_bucket,
+        _prefill_bucket_tail_class,
+        _select_prefill_bucket,
+    )
+
+    buckets = (64, 128, 192, 256, 320, 384)
+    assert _select_prefill_bucket(299, buckets) == 320
+    assert _select_prefill_bucket(320, buckets) == 320
+    assert _select_prefill_bucket(321, buckets) == 384
+    assert _select_prefill_bucket(384, buckets) == 384
+    with pytest.raises(RuntimeError, match="largest retained bucket 384"):
+        _select_prefill_bucket(385, buckets)
+
+    calls = []
+
+    def resolve(length: int) -> int:
+        calls.append(length)
+        return 128
+
+    assert _plan_prefill_bucket(
+        313,
+        320,
+        848,
+        64,
+        resolve,
+    ) == (320, 128)
+    assert calls == [320]
+    assert _plan_prefill_bucket(320, 320, 848, 64, resolve) == (320, 128)
+    with pytest.raises(RuntimeError, match="over the configured budget"):
+        _plan_prefill_bucket(255, 320, 848, 64, resolve)
+
+    # These three real lengths share bucket=320/chunk=128 but cross native
+    # convolution node/grid envelopes, so they must not share Graph identity.
+    assert _prefill_bucket_tail_class(257, 320, 128) == 1
+    assert _prefill_bucket_tail_class(258, 320, 128) == 2
+    assert _prefill_bucket_tail_class(287, 320, 128) == 2
+    assert _prefill_bucket_tail_class(288, 320, 128) == 3
+    assert _prefill_bucket_tail_class(320, 320, 128) == 3
+
+
+def test_prefill_bucket_plan_cache_keeps_real_length_in_its_key() -> None:
+    from rpu_backend.adapters.qwen3_5.text import run_qwen3_5_text
+
+    source = inspect.getsource(run_qwen3_5_text)
+    assert re.search(
+        r"plan_key\s*=\s*\(\s*real_len,\s*prefill_bucket,",
+        source,
+    )
+
+
+def test_vision_graph_capacity_is_monotonic_after_install() -> None:
+    import torch
+
+    from rpu_backend.api.errors import RPUConfigError
+    from rpu_backend.runtime.hw_attrs import install_hw_attr_validator
+
+    module = torch.nn.Module()
+    install_hw_attr_validator(module)
+    module._rpu_vision_graph_max_entries = 2
+    with pytest.raises(RPUConfigError, match="monotonic"):
+        module._rpu_vision_graph_max_entries = 1
 
 
 def test_per_request_profile_uses_reference_filename_and_artifact_manifest(

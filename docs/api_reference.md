@@ -165,7 +165,15 @@ exact locally admitted checkpoint. Its initial envelope is FP16 batch 1 with
 exactly the three canonical cameras, an initial multimodal prefix no longer
 than 384 tokens, Dataset-V2 single-stage BICUBIC image preprocessing, robot ID
 `10070`, normalizer `x2_normal`, state/action masks `[1]*20+[0]*6`, an action
-shape of `[1,32,26]`, and 10 Euler steps.
+shape of `[1,32,26]`, and 10 Euler steps. The controlled runtime maps base-text
+prefill into fixed 64-row execution buckets from 64 through 384. A retained
+Prefill signature also distinguishes the native final-chunk topology classes
+(one row, 2--31 rows, or at least 32 rows); valid prefix length and M-RoPE
+values remain per-call mutable state within a class. Native pad-zeroing emits a
+stable fill-node envelope even for an exact bucket boundary. Action fast replay
+remains keyed by the exact real prefix length because its KV insertion and SDPA
+registers bake in that value. These optimizations are internal to the Wall
+profile and do not broaden the generic Qwen3.5 execution API.
 `predict_action_chunk(..., initial_noise=...)` accepts a finite CPU FP32-
 convertible tensor with shape `[32,26]` or `[1,32,26]` for exact cross-device
 flow-input parity. It is mutually exclusive with `noise_seed`; omitting both

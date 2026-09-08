@@ -53,7 +53,41 @@ from rpu_backend.api.cache import RPUCache
 
 
 QWEN3_5_VISION_ARCH = "qwen3_5_vision"
+# The generic Qwen3.5 path keeps one shape to bound its private queue usage.
+# Wall's controlled VLA request contains two distinct image geometries in the
+# same prefix (face + wrist); retaining both is required for a repeat to stay
+# on REPLAY instead of rebuilding one geometry on every request.  The opt-in is
+# deliberately environment-scoped so generic Qwen3.5 behavior remains
+# unchanged unless a caller explicitly budgets the extra graph entry.
+_VISION_GRAPH_MAX_ENTRIES_ENV = "QWEN3_5_VISION_GRAPH_MAX_ENTRIES"
+_VISION_GRAPH_MAX_ENTRIES_LIMIT = (1 << 63) - 1
 _VISION_INSTALL_LOCK = threading.RLock()
+
+
+def _parse_vision_graph_max_entries(value: Any | None = None) -> int:
+    """Parse the bounded GraphCache capacity before any model mutation."""
+
+    raw_value = (
+        os.environ.get(_VISION_GRAPH_MAX_ENTRIES_ENV, "1")
+        if value is None
+        else value
+    )
+    try:
+        max_entries = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{_VISION_GRAPH_MAX_ENTRIES_ENV} must be a positive integer, "
+            f"got {raw_value!r}"
+        ) from exc
+    # The pybind diagnostic surface exposes this size_t value as int64_t.
+    # Reject values that would wrap there before creating a handle or swizzling
+    # any checkpoint weights.
+    if not 1 <= max_entries <= _VISION_GRAPH_MAX_ENTRIES_LIMIT:
+        raise ValueError(
+            f"{_VISION_GRAPH_MAX_ENTRIES_ENV} must be in "
+            f"[1, {_VISION_GRAPH_MAX_ENTRIES_LIMIT}], got {max_entries}"
+        )
+    return max_entries
 
 
 def build_vision_rope_tables(
@@ -391,6 +425,7 @@ _QWEN3_5_VISION_READY_ATTRS = (
     "_rpu_vision_kv_cache",
     "_rpu_vision_graph_disable",
     "_rpu_vision_graph_cache",
+    "_rpu_vision_graph_max_entries",
     "_rpu_vision_graph_key",
     "_rpu_vision_graph_sig",
     "_rpu_vision_debug_graph",
@@ -429,7 +464,19 @@ def _qwen3_5_vision_runtime_complete(
         return False
     if not getattr(finalizer, "alive", False):
         return False
-    if getattr(vision_model, "_rpu_vision_graph_cache", None) is None:
+    graph_cache = getattr(vision_model, "_rpu_vision_graph_cache", None)
+    if graph_cache is None:
+        return False
+    graph_max_entries = getattr(
+        vision_model, "_rpu_vision_graph_max_entries", None
+    )
+    try:
+        if (
+            int(graph_max_entries) < 1
+            or int(graph_cache.max_entries()) != int(graph_max_entries)
+        ):
+            return False
+    except (AttributeError, TypeError, ValueError):
         return False
     if getattr(vision_model, "_rpu_vision_debug_graph", None) is None:
         return False
@@ -622,6 +669,13 @@ def _install_qwen3_5_vision_for_rpu_impl(
             "only, set QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 before the first "
             "image forward."
         )
+    # This is a MODEL-scope setting. Parse it and construct the empty cache
+    # before the installation marker, native handle, or irreversible weight
+    # conversion so malformed values leave a clean, retryable CPU model.
+    graph_max_entries = _parse_vision_graph_max_entries()
+    vision_graph_cache = rpu_backend.graph.GraphCache(
+        max_entries=graph_max_entries
+    )
     if not hasattr(vision_model, "_rpu_qwen3_5_original_forward"):
         model_vars = vars(vision_model)
         vision_model._rpu_qwen3_5_had_instance_forward = "forward" in model_vars
@@ -800,11 +854,15 @@ def _install_qwen3_5_vision_for_rpu_impl(
         num_layers, max_seq_len, num_heads, head_dim
     )
     # One cached shape is enough for same-size images/repeated requests and bounds the
-    # private Queue_t cost. A shape change evicts this entry before building the next.
+    # private Queue_t cost.  A Wall request contains two geometries, so its
+    # controlled path sets QWEN3_5_VISION_GRAPH_MAX_ENTRIES=2 before this lazy
+    # installer runs. Keep the generic default at one; capacity was validated
+    # and the empty cache constructed before any model mutation above.
     vision_model._rpu_vision_graph_disable = (
         os.environ.get("QWEN3_5_VISION_GRAPH_DISABLE", "0") != "0"
     )
-    vision_model._rpu_vision_graph_cache = rpu_backend.graph.GraphCache(max_entries=1)
+    vision_model._rpu_vision_graph_cache = vision_graph_cache
+    vision_model._rpu_vision_graph_max_entries = graph_max_entries
     vision_model._rpu_vision_graph_key = None
     vision_model._rpu_vision_graph_sig = None
     vision_model._rpu_vision_debug_graph = rpu_backend.graph.Graph()
@@ -1063,7 +1121,16 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
                 compact_input, tuple(embed_i.shape),
             )
             if self._rpu_vision_graph_key != key:
-                if self._rpu_vision_graph_sig is not None:
+                # The generic path deliberately retains one shape.  Wall's
+                # controlled path sets a bounded two-entry cache so face and
+                # wrist geometries can coexist; do not evict the previous
+                # signature in that mode.  GraphCache has no implicit LRU, so
+                # a third geometry fails at the explicit capacity bound rather
+                # than silently changing the admitted profile.
+                if (
+                    getattr(self, "_rpu_vision_graph_max_entries", 1) <= 1
+                    and self._rpu_vision_graph_sig is not None
+                ):
                     self._rpu_vision_graph_cache.evict(self._rpu_vision_graph_sig)
                 self._rpu_vision_graph_sig = rpu_backend.graph.GraphSignature(
                     op_id="qwen3_5_vision",

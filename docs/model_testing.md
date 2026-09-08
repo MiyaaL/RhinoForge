@@ -169,9 +169,22 @@ request once without a profiler, then records exactly one identical repeat.
 `wall_qwen35_torch_profile_YYYYMMDD_HHMMSS_PID.trace.json` and matching
 `.summary.json` files make repeated runs non-overwriting. The summary contains
 compact Torch key averages, exact warmup/repeat action parity, and component
-Graph lifecycle evidence. It reports `accepted` only when Vision, base Prefill,
-and Action all prove stable retained replay; a generated trace is not itself a
-READY claim. Named ranges expose `wall_qwen35_preprocess`,
+Graph lifecycle evidence. It reports `accepted` only when Vision, a retained
+base Prefill bucket/topology signature, and exact-prefix Action are frozen in
+lookup-only READY and prove exact replay deltas of 3, 1, and 10 respectively; a
+generated trace is not itself a READY claim. Wall base-text prefixes are assigned
+to fixed 64-row buckets up to 384. The signature also separates the native
+one-row, 2--31-row, and 32+-row final-chunk envelopes, so compatible requests in
+one bucket can REPLAY without crossing a node/grid topology branch. Action
+rebuilds when the real prefix changes because its fast replay bakes that length
+into KV-insert and SDPA registers. After the bounded exact-repeat probe, the
+caches return to WARMING so later dataset prefixes may build; no dataset-wide
+frozen-READY claim follows from that probe. On hardware that exhibits FP16
+repeat drift, the trace is still exported and the summary keeps
+`actions_exact=false` / `actions_norm_exact=false` with their respective maximum
+absolute differences; only physical/normalized shape, prefix, missing normalized
+output, or non-finite mismatches abort the run. Named ranges expose
+`wall_qwen35_preprocess`,
 `wall_qwen35_vision_text_prefill`, `wall_qwen35_action_denoise_loop`, and
 `wall_qwen35_action_decoder` directly in the trace.
 

@@ -112,6 +112,130 @@ def _plan_prefill_execution(real_len, physical_limit, padding_budget,
     )
 
 
+def _select_prefill_bucket(real_len, bucket_sizes):
+    """Select the smallest fixed execution bucket covering ``real_len``.
+
+    Prefix buckets are an adapter opt-in.  The generic Qwen3.5 path keeps its
+    variable-length one-shot contract; a policy such as Wall may provide a
+    finite, 64-row-aligned tuple so repeated prefixes share a retained graph.
+    Keeping this helper independent of the native backend makes the admission
+    rule testable before a handle is created.
+    """
+    real_len = int(real_len)
+    if real_len <= 0:
+        raise ValueError(f"prefill real length must be positive, got {real_len}")
+    if bucket_sizes is None:
+        return None
+    try:
+        buckets = tuple(int(item) for item in bucket_sizes)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prefill_bucket_sizes must be an iterable of integers") from exc
+    if not buckets or any(item <= 0 or item % 64 for item in buckets):
+        raise ValueError(
+            "prefill_bucket_sizes must contain positive 64-row-aligned buckets"
+        )
+    if tuple(sorted(set(buckets))) != buckets:
+        raise ValueError(
+            "prefill_bucket_sizes must be strictly increasing without duplicates"
+        )
+    for bucket in buckets:
+        if real_len <= bucket:
+            return bucket
+    raise RuntimeError(
+        f"prefill prefix length {real_len} exceeds the largest retained bucket "
+        f"{buckets[-1]}"
+    )
+
+
+def _plan_prefill_bucket(real_len, bucket_len, physical_limit, padding_budget,
+                         resolve_chunk_size, *, padding_rows="auto",
+                         exact_chunk_size=None):
+    """Validate and resolve one fixed prefix bucket.
+
+    ``plan_bounded_prefill_execution`` intentionally chooses among candidate
+    lengths.  A bucket must instead force exactly one execution shape so its
+    Graph signature stays stable while ``real_len`` changes between requests.
+    """
+    real_len = int(real_len)
+    bucket_len = int(bucket_len)
+    physical_limit = int(physical_limit)
+    padding_budget = int(padding_budget)
+    if bucket_len < real_len or bucket_len % 64:
+        raise ValueError(
+            f"invalid prefill bucket {bucket_len} for real length {real_len}; "
+            "bucket must be >= real length and 64-row aligned"
+        )
+    if bucket_len > physical_limit:
+        raise RuntimeError(
+            f"prefill bucket {bucket_len} exceeds physical cache limit "
+            f"{physical_limit}"
+        )
+    padding = bucket_len - real_len
+    if padding > padding_budget:
+        raise RuntimeError(
+            f"prefill bucket {bucket_len} requires {padding} padding rows, "
+            f"over the configured budget {padding_budget}"
+        )
+    if padding_rows != "auto" and int(padding_rows) != padding:
+        raise ValueError(
+            "prefix bucket execution conflicts with exact padding_rows: "
+            f"bucket={bucket_len}, real_len={real_len}, padding_rows={padding_rows}"
+        )
+    try:
+        chunk_size = int(resolve_chunk_size(bucket_len))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"native resolver rejected prefix bucket {bucket_len}: {exc}"
+        ) from exc
+    if chunk_size <= 0 or chunk_size % 16:
+        raise RuntimeError(
+            "Qwen3.5 prefill bucket resolver returned invalid chunk_size="
+            f"{chunk_size} for execution_len={bucket_len}"
+        )
+    if exact_chunk_size is not None and chunk_size != int(exact_chunk_size):
+        raise RuntimeError(
+            "prefix bucket resolver returned chunk_size="
+            f"{chunk_size}, not exact request {exact_chunk_size}"
+        )
+    num_chunks = (bucket_len + chunk_size - 1) // chunk_size
+    if (num_chunks - 1) * chunk_size >= real_len:
+        raise RuntimeError(
+            f"prefix bucket {bucket_len} would end with a padding-only chunk"
+        )
+    return bucket_len, chunk_size
+
+
+def _prefill_bucket_tail_class(real_len, bucket_len, chunk_size):
+    """Return the native GDN tail-topology class for a retained bucket.
+
+    Qwen3.5's prefill convolution emits one of three node envelopes for the
+    final physical chunk: the one-token decode kernel, the unsegmented prefill
+    kernel for 2..31 valid rows, or the eight-segment prefill kernel for 32+
+    rows.  Register values are mutable within each class, but Graph replay
+    requires the class itself in the signature because its node/grid topology
+    differs.
+    """
+    real_len = int(real_len)
+    bucket_len = int(bucket_len)
+    chunk_size = int(chunk_size)
+    if real_len <= 0 or bucket_len < real_len or chunk_size <= 0:
+        raise ValueError(
+            "prefill bucket tail classification requires "
+            "0 < real_len <= bucket_len and chunk_size > 0"
+        )
+    final_offset = ((bucket_len - 1) // chunk_size) * chunk_size
+    valid_tail = real_len - final_offset
+    if valid_tail <= 0:
+        raise RuntimeError(
+            f"prefill bucket {bucket_len} would end with a padding-only chunk"
+        )
+    if valid_tail == 1:
+        return 1
+    if valid_tail < 32:
+        return 2
+    return 3
+
+
 _VALID_LAYER_TYPES = {"linear_attention", "full_attention"}
 
 # Certified chunk envelope.
@@ -751,8 +875,9 @@ def _install_qwen3_5_text_for_rpu_impl(
         _drop_raw_hf_text_weights(inner, is_full)
 
         # Per-model GraphCache keeps the stable decode signature on BUILD→REPLAY.
-        # Variable-length prefill uses the bounded raw-Graph one-shot above instead;
-        # uncached PASSTHROUGH is queue-safe but would rebuild every immediate op.
+        # A fixed-profile policy may attach ``prefill_graph_cache`` and
+        # ``prefill_bucket_sizes`` after installation; until then variable-length
+        # prefill uses the bounded raw-Graph one-shot above.
         #
         # Stash all per-forward state on `text_model._rpu_qwen3_5`. The namespace
         # is not itself a native handle. `run_qwen3_5_text` reads it, while the
@@ -774,9 +899,10 @@ def _install_qwen3_5_text_for_rpu_impl(
             adaptive_mode=adaptive_mode,
             prefill_plan_key=None,
             prefill_plan=None,
-            # Prefill uses a dedicated Graph outside GraphCache because its
-            # signature varies with real length. Each call records and executes
-            # one shot, while decode retains the cache for stable replay.
+            # Generic Qwen3.5 prefill uses a dedicated Graph outside GraphCache
+            # because its signature varies with real length. Fixed-profile
+            # callers can attach a retained cache plus bucket tuple after the
+            # install; the forward path then keys by bucket, not real length.
             prefill_graph=prefill_graph,
         )
     except BaseException:
@@ -838,9 +964,18 @@ def run_qwen3_5_text(text_model, hidden, cache, *, attention_mask=None,
     # spend the cold padding budget only when the exact C++ planner can reduce
     # the chunk count. Padding remains text-only and bounded by physical KV capacity.
     planned_chunk_size = 0
+    prefill_bucket = None
     if seq_len > 1:
+        # A fixed-profile policy (Wall) supplies a finite bucket tuple.  The
+        # bucket is the physical execution length and therefore the only shape
+        # discriminator needed for Graph admission; valid token count remains
+        # mutable native state refreshed immediately before replay.
+        prefill_bucket = _select_prefill_bucket(
+            real_len, getattr(st, "prefill_bucket_sizes", None)
+        )
         plan_key = (
             real_len,
+            prefill_bucket,
             int(cache.allocated_max_seq_len),
             st.padding_budget,
             st.padding_rows,
@@ -848,6 +983,19 @@ def run_qwen3_5_text(text_model, hidden, cache, *, attention_mask=None,
         )
         if st.prefill_plan_key == plan_key:
             pad_len, planned_chunk_size = st.prefill_plan
+        elif prefill_bucket is not None:
+            pad_len, planned_chunk_size = _plan_prefill_bucket(
+                real_len,
+                prefill_bucket,
+                cache.allocated_max_seq_len,
+                st.padding_budget,
+                lambda n: torch.ops.rpu.qwen3_5_resolve_prefill_chunk_size(
+                    handle, n),
+                padding_rows=st.padding_rows,
+                exact_chunk_size=st.exact_chunk_size,
+            )
+            st.prefill_plan_key = plan_key
+            st.prefill_plan = (pad_len, planned_chunk_size)
         else:
             pad_len, planned_chunk_size = _plan_prefill_execution(
                 real_len,
@@ -910,14 +1058,44 @@ def run_qwen3_5_text(text_model, hidden, cache, *, attention_mask=None,
                 active_cache = prefill_cache
                 op_id = "rpu_g05_qwen3_5_prefill"
                 sig_attr = "prefill_graph_sig"
+            # ``real_len`` is deliberately absent from this signature for a
+            # bucketed policy.  It is refreshed through the native mutable
+            # valid-length setter above; including it would recapture once per
+            # prompt and defeat the point of prefix bucketing.
+            signature_len = (
+                prefill_bucket if prefill_bucket is not None else real_len
+            )
+            if not debug_export:
+                op_id = getattr(
+                    st, "prefill_graph_op_id", "rpu_g05_qwen3_5_prefill"
+                )
+            dyn_dims = [num_layers, signature_len, planned_chunk_size]
+            if prefill_bucket is not None:
+                # ``valid_prefill_len`` changes registers inside a topology
+                # class, but the native one-token/unsegmented/segmented GDN
+                # tails emit different nodes and grids.  Keep that semantic
+                # branch in the signature while still sharing one graph among
+                # real lengths with the same bucket and native envelope.
+                dyn_dims.append(
+                    _prefill_bucket_tail_class(
+                        real_len, prefill_bucket, planned_chunk_size
+                    )
+                )
             sig = _rb.graph.GraphSignature(
                 op_id=op_id,
                 shapes=[seq_len, hidden_size],
-                dyn_dims=[num_layers, real_len, planned_chunk_size],
+                dyn_dims=dyn_dims,
                 dtypes=[torch.float16],
             )
             old_sig = getattr(st, sig_attr, None)
-            if old_sig is not None and old_sig != sig:
+            # Bucketed caches intentionally retain one entry per configured
+            # bucket.  The legacy G05 one-entry cache still evicts on a shape
+            # change, and the debug cache is always one-entry as well.
+            retain_bucket_entries = (
+                active_cache is prefill_cache
+                and getattr(st, "prefill_bucket_sizes", None) is not None
+            )
+            if old_sig is not None and old_sig != sig and not retain_bucket_entries:
                 active_cache.evict(old_sig)
             setattr(st, sig_attr, sig)
             ctx = active_cache.capture(sig)
@@ -949,6 +1127,7 @@ def run_qwen3_5_text(text_model, hidden, cache, *, attention_mask=None,
         "stage": "prefill" if is_prefill else "decode",
         "logical_len": int(real_len),
         "execution_len": int(seq_len),
+        "bucket_len": int(prefill_bucket) if prefill_bucket is not None else None,
         "chunk_size": resolved,
         "padding_rows": int(seq_len - real_len),
         "position": int(cache.position),

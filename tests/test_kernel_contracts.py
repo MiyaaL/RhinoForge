@@ -230,10 +230,89 @@ def test_qwen3_5_vision_gate_precedes_handle_and_weight_mutation() -> None:
     assert gate < install.index("torch.ops.rpu.qwen3_5_vision_create()")
     assert gate < install.index("_convert_vision_block_weights_for_rpu(")
 
+    graph_capacity = install.index("_parse_vision_graph_max_entries()")
+    assert graph_capacity < install.index(
+        "vision_model._rpu_vision_installing = True"
+    )
+    assert graph_capacity < install.index("torch.ops.rpu.qwen3_5_vision_create()")
+    assert graph_capacity < install.index("_convert_vision_block_weights_for_rpu(")
+
     example = (ROOT / "examples/qwen3_5_vision.py").read_text(encoding="utf-8")
     assert example.index("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") < example.index(
         "    import torch"
     )
+
+
+@pytest.mark.parametrize("value", ["invalid", "0", "-1", str(1 << 63)])
+def test_qwen3_5_vision_graph_capacity_fails_before_mutation(
+    value, monkeypatch
+) -> None:
+    monkeypatch.setenv("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED", "1")
+    monkeypatch.setenv("QWEN3_5_VISION_GRAPH_MAX_ENTRIES", value)
+    model = SimpleNamespace(
+        blocks=[SimpleNamespace() for _ in range(24)],
+        merger=object(),
+        config=SimpleNamespace(
+            num_heads=16,
+            hidden_size=1024,
+            intermediate_size=4096,
+            spatial_merge_size=2,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="VISION_GRAPH_MAX_ENTRIES"):
+        qwen3_5_vision.install_qwen3_5_vision_for_rpu(model)
+
+    assert not any(name.startswith("_rpu_") for name in vars(model))
+
+
+def test_qwen3_5_vision_runtime_requires_matching_graph_capacity() -> None:
+    class Cache:
+        def __init__(self, max_entries: int) -> None:
+            self.value = max_entries
+
+        def max_entries(self) -> int:
+            return self.value
+
+    blocks = [
+        SimpleNamespace(
+            _rpu_qwen3_5_vision_weights_converted=True,
+            _rpu_qwen3_5_vision_conversion_started=False,
+        )
+        for _ in range(24)
+    ]
+    vision = SimpleNamespace(
+        blocks=blocks,
+        _rpu_vision_handle=1,
+        _rpu_vision_handle_finalizer=SimpleNamespace(alive=True),
+        _rpu_vision_freq_cos=object(),
+        _rpu_vision_freq_sin=object(),
+        _rpu_vision_position_idx_keepalive=object(),
+        _rpu_vision_step0=False,
+        _rpu_vision_patch_embed_w=object(),
+        _rpu_vision_patch_embed_b=None,
+        _rpu_vision_has_merger=False,
+        _rpu_vision_kv_cache=object(),
+        _rpu_vision_graph_disable=False,
+        _rpu_vision_graph_cache=Cache(2),
+        _rpu_vision_graph_max_entries=2,
+        _rpu_vision_graph_key=None,
+        _rpu_vision_graph_sig=None,
+        _rpu_vision_debug_graph=object(),
+        _rpu_vision_spatial_merge_size=2,
+        _rpu_vision_num_layers=24,
+        _rpu_vision_hidden_size=1024,
+        _rpu_qwen3_5_had_instance_forward=False,
+        _rpu_qwen3_5_original_forward=None,
+    )
+    vision.forward = qwen3_5_vision._rpu_vision_forward.__get__(vision)
+
+    assert qwen3_5_vision._qwen3_5_vision_runtime_complete(vision)
+    vision._rpu_vision_graph_max_entries = 1
+    assert not qwen3_5_vision._qwen3_5_vision_runtime_complete(vision)
+    vision._rpu_vision_graph_max_entries = 2
+    vision._rpu_vision_graph_cache.value = 1
+    assert not qwen3_5_vision._qwen3_5_vision_runtime_complete(vision)
 
 
 def test_qwen3_14b_requires_exact_lm_head_quantization_metadata() -> None:

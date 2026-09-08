@@ -1105,6 +1105,50 @@ def _policy_graph_stats(policy: Any) -> dict[str, Any]:
     }
 
 
+def _policy_retained_graph_caches(policy: Any) -> dict[str, Any]:
+    """Resolve the three caches required by the exact-repeat READY probe."""
+
+    runtime = getattr(policy, "_runtime", None)
+    action_state = getattr(
+        getattr(runtime, "action_expert", None), "_rpu_qwen3_5", None
+    )
+    fusion = getattr(getattr(runtime, "base_model", None), "model", None)
+    vision = getattr(fusion, "visual", None)
+    text_state = getattr(
+        getattr(fusion, "language_model", None), "_rpu_qwen3_5", None
+    )
+    caches = {
+        "action": getattr(action_state, "action_graph_cache", None),
+        "vision": getattr(vision, "_rpu_vision_graph_cache", None),
+        "base_prefill": getattr(text_state, "prefill_graph_cache", None),
+    }
+    missing = [name for name, cache in caches.items() if cache is None]
+    if missing:
+        raise RuntimeError(
+            "Wall Qwen3.5 READY probe is missing retained GraphCache owners: "
+            + ", ".join(missing)
+        )
+    return caches
+
+
+@contextlib.contextmanager
+def _frozen_policy_graph_caches(policy: Any):
+    """Freeze every required cache and restore WARMING on all exit paths."""
+
+    caches = _policy_retained_graph_caches(policy)
+    frozen = []
+    try:
+        for cache in caches.values():
+            cache.freeze()
+            frozen.append(cache)
+        yield caches
+    finally:
+        # Later open-loop requests may have another exact Action prefix. Keep
+        # the warmed entries, but explicitly allow a bounded BUILD again.
+        for cache in reversed(frozen):
+            cache.begin_warmup()
+
+
 def _retained_replay_admission(
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
@@ -1119,6 +1163,10 @@ def _retained_replay_admission(
     after_recaptures = int(after["recaptures"]) if after is not None else 0
     replay_delta = after_replays - before_replays
     recapture_delta = after_recaptures - before_recaptures
+    ready_phase = bool(
+        str((before or {}).get("phase", "")) == "READY"
+        and str((after or {}).get("phase", "")) == "READY"
+    )
     before_signatures = (
         tuple(entry["signature"] for entry in before["entries"])
         if before is not None
@@ -1135,9 +1183,13 @@ def _retained_replay_admission(
         and before["size"] > 0
         and after["size"] == before["size"]
         and after_signatures == before_signatures
+        and ready_phase
+        and before["invariant_ok"]
         and after["invariant_ok"]
+        and before_recaptures == 0
+        and after_recaptures == 0
         and recapture_delta == 0
-        and replay_delta >= expected_replays
+        and replay_delta == expected_replays
         and all(
             entry["kernel_count"] > 0
             and not entry["non_replayable_reason"]
@@ -1150,17 +1202,25 @@ def _retained_replay_admission(
         "replay_delta": replay_delta,
         "recapture_delta": recapture_delta,
         "stable_signatures": after_signatures == before_signatures,
+        "ready_phase": ready_phase,
         "before": before,
         "after": after,
     }
 
 
 def _profile_output_parity(warm: Any, measured: Any) -> dict[str, Any]:
+    expected_shape = (1, ACTION_HORIZON, 26)
     warm_actions = warm.actions.detach().to(device="cpu", dtype=torch.float32)
     measured_actions = measured.actions.detach().to(
         device="cpu", dtype=torch.float32
     )
-    same_shape = tuple(warm_actions.shape) == tuple(measured_actions.shape)
+    actions_pair_shape_match = tuple(warm_actions.shape) == tuple(
+        measured_actions.shape
+    )
+    same_shape = bool(
+        tuple(warm_actions.shape) == expected_shape
+        and tuple(measured_actions.shape) == expected_shape
+    )
     finite = bool(
         same_shape
         and torch.isfinite(warm_actions).all()
@@ -1171,20 +1231,68 @@ def _profile_output_parity(warm: Any, measured: Any) -> dict[str, Any]:
     )
     max_abs = (
         float((warm_actions - measured_actions).abs().max())
-        if same_shape and warm_actions.numel()
+        if actions_pair_shape_match and warm_actions.numel()
         else None
     )
+    warm_actions_norm = getattr(warm, "actions_norm", None)
+    measured_actions_norm = getattr(measured, "actions_norm", None)
+    normalized_present = bool(
+        warm_actions_norm is not None and measured_actions_norm is not None
+    )
+    if normalized_present:
+        warm_actions_norm = warm_actions_norm.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        measured_actions_norm = measured_actions_norm.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        normalized_pair_shape_match = tuple(warm_actions_norm.shape) == tuple(
+            measured_actions_norm.shape
+        )
+        normalized_same_shape = bool(
+            tuple(warm_actions_norm.shape) == expected_shape
+            and tuple(measured_actions_norm.shape) == expected_shape
+        )
+        normalized_finite = bool(
+            normalized_same_shape
+            and torch.isfinite(warm_actions_norm).all()
+            and torch.isfinite(measured_actions_norm).all()
+        )
+        normalized_exact = bool(
+            normalized_finite
+            and torch.equal(warm_actions_norm, measured_actions_norm)
+        )
+        normalized_max_abs = (
+            float((warm_actions_norm - measured_actions_norm).abs().max())
+            if normalized_pair_shape_match and warm_actions_norm.numel()
+            else None
+        )
+    else:
+        normalized_same_shape = False
+        normalized_finite = False
+        normalized_exact = False
+        normalized_max_abs = None
     return {
         # Keep the exact parity contract in the admission record.  Numerical
         # repeatability is evidence, not a reason to discard an otherwise
         # valid diagnostic trace; the caller separately hard-fails shape,
         # prefix, or non-finite mismatches.
-        "accepted": bool(exact and warm.prefix_length == measured.prefix_length),
+        "accepted": bool(
+            exact
+            and normalized_exact
+            and warm.prefix_length == measured.prefix_length
+        ),
+        "expected_shape": expected_shape,
         "same_shape": same_shape,
         "finite": finite,
         "prefix_equal": bool(warm.prefix_length == measured.prefix_length),
         "actions_exact": exact,
         "actions_max_abs": max_abs,
+        "actions_norm_present": normalized_present,
+        "actions_norm_same_shape": normalized_same_shape,
+        "actions_norm_finite": normalized_finite,
+        "actions_norm_exact": normalized_exact,
+        "actions_norm_max_abs": normalized_max_abs,
         "warm_prefix_length": warm.prefix_length,
         "measured_prefix_length": measured.prefix_length,
     }
@@ -1613,33 +1721,37 @@ def main() -> int:
                     **request_kwargs,
                 )
                 warmup_seconds = time.perf_counter() - warmup_started
-                graph_before = _policy_graph_stats(policy)
+                with _frozen_policy_graph_caches(policy):
+                    graph_before = _policy_graph_stats(policy)
 
-                print(
-                    "[wall-qwen35-openloop] profile measure: repeat of the "
-                    "same request",
-                    flush=True,
-                )
-                measured_started = time.perf_counter()
-                with profiler:
-                    ready_profile_entered = True
-                    output = _profiled_predict_action_chunk(
-                        policy,
-                        profiler,
-                        **request_kwargs,
+                    print(
+                        "[wall-qwen35-openloop] profile measure: frozen "
+                        "READY repeat of the same request",
+                        flush=True,
                     )
-                request_seconds = time.perf_counter() - measured_started
-                graph_after = _policy_graph_stats(policy)
-                admission = _ready_replay_admission(
-                    graph_before,
-                    graph_after,
-                    warm_output,
-                    output,
-                )
+                    measured_started = time.perf_counter()
+                    with profiler:
+                        ready_profile_entered = True
+                        output = _profiled_predict_action_chunk(
+                            policy,
+                            profiler,
+                            **request_kwargs,
+                        )
+                    request_seconds = time.perf_counter() - measured_started
+                    graph_after = _policy_graph_stats(policy)
+                    admission = _ready_replay_admission(
+                        graph_before,
+                        graph_after,
+                        warm_output,
+                        output,
+                    )
                 torch_profile_meta["warmup_seconds"] = warmup_seconds
                 torch_profile_meta["measured_seconds"] = request_seconds
                 torch_profile_meta["admission"] = admission
-                torch_profile_meta["includes_graph_build"] = not admission["full_ready"]
+                # A completed call while all caches are lookup-only cannot
+                # contain an online BUILD, even if numerical parity later
+                # keeps the overall admission from being accepted.
+                torch_profile_meta["includes_graph_build"] = False
                 _export_torch_profile(profiler, torch_profile_meta)
                 ready_profile_exported = True
                 print(
@@ -1652,9 +1764,13 @@ def main() -> int:
                     not parity["same_shape"]
                     or not parity["prefix_equal"]
                     or not parity["finite"]
+                    or not parity["actions_norm_present"]
+                    or not parity["actions_norm_same_shape"]
+                    or not parity["actions_norm_finite"]
                 ):
                     raise RuntimeError(
-                        "profile warmup/repeat output shape/prefix/finite "
+                        "profile warmup/repeat physical/normalized "
+                        "shape/prefix/finite "
                         f"contract failed: {parity}"
                     )
                 if not parity["accepted"]:
@@ -1662,7 +1778,9 @@ def main() -> int:
                         "[wall-qwen35-openloop] WARNING: warmup/repeat "
                         "action values are not bit-exact; keeping the exported "
                         "profile as diagnostic evidence "
-                        f"(max_abs={parity['actions_max_abs']})",
+                        f"(physical_max_abs={parity['actions_max_abs']}, "
+                        "normalized_max_abs="
+                        f"{parity['actions_norm_max_abs']})",
                         flush=True,
                     )
             elif torch_profile_meta["mode"] == "per_request":
@@ -1718,7 +1836,11 @@ def main() -> int:
             vision_graph = graph["vision"]
             completed_requests = request_index + 1
             _validate_retained_graph_stats(
-                "action", action_graph, calls=10 * completed_requests
+                # Action fast replay is exact-prefix keyed. A changed prefix
+                # deliberately replaces the prior entry, so validate the ten
+                # calls represented by the current request rather than a
+                # cumulative count across evicted signatures.
+                "action", action_graph, calls=10
             )
             _validate_retained_graph_stats(
                 "vision", vision_graph, calls=3 * completed_requests

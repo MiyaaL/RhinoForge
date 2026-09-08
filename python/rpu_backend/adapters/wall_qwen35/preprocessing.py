@@ -27,6 +27,13 @@ CAMERA_LABELS = {
 }
 ACTION_HORIZON = 32
 MAX_ACTION_PREFIX_LENGTH = 384
+# Fixed execution shapes used by the controlled prefix-bucket runtime.  Every
+# admitted real prefix is at most 63 rows below its selected bucket.
+WALL_PREFIX_BUCKETS = (64, 128, 192, 256, 320, 384)
+# Each execution bucket can produce three native GDN tail envelopes: one real
+# row, 2..31 unsegmented rows, or 32+ segmented rows. Graph identity must retain
+# that topology class in addition to the physical bucket shape.
+WALL_PREFILL_GRAPH_MAX_ENTRIES = 3 * len(WALL_PREFIX_BUCKETS)
 STATE_DIM = 26
 STATE_BINS = 256
 MAX_SEQ_LENGTH = 780
@@ -410,6 +417,8 @@ __all__ = [
     "DEFAULT_CAMERAS",
     "DEFAULT_ROBOT_ID",
     "MAX_ACTION_PREFIX_LENGTH",
+    "WALL_PREFILL_GRAPH_MAX_ENTRIES",
+    "WALL_PREFIX_BUCKETS",
     "MAX_SEQ_LENGTH",
     "PROFILE_MASK",
     "STATE_DIM",

@@ -27,6 +27,7 @@ from .preprocessing import (
     MAX_SEQ_LENGTH,
     STATE_DIM,
     SPECIAL_TOKENS,
+    WALL_PREFILL_GRAPH_MAX_ENTRIES,
     WALL_PREFIX_BUCKETS,
     WallQwen35PreparedInput,
     prepare_wall_qwen35_input,
@@ -254,12 +255,19 @@ class WallQwen35Runtime:
                 os.environ[_VISION_GRAPH_MAX_ENTRIES] = "2"
                 self._owned_vision_graph_entries_env = True
             else:
+                from rpu_backend.adapters.qwen3_5.vision import (
+                    _parse_vision_graph_max_entries,
+                )
+
                 try:
-                    parsed_entries = int(vision_entries)
+                    parsed_entries = _parse_vision_graph_max_entries(
+                        vision_entries
+                    )
                 except (TypeError, ValueError) as exc:
                     raise RuntimeError(
                         "Wall Qwen3.5 requires "
-                        f"{_VISION_GRAPH_MAX_ENTRIES} to be a positive integer"
+                        f"{_VISION_GRAPH_MAX_ENTRIES} to be a valid positive "
+                        "GraphCache capacity"
                     ) from exc
                 if parsed_entries < 2:
                     raise RuntimeError(
@@ -297,8 +305,11 @@ class WallQwen35Runtime:
                 raise RuntimeError(
                     "Wall Qwen3.5 base install did not publish text runtime state"
                 )
+            # A bucket's final GDN chunk has three possible native node/grid
+            # envelopes (1, 2..31, or 32+ valid rows). Capacity covers the
+            # finite cross-product; entries remain allocated lazily.
             text_state.prefill_graph_cache = _rb.graph.GraphCache(
-                max_entries=len(WALL_PREFIX_BUCKETS)
+                max_entries=WALL_PREFILL_GRAPH_MAX_ENTRIES
             )
             text_state.prefill_graph_sig = None
             text_state.prefill_bucket_sizes = WALL_PREFIX_BUCKETS
@@ -335,7 +346,6 @@ class WallQwen35Runtime:
                 raise RuntimeError(
                     "Wall Qwen3.5 action install did not publish runtime state"
                 )
-            action_state.action_prefix_bucket_sizes = WALL_PREFIX_BUCKETS
             self._installed = True
             return self
         except BaseException:

@@ -210,6 +210,12 @@ INTERNAL_HW_ATTRS_TRANSITIONAL: frozenset[str] = frozenset({
     "_rpu_vision_graph_disable", "_rpu_vision_rope_disable",
     "_rpu_vision_graph_cache",
     "_rpu_vision_graph_key", "_rpu_vision_graph_sig",
+    # Capacity of the bounded Vision GraphCache.  This is adapter-internal
+    # state (not a public hardware knob) but it is read on every shape change
+    # to decide whether the generic one-entry cache should evict its prior
+    # signature.  Keep it in the transitional set because the Vision
+    # installer writes it after the module tree has been stamped.
+    "_rpu_vision_graph_max_entries",
     "_rpu_vision_debug_graph",
     "_rpu_vision_spatial_merge_size",
     "_rpu_vision_num_layers", "_rpu_vision_hidden_size",
@@ -227,6 +233,9 @@ _MONOTONIC_INTERNAL_HW_ATTRS: frozenset[str] = frozenset({
     "_rpu_weights_converted",
     "_rpu_gemm_weight",
     "_rpu_pos_emb_fused",
+    # Bound once alongside the GraphCache constructor. A later write would
+    # make shape-eviction policy disagree with the cache's immutable capacity.
+    "_rpu_vision_graph_max_entries",
 })
 
 

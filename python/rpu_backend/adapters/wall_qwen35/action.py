@@ -38,7 +38,6 @@ from .checkpoint import (
     _file_identity,
     _is_action_tensor,
 )
-from .preprocessing import WALL_PREFIX_BUCKETS
 
 
 ACTION_BATCH_SIZE = 1
@@ -754,14 +753,11 @@ def patch_wall_qwen35_action_for_rpu(
         import rpu_backend as rpu_backend
 
         state = expert._rpu_qwen3_5
-        # The generic action adapter keeps one signature because ordinary
-        # callers use a fixed prefix.  Wall's finite <=384 profile uses the
-        # same prefix buckets as the base text path, so retain one action Graph
-        # per bucket instead of clearing the cache whenever the real prefix
-        # length changes.
-        state.action_graph_cache = rpu_backend.graph.GraphCache(
-            max_entries=len(WALL_PREFIX_BUCKETS)
-        )
+        # Action fast replay bakes the real prefix into KV-insert and SDPA
+        # registers. Keep one exact-prefix signature and rebuild on a prefix
+        # change; hiding the real length behind the text execution bucket would
+        # replay stale insertion positions and attention lengths.
+        state.action_graph_cache = rpu_backend.graph.GraphCache(max_entries=1)
         state.action_cache = Qwen3_5Cache.from_config(
             expert.config,
             max_seq_len=int(max_seq_len),
@@ -780,7 +776,6 @@ def patch_wall_qwen35_action_for_rpu(
         state.action_rope_cache = None
         state.action_modulation_cache = {}
         state.action_graph_signature = None
-        state.action_prefix_bucket_sizes = WALL_PREFIX_BUCKETS
         _drop_installed_shell_weights(expert)
         expert._wall_qwen35_action_ready = True
         return expert
@@ -1185,7 +1180,27 @@ def run_wall_qwen35_action(
     _dof_mask(dof_mask)
     action_position_ids = _canonical_action_positions(position_ids, prefix_len)
 
+    import rpu_backend as rpu_backend
+
     state = expert._rpu_qwen3_5
+    signature = rpu_backend.graph.GraphSignature(
+        op_id="rpu_wall_qwen35_action_decoder",
+        shapes=[ACTION_BATCH_SIZE, ACTION_HORIZON, ACTION_HIDDEN_SIZE, prefix_len],
+        dyn_dims=[ACTION_NUM_LAYERS, *_FULL_LAYERS],
+        dtypes=[torch.float16],
+    )
+    cold = state.action_graph_cache.lookup(signature) is None
+    if cold:
+        # Reject a frozen miss before prefix copies, RoPE updates, uploads, or
+        # the uncaptured priming forward. READY is strictly lookup-only.
+        if state.action_graph_cache.is_frozen():
+            raise RuntimeError(
+                "Wall action GraphCache READY miss for exact real prefix "
+                f"{prefix_len}; call begin_warmup() before changing prefix"
+            )
+        if state.action_graph_cache.size() != 0:
+            state.action_graph_cache.clear()
+
     prefix_lens = _copy_physical_prefix(state, prefix_cache, prefix_len)
     _ensure_action_rope(state, action_position_ids)
     modulation = _adaptive_modulation(expert, time_cond)
@@ -1193,31 +1208,7 @@ def run_wall_qwen35_action(
     hidden_rpu = (hidden_cpu / 4.0).to(
         device="rpu", dtype=torch.float16
     ).contiguous()
-
-    import rpu_backend as rpu_backend
-
-    bucket_sizes = getattr(state, "action_prefix_bucket_sizes", None)
-    if bucket_sizes is None:
-        execution_prefix_len = prefix_len
-    else:
-        from rpu_backend.adapters.qwen3_5.text import _select_prefill_bucket
-
-        execution_prefix_len = _select_prefill_bucket(prefix_len, bucket_sizes)
-    signature = rpu_backend.graph.GraphSignature(
-        op_id="rpu_wall_qwen35_action_decoder",
-        shapes=[
-            ACTION_BATCH_SIZE,
-            ACTION_HORIZON,
-            ACTION_HIDDEN_SIZE,
-            execution_prefix_len,
-        ],
-        dyn_dims=[ACTION_NUM_LAYERS, *_FULL_LAYERS],
-        dtypes=[torch.float16],
-    )
-    cold = state.action_graph_cache.lookup(signature) is None
     if cold:
-        if bucket_sizes is None and state.action_graph_cache.size() != 0:
-            state.action_graph_cache.clear()
         # Prime persistent SPM state before BUILD.  The action suffix is then
         # deterministically overwritten by the captured call.
         torch.ops.rpu.qwen3_5_action_forward(

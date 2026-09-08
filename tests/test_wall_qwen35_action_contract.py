@@ -89,6 +89,25 @@ def test_scale4_has_exactly_two_python_owners() -> None:
     assert wall_action._FULL_LAYERS == (3, 7, 11, 15, 19, 23)
 
 
+def test_action_fast_replay_signature_keeps_exact_real_prefix() -> None:
+    install = inspect.getsource(wall_action.patch_wall_qwen35_action_for_rpu)
+    decoder = inspect.getsource(wall_action.run_wall_qwen35_action)
+
+    assert "GraphCache(max_entries=1)" in install
+    assert "ACTION_HIDDEN_SIZE, prefix_len" in decoder
+    assert "_select_prefill_bucket" not in decoder
+    assert "state.action_graph_cache.clear()" in decoder
+    assert decoder.index("state.action_graph_cache.is_frozen()") < decoder.index(
+        "state.action_graph_cache.clear()"
+    )
+    assert decoder.index("state.action_graph_cache.is_frozen()") < decoder.index(
+        "_copy_physical_prefix"
+    )
+    assert decoder.index("state.action_graph_cache.is_frozen()") < decoder.index(
+        "torch.ops.rpu.qwen3_5_action_forward"
+    )
+
+
 def _processor_with_w1(weight: torch.Tensor) -> wall_action.WallActionProcessor:
     dummy = wall_action.WallHostLinear(torch.empty((1, 1), dtype=torch.float32))
     bank = wall_action.WallNormalizerBank(

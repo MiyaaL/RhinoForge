@@ -142,8 +142,16 @@ normalization，不认证机器人安全或坐标系。
 API。初版范围固定为 FP16 batch 1、精确三个规范相机、初始多模态 prefix 不超过
 384 token、Dataset-V2 单次 BICUBIC 图像预处理、robot ID `10070`、normalizer
 `x2_normal`、state/action mask `[1]*20+[0]*6`、action shape `[1,32,26]` 和
-10 个 Euler step。Qwen3.5 vision 路径仍为
-numeric-blocked，因此 `.to("rpu")` 前必须通过
+10 个 Euler step。受控 runtime 会把 base-text prefill 映射到固定 64 行 bucket
+`64..384`；retained Prefill 签名还会区分末个 native chunk 的三种拓扑类别
+（1 行、2--31 行、至少 32 行），同一类别内的有效 prefix 长度和 M-RoPE 仍按调用刷新。
+native pad-zeroing 即使在 bucket 边界也会发出稳定的 fill 节点。Action fast replay
+仍按精确真实 prefix 长度建图，因为 KV 插入位置和 SDPA 寄存器会固化该值。
+这些只是 Wall profile 的内部优化，不扩展通用 Qwen3.5 API。
+`predict_action_chunk(..., initial_noise=...)` 接受 shape 为 `[32,26]` 或
+`[1,32,26]`、可转换成 CPU FP32 且所有元素有限的 tensor，用于精确的跨设备 flow 输入
+对齐；它与 `noise_seed` 互斥，两者均省略时保持确定性的 seed-0 行为。Qwen3.5 vision
+路径仍为 numeric-blocked，因此 `.to("rpu")` 前必须通过
 `from_checkpoint(..., allow_numeric_blocked_vision=True)` 显式 opt-in。
 `WallQwen35ActionOutput.actions` 是 shape `[1,32,26]`、物理单位、独立存储的连续
 CPU FP32 tensor。runtime 负责冷启动多 handle 配置
