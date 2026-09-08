@@ -38,6 +38,10 @@ using namespace ::rhino_lkn;
 constexpr int64_t QWEN3_5_VISION_GENERIC_MAX_SEQ = 4096;
 constexpr int64_t QWEN3_5_VISION_MAX_KEEPALIVE_SEQ = 4608;
 constexpr int64_t G05_MAX_CAMERA_BATCH = 3;
+// Dataset-V2's 224-pixel longest edge produces at most 14*14 patches/image.
+// This is a bounded Wall spatial profile, separate from G0.5 temporal batching.
+constexpr int64_t WALL_SPATIAL_IMAGES = 3;
+constexpr int64_t WALL_SPATIAL_MAX_IMAGE_PATCHES = 14 * 14;
 constexpr int64_t G05_COMPACT_STEP0_FRAMES = 3;
 constexpr int64_t G05_COMPACT_CHANNELS = 3;
 constexpr int64_t G05_COMPACT_IMAGE_SIDE = 256;
@@ -137,7 +141,8 @@ at::Tensor Qwen3_5VisionModel::forward(
     const std::optional<at::Tensor>& fusion_target,
     at::IntArrayRef fusion_row_starts,
     int64_t temporal_num_frames,
-    int64_t camera_batch_count)
+    int64_t camera_batch_count,
+    at::IntArrayRef image_patch_counts)
 {
     TORCH_CHECK(num_layers() > 0,
                 "Qwen3_5VisionModel::forward called before set_weights");
@@ -168,8 +173,75 @@ at::Tensor Qwen3_5VisionModel::forward(
                 "Qwen3_5VisionModel::forward: temporal_num_frames must be positive");
     TORCH_CHECK(camera_batch_count == 1 || camera_batch_count == G05_MAX_CAMERA_BATCH,
                 "Qwen3_5VisionModel::forward: camera_batch_count must be 1 or 3");
+    std::vector<FmbExecutionSpan> spatial_spans;
+    if (!image_patch_counts.empty()) {
+        TORCH_CHECK(temporal_num_frames == 1 && camera_batch_count == 1 &&
+                        !compact_input && image_patch_counts.size() == WALL_SPATIAL_IMAGES,
+                    "Qwen3.5 packed spatial vision requires three single-frame images");
+        int64_t offset = 0;
+        for (int64_t length : image_patch_counts) {
+            TORCH_CHECK(length > 0 && length <= WALL_SPATIAL_MAX_IMAGE_PATCHES &&
+                            length % QWEN3_5_SPATIAL_MERGE_UNIT == 0,
+                        "Qwen3.5 packed spatial image lengths must be multiples of 4 "
+                        "in [4,196], got ", length);
+            spatial_spans.push_back({offset, length});
+            offset += length;
+        }
+        TORCH_CHECK(offset == num_patches_in,
+                    "Qwen3.5 packed spatial lengths must cover all input patches");
+        TORCH_CHECK(k_caches.size() == static_cast<size_t>(num_layers()) &&
+                        v_caches.size() == static_cast<size_t>(num_layers()),
+                    "Qwen3.5 packed spatial vision requires one K/V tensor per layer");
+        for (int64_t layer = 0; layer < num_layers(); ++layer) {
+            for (const auto& cache : {k_caches[layer], v_caches[layer]}) {
+                TORCH_CHECK(cache.dim() == 7 && cache.size(0) == WALL_SPATIAL_IMAGES &&
+                                cache.size(1) >= CeilDiv(
+                                    *std::max_element(image_patch_counts.begin(),
+                                                      image_patch_counts.end()), int64_t{16}) &&
+                                cache.device() == input.device() &&
+                                cache.scalar_type() == at::kHalf && cache.is_contiguous(),
+                            "Qwen3.5 packed spatial vision requires contiguous FP16 "
+                            "RPU K/V caches with three independent batch slots");
+                TORCH_CHECK(cache.size(2) == num_q_heads() / NUM_CORES &&
+                                cache.size(3) == head_dim() / 16 &&
+                                cache.size(4) == NUM_CORES &&
+                                cache.size(5) == 16 && cache.size(6) == 16,
+                            "Qwen3.5 packed spatial K/V layout does not match the tower");
+            }
+        }
+        auto bind_spatial_caches = [&](const std::vector<at::Tensor>& caches,
+                                      std::vector<std::array<at::Tensor, 3>>& views) {
+            if (views.empty()) {
+                views.resize(num_layers());
+                for (int64_t layer = 0; layer < num_layers(); ++layer) {
+                    for (int64_t image = 0; image < WALL_SPATIAL_IMAGES; ++image) {
+                        views[layer][image] = caches[layer].narrow(0, image, 1);
+                    }
+                }
+            }
+            for (int64_t layer = 0; layer < num_layers(); ++layer) {
+                const auto& cache = caches[layer];
+                for (int64_t image = 0; image < WALL_SPATIAL_IMAGES; ++image) {
+                    const auto& view = views[layer][image];
+                    TORCH_CHECK(view.sizes().slice(1) == cache.sizes().slice(1),
+                                "Qwen3.5 packed spatial K/V shape changed; reload the model");
+                    TORCH_CHECK(
+                        view.storage().unsafeGetStorageImpl() ==
+                            cache.storage().unsafeGetStorageImpl() &&
+                        view.data_ptr<c10::Half>() == cache.data_ptr<c10::Half>() +
+                            image * cache.stride(0) &&
+                        view.numel() == cache.stride(0),
+                        "Qwen3.5 packed spatial K/V storage changed; reload the model");
+                }
+            }
+        };
+        bind_spatial_caches(k_caches, spatial_k_caches_);
+        bind_spatial_caches(v_caches, spatial_v_caches_);
+    }
+    spatial_image_spans_ = std::move(spatial_spans);
     current_temporal_num_frames_ = temporal_num_frames;
-    current_camera_batch_count_ = camera_batch_count;
+    current_camera_batch_count_ = spatial_image_spans_.empty()
+        ? camera_batch_count : WALL_SPATIAL_IMAGES;
     if (temporal_num_frames > 1) {
         TORCH_CHECK(has_temporal_ && temporal_num_frames == temporal_num_frames_,
                     "Qwen3_5VisionModel::forward: unsupported temporal frame count ",
@@ -348,9 +420,6 @@ at::Tensor Qwen3_5VisionModel::forward(
 
     if (fusion_target.has_value()) {
         const at::Tensor& target = *fusion_target;
-        const int64_t merged_rows_per_camera =
-            (current_output_patches_ / current_camera_batch_count_) /
-            QWEN3_5_SPATIAL_MERGE_UNIT;
         TORCH_CHECK(has_merger_,
                     "Qwen3_5VisionModel::forward: fusion_target requires the RPU merger");
         TORCH_CHECK(target.defined() && target.device().type() == at::kPrivateUse1 &&
@@ -369,6 +438,10 @@ at::Tensor Qwen3_5VisionModel::forward(
             ::rhino_lkn::RpuGetDevAddr(target.data_ptr<c10::Half>());
         merger_dst_bases_.fill(0);
         for (int64_t camera = 0; camera < current_camera_batch_count_; ++camera) {
+            const int64_t merged_rows_per_camera =
+                (spatial_image_spans_.empty()
+                    ? current_output_patches_ / current_camera_batch_count_
+                    : spatial_image_spans_[camera].len) / QWEN3_5_SPATIAL_MERGE_UNIT;
             const int64_t row_start = fusion_row_starts[camera];
             TORCH_CHECK(row_start >= 0 &&
                         row_start + merged_rows_per_camera <= target.size(1),
@@ -404,9 +477,7 @@ at::Tensor Qwen3_5VisionModel::forward(
 
     const int64_t layer_rows = layer_input->size(1);
     TORCH_INTERNAL_ASSERT(
-        layer_rows % current_camera_batch_count_ == 0);
-    const int64_t rows_per_camera =
-        layer_rows / current_camera_batch_count_;
+        !spatial_image_spans_.empty() || layer_rows % current_camera_batch_count_ == 0);
     const int64_t input_chunk_size = !has_step0_
         ? layer_rows
         : current_compact_step0_
@@ -423,10 +494,12 @@ at::Tensor Qwen3_5VisionModel::forward(
             {static_cast<int>(input_chunks.size()), offset, len,
              offset + len});
     }
-    std::vector<FmbExecutionSpan> spans;
-    spans.reserve(current_camera_batch_count_);
-    for (int64_t camera = 0; camera < current_camera_batch_count_; ++camera) {
-        spans.push_back({camera * rows_per_camera, rows_per_camera});
+    std::vector<FmbExecutionSpan> spans = spatial_image_spans_;
+    if (spans.empty()) {
+        const int64_t rows_per_camera = layer_rows / current_camera_batch_count_;
+        for (int64_t camera = 0; camera < current_camera_batch_count_; ++camera) {
+            spans.push_back({camera * rows_per_camera, rows_per_camera});
+        }
     }
     at::Tensor result = run_all_layers(
         *layer_input, k_caches, v_caches,
@@ -603,7 +676,8 @@ void Qwen3_5VisionModel::emit_step0() {
 //    needs, so NO all_gather between them (identical to the encoder MLP at
 //    build_layer_subgraph's Phase 5/6).
 void Qwen3_5VisionModel::emit_merger() {
-    const int64_t cameras = current_camera_batch_count_;
+    const bool packed_spatial = !spatial_image_spans_.empty();
+    const int64_t cameras = packed_spatial ? 1 : current_camera_batch_count_;
     const int64_t camera_patches = current_output_patches_ / cameras;
     const int64_t h   = hidden_size();               // 1024 — per-patch dim / LN width
     const int64_t mu  = QWEN3_5_SPATIAL_MERGE_UNIT;  // 4
@@ -687,6 +761,21 @@ void Qwen3_5VisionModel::emit_merger() {
                     addr(0, "m_out"), &merger_dst_bases_[0],
                     (merged_camera_base + off / mu) * oh * sizeof(c10::Half),
                     m * oh);
+            } else if (packed_spatial) {
+                // A merger chunk may cross image boundaries (including the
+                // 512-patch boundary at the maximum 588-patch envelope).
+                const auto& spans = ctx().stage_plan.spans;
+                for (size_t image = 0; image < spans.size(); ++image) {
+                    const auto& span = spans[image];
+                    const int64_t begin = std::max(off, span.offset);
+                    const int64_t end = std::min(off + len, span.offset + span.len);
+                    if (begin >= end) continue;
+                    rpu_launch_spm_copy_ddr_dma_mutable(
+                        addr(0, "m_out") + (begin - off) / mu * oh * DWIDTH,
+                        &merger_dst_bases_[image],
+                        (begin - span.offset) / mu * oh * DWIDTH,
+                        (end - begin) / mu * oh);
+                }
             } else {
                 rpu_launch_spm_copy_ddr_dma_mutable(
                     addr(0, "m_out"), &merger_dst_bases_[camera],
@@ -1002,10 +1091,26 @@ void Qwen3_5VisionModel::emit_kv_first_body(int layer_idx, const ChunkInfo& chun
     // Phase 3a: KV cache insert at ABSOLUTE position (累积；单 chunk 时 cur_pos=0 等价旧行为)
     auto& k_cache = (*ctx().k_caches)[layer_idx];
     auto& v_cache = (*ctx().v_caches)[layer_idx];
-    rpu_launch_insert_kcache_spm_unified(
-        k_cache, cur_pos, addr_offset("k").value, seq_len, nq, hd, NUM_CORES);
-    rpu_launch_insert_vcache_spm_unified(
-        v_cache, cur_pos, addr_offset("v").value, seq_len, nq, hd, NUM_CORES);
+    if (!spatial_image_spans_.empty()) {
+        TORCH_CHECK(chunk.offset == 0 && seq_len == current_num_patches_,
+                    "packed spatial vision requires one shared QKV chunk");
+        const auto& spans = ctx().stage_plan.spans;
+        for (size_t image = 0; image < spans.size(); ++image) {
+            const auto& span = spans[image];
+            const int64_t bytes = span.offset * local_heads * hd * DWIDTH;
+            rpu_launch_insert_kcache_spm_unified(
+                spatial_k_caches_[layer_idx][image], 0,
+                addr_offset("k").value + bytes, span.len, nq, hd, NUM_CORES);
+            rpu_launch_insert_vcache_spm_unified(
+                spatial_v_caches_[layer_idx][image], 0,
+                addr_offset("v").value + bytes, span.len, nq, hd, NUM_CORES);
+        }
+    } else {
+        rpu_launch_insert_kcache_spm_unified(
+            k_cache, cur_pos, addr_offset("k").value, seq_len, nq, hd, NUM_CORES);
+        rpu_launch_insert_vcache_spm_unified(
+            v_cache, cur_pos, addr_offset("v").value, seq_len, nq, hd, NUM_CORES);
+    }
 
     // 存 rope 后的 Q 到 q_ddr_buf_（position-indexed，照 gemma:823-836）
     TORCH_CHECK(q_ddr_buf_.defined(),
@@ -1029,6 +1134,51 @@ void Qwen3_5VisionModel::emit_kv_first_body(int layer_idx, const ChunkInfo& chun
         rpu_launch_spm_scatter_ddr_dma(
             addr(0, "q"), dq, q_local_elems,
             /*core_stride_bytes=*/N * local_q_dim * DWIDTH, NUM_CORES);
+    }
+}
+
+void Qwen3_5VisionModel::emit_packed_spatial_attention(int layer_idx) {
+    // Replacement boundary for a future varlen kernel: real image spans,
+    // packed Q/output, and independent KV views. No padding or cross-image
+    // attention. Sequential calls reuse the same temporary workspace.
+    const int64_t nq = num_q_heads();
+    const int64_t hd = head_dim();
+    const int64_t row_bytes = (nq / NUM_CORES) * hd * DWIDTH;
+    const double scale = 1.0 / std::sqrt(static_cast<double>(orig_head_dim_));
+    const auto& spans = ctx().stage_plan.spans;
+    for (size_t image = 0; image < spans.size(); ++image) {
+        const auto& span = spans[image];
+        const int64_t bytes = span.offset * row_bytes;
+        rpu_launch_sdpa_spm_unified_kernel_v2(
+            spatial_k_caches_[layer_idx][image], spatial_v_caches_[layer_idx][image],
+            0 /*MASK_NONE*/, scale,
+            addr_offset("q_comp").value + bytes,
+            addr_offset("sdpa_out").value + bytes,
+            addr_offset("sdpa_tmp").value, 0,
+            span.len, nq, nq, hd, span.len, NUM_CORES, NUM_CORES);
+    }
+}
+
+void Qwen3_5VisionModel::emit_spatial_residual_reduce(
+    uint32_t input, uint32_t residual, uint32_t output, const ChunkInfo& chunk) {
+    const int64_t h = hidden_size();
+    if (spatial_image_spans_.empty()) {
+        rpu_launch_all_reduce_sum_residual_kernel(
+            input, residual, output, chunk.len, h, NUM_CORES, NUM_CORES);
+        return;
+    }
+    TORCH_CHECK(chunk.offset == 0 && chunk.len == current_num_patches_,
+                "packed spatial reduction requires one shared compute chunk");
+    // Ring ownership depends on M*H. Reducing the entire packed tensor changes
+    // the per-image accumulation order and can move an FP16 rounding boundary.
+    // Preserve the reference image geometry while keeping GEMMs packed and all
+    // reductions in the same Graph. This uses the shared ring wrapper, not a
+    // different reduction route or a model-specific kernel.
+    for (const auto& span : ctx().stage_plan.spans) {
+        const uint32_t bytes = span.offset * h * DWIDTH;
+        rpu_launch_all_reduce_sum_residual_kernel(
+            input + bytes, residual + bytes, output + bytes,
+            span.len, h, NUM_CORES, NUM_CORES);
     }
 }
 
@@ -1061,27 +1211,31 @@ void Qwen3_5VisionModel::build_layer_subgraph(int layer_idx, const ChunkInfo& ch
         q_ddr_base + q_elem_offset, q_local_elems, q_core_stride,
         addr(0, "q_comp"), NUM_CORES);
 
-    // SDPA：query = 本 chunk 的 q_comp(seq_len 行)，K/V = cache 全量(current_num_patches_) → 双向。
-    auto& k_cache = (*ctx().k_caches)[layer_idx];
-    auto& v_cache = (*ctx().v_caches)[layer_idx];
-    double attn_scale = 1.0 / std::sqrt(static_cast<double>(orig_head_dim_));
-    rpu_launch_sdpa_spm_unified_kernel_v2(
-        k_cache, v_cache,
-        0 /*MASK_NONE*/, attn_scale,
-        addr_offset("q_comp").value,
-        addr_offset("sdpa_out").value,
-        addr_offset("sdpa_tmp").value, 0,
-        seq_len, nq, nq, hd,
-        current_num_patches_, NUM_CORES, NUM_CORES);
+    // Bidirectional SDPA: packed mode restricts each call to one image.
+    if (!spatial_image_spans_.empty()) {
+        emit_packed_spatial_attention(layer_idx);
+    } else {
+        auto& k_cache = (*ctx().k_caches)[layer_idx];
+        auto& v_cache = (*ctx().v_caches)[layer_idx];
+        double attn_scale = 1.0 / std::sqrt(static_cast<double>(orig_head_dim_));
+        rpu_launch_sdpa_spm_unified_kernel_v2(
+            k_cache, v_cache,
+            0 /*MASK_NONE*/, attn_scale,
+            addr_offset("q_comp").value,
+            addr_offset("sdpa_out").value,
+            addr_offset("sdpa_tmp").value, 0,
+            seq_len, nq, nq, hd,
+            current_num_patches_, NUM_CORES, NUM_CORES);
+    }
 
     // Phase 4: O_proj (row-partition, with bias) + AllReduce + Residual.
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
         seq_len, h, nq * hd, 0, NUM_CORES,
         layer_addr(layer_idx, 0, "o_bias"));
-    rpu_launch_all_reduce_sum_residual_kernel(
+    emit_spatial_residual_reduce(
         addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
-        seq_len, h, NUM_CORES, NUM_CORES);
+        chunk);
 
     // Phase 5: LayerNorm2 + fc1+bias + GELU (gelu_pytorch_tanh per Q3.5 config).
     rpu_launch_layernorm_spm_kernel(
@@ -1103,9 +1257,9 @@ void Qwen3_5VisionModel::build_layer_subgraph(int layer_idx, const ChunkInfo& ch
         addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
         seq_len, h, is_, 0, NUM_CORES,
         layer_addr(layer_idx, 0, "fc2_bias"));
-    rpu_launch_all_reduce_sum_residual_kernel(
+    emit_spatial_residual_reduce(
         addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
-        seq_len, h, NUM_CORES, NUM_CORES);
+        chunk);
 
     // Output DMA (SPM_RESIDENT skips it for non-last layers; the last layer writes the caller's
     // output_tensor_). Channel 0 shares the compute stream, so queue ordering already places this
@@ -1161,6 +1315,15 @@ std::vector<BufferDecl> Qwen3_5VisionModel::declare_buffers(const LayoutContext&
     SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, cs);
     int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
     int64_t sdpa_tmp = A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(cs, t.tile_m) * 32);
+    if (!spatial_image_spans_.empty()) {
+        sdpa_tmp = 0;
+        for (const auto& span : spatial_image_spans_) {
+            const auto image_t = sdpa_compute_tiling(sdpa_cfg, span.len);
+            sdpa_tmp = std::max(sdpa_tmp, A(
+                image_t.tile_n_v16 * image_t.tile_k * nkv_per_core *
+                CeilDiv(span.len, image_t.tile_m) * 32));
+        }
+    }
 
     auto dma_safe = [&](int64_t elems) -> int64_t {
         int64_t dma_elems = ((elems + 255) / 256) * 256;
@@ -1417,7 +1580,11 @@ ModelStaticConfig Qwen3_5VisionModel::static_config() {
 }
 
 // ── dynamic_config: KV_FIRST chunk mode + AUTO inter-layer IO. ──
-ModelDynamicConfig Qwen3_5VisionModel::dynamic_config(const ChunkPlan& /*plan*/) {
+ModelDynamicConfig Qwen3_5VisionModel::dynamic_config(const ChunkPlan& plan) {
+    TORCH_CHECK(spatial_image_spans_.empty() ||
+                    (plan.num_chunks == 1 && plan.chunk_size == current_num_patches_),
+                "packed spatial vision requires one shared compute chunk; "
+                "check the SPM budget and QWEN3_5_VISION_CHUNK cap");
     ModelDynamicConfig cfg;
     cfg.chunk_mode     = ChunkMode::KV_FIRST;    // 双向分块两相
     cfg.inter_layer_io = current_temporal_num_frames_ > 1
@@ -1455,7 +1622,16 @@ bool Qwen3_5VisionModel::subclass_chunk_size_valid(int64_t cs, int64_t seq, int6
     SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                         head_dim(), num_q_heads(), num_q_heads(),
                         NUM_CORES, /*mask=*/0};
-    if (!sdpa_is_valid_chunk_size(sdpa_cfg, cs, seq, pos)) return false;
+    if (spatial_image_spans_.empty()) {
+        if (!sdpa_is_valid_chunk_size(sdpa_cfg, cs, seq, pos)) return false;
+    } else {
+        if (cs < seq) return false;
+        for (const auto& span : spatial_image_spans_) {
+            if (!sdpa_is_valid_chunk_size(
+                    sdpa_cfg, CeilDiv(span.len, int64_t{16}) * 16, span.len, 0))
+                return false;
+        }
+    }
 
     if (chunk_size_cap_ < 0) {   // not latched yet → take this handle's default
         const char* e = std::getenv("QWEN3_5_VISION_CHUNK");
@@ -1463,6 +1639,14 @@ bool Qwen3_5VisionModel::subclass_chunk_size_valid(int64_t cs, int64_t seq, int6
     }
     if (chunk_size_cap_ > 0 && cs > chunk_size_cap_) return false;
     return true;
+}
+
+int64_t Qwen3_5VisionModel::subclass_layout_hash() const {
+    int64_t hash = 0;
+    for (const auto& span : spatial_image_spans_) {
+        hash = detail::layout_mix(hash, span.len);
+    }
+    return hash;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1975,14 +2159,15 @@ at::Tensor rpu_qwen3_5_vision_forward(
     const std::optional<at::Tensor>& fusion_target,
     at::IntArrayRef fusion_row_starts,
     int64_t temporal_num_frames,
-    int64_t camera_batch_count)
+    int64_t camera_batch_count,
+    at::IntArrayRef image_patch_counts)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision")
         ->forward(input, k_caches, v_caches, num_patches, step0_pos,
                   fusion_target, fusion_row_starts, temporal_num_frames,
-                  camera_batch_count);
+                  camera_batch_count, image_patch_counts);
 }
 
 // Per-handle SPM-budget-resolved chunk_size (0 before any forward), matching

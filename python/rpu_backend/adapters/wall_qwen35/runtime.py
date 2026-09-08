@@ -244,15 +244,11 @@ class WallQwen35Runtime:
             if os.environ.get(_VISION_OPT_IN) != "1":
                 os.environ[_VISION_OPT_IN] = "1"
                 self._owned_vision_env = True
-            # Wall's exact prefix has two distinct image geometries (face and
-            # wrist).  The shared Qwen3.5 installer defaults to one retained
-            # Vision graph for generic workloads; that setting would evict one
-            # geometry on every request and make a repeated profile call BUILD
-            # again.  Require a bounded two-entry cache for this controlled
-            # profile, while honoring a larger caller-provided budget.
+            # One retained Vision graph covers the complete image triple,
+            # including its ordered real patch lengths.
             vision_entries = os.environ.get(_VISION_GRAPH_MAX_ENTRIES)
             if vision_entries is None:
-                os.environ[_VISION_GRAPH_MAX_ENTRIES] = "2"
+                os.environ[_VISION_GRAPH_MAX_ENTRIES] = "1"
                 self._owned_vision_graph_entries_env = True
             else:
                 from rpu_backend.adapters.qwen3_5.vision import (
@@ -260,7 +256,7 @@ class WallQwen35Runtime:
                 )
 
                 try:
-                    parsed_entries = _parse_vision_graph_max_entries(
+                    _parse_vision_graph_max_entries(
                         vision_entries
                     )
                 except (TypeError, ValueError) as exc:
@@ -269,11 +265,11 @@ class WallQwen35Runtime:
                         f"{_VISION_GRAPH_MAX_ENTRIES} to be a valid positive "
                         "GraphCache capacity"
                     ) from exc
-                if parsed_entries < 2:
-                    raise RuntimeError(
-                        "Wall Qwen3.5 requires at least two retained Vision "
-                        "graph entries; unset the variable or set it to >=2"
-                    )
+            from rpu_backend.adapters.qwen3_5.vision import (
+                _require_packed_spatial_vision_native,
+            )
+
+            _require_packed_spatial_vision_native()
             self._processor = _load_processor(self.checkpoint, checkpoint_module)
             self.base_model = _load_base_model(
                 self.checkpoint, checkpoint_module, manifest=self._manifest
@@ -281,6 +277,7 @@ class WallQwen35Runtime:
             self.base_model.config._attn_implementation = "eager"
             _text_config(self.base_model.config)._attn_implementation = "eager"
             self.base_model.eval()
+            self.base_model.model.visual._wall_qwen35_packed_vision = True
             # This VLA uses the base decoder only to populate six physical K/V
             # prefixes for the action expert.  It never consumes language
             # logits, and its 256277-row tied head cannot satisfy the generic
@@ -378,40 +375,52 @@ class WallQwen35Runtime:
             )
 
     def _build_prefix(self, prepared: WallQwen35PreparedInput):
-        self.base_cache.reset()
-        # Qwen3.5 vision STEP0 accepts host folded patches and performs the
-        # explicit CPU/RPU handoff itself.  Keep this pointer off RPU before
-        # entering the lazy vision installer/captured graph.
-        pixel_values = prepared.pixel_values.detach().to(
-            device="cpu", dtype=torch.float16
-        ).contiguous()
-        with torch.inference_mode(), _profile_scope(
-            "wall_qwen35_vision_text_prefill"
-        ):
-            output = self.base_model(
-                input_ids=prepared.prefix_input_ids,
-                attention_mask=prepared.prefix_attention_mask,
-                position_ids=prepared.prefix_position_ids,
-                past_key_values=self.base_cache,
-                pixel_values=pixel_values,
-                image_grid_thw=prepared.image_grid_thw,
-                mm_token_type_ids=prepared.prefix_mm_token_type_ids,
-                use_cache=True,
-                return_dict=True,
-                logits_to_keep=1,
-            )
-        logits = getattr(output, "logits", None)
-        if not isinstance(logits, torch.Tensor) or tuple(logits.shape) != (1, 1, 0):
-            raise RuntimeError(
-                "Wall base decoder must use the explicit cache-only/no-lm-head "
-                f"contract, got logits shape {getattr(logits, 'shape', None)}"
-            )
-        if int(self.base_cache.position) != prepared.prefix_length:
-            raise RuntimeError(
-                "base prefix cache position drift: "
-                f"{self.base_cache.position} != {prepared.prefix_length}"
-            )
-        return self.base_cache
+        # A completed action call may leave its temporary allocation high-water
+        # mark behind, especially after an exact-prefix Graph miss/priming call.
+        # Vision must start at the same temporary base on BUILD and REPLAY, not
+        # append its packed workspace to the previous component's dead Temps.
+        # These resets are OUTSIDE component capture scopes: persistent state
+        # and retained Graphs survive, and no Graph is made non-replayable.
+        torch.ops.rpu.spm_alloc_reset_temporary()
+        try:
+            self.base_cache.reset()
+            # Qwen3.5 vision STEP0 accepts host folded patches and performs the
+            # explicit CPU/RPU handoff itself. Keep this pointer off RPU before
+            # entering the lazy vision installer/captured graph.
+            pixel_values = prepared.pixel_values.detach().to(
+                device="cpu", dtype=torch.float16
+            ).contiguous()
+            with torch.inference_mode(), _profile_scope(
+                "wall_qwen35_vision_text_prefill"
+            ):
+                output = self.base_model(
+                    input_ids=prepared.prefix_input_ids,
+                    attention_mask=prepared.prefix_attention_mask,
+                    position_ids=prepared.prefix_position_ids,
+                    past_key_values=self.base_cache,
+                    pixel_values=pixel_values,
+                    image_grid_thw=prepared.image_grid_thw,
+                    mm_token_type_ids=prepared.prefix_mm_token_type_ids,
+                    use_cache=True,
+                    return_dict=True,
+                    logits_to_keep=1,
+                )
+            logits = getattr(output, "logits", None)
+            if not isinstance(logits, torch.Tensor) or tuple(logits.shape) != (1, 1, 0):
+                raise RuntimeError(
+                    "Wall base decoder must use the explicit cache-only/no-lm-head "
+                    f"contract, got logits shape {getattr(logits, 'shape', None)}"
+                )
+            if int(self.base_cache.position) != prepared.prefix_length:
+                raise RuntimeError(
+                    "base prefix cache position drift: "
+                    f"{self.base_cache.position} != {prepared.prefix_length}"
+                )
+            return self.base_cache
+        finally:
+            # Vision already closes its own boundary before Text. Close the
+            # Text -> Action boundary even on failure; KV/GDN state is not Temp.
+            torch.ops.rpu.spm_alloc_reset_temporary()
 
     def _run_action_layer(self, *, action_embed, time_cond, prepared, prefix_cache):
         _, action_module = _wall_modules()

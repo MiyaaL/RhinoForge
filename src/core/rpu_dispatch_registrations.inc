@@ -611,7 +611,8 @@ TORCH_LIBRARY(rpu, m) {
         "Tensor[] k_caches, Tensor[] v_caches, int num_patches, "
         "Tensor? step0_pos=None, "
         "Tensor(a!)? fusion_target=None, int[] fusion_row_starts=[], "
-        "int temporal_num_frames=1, int camera_batch_count=1) -> Tensor");
+        "int temporal_num_frames=1, int camera_batch_count=1, "
+        "int[] image_patch_counts=[]) -> Tensor");
 
   // Qwen2.5-VL Vision Encoder. See src/fused/rpu_qwen25vl_vision_model.cpp.
   m.def("qwen25vl_vision_create", TORCH_FN(rpu_qwen25vl_vision_create));

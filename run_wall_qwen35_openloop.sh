@@ -41,6 +41,12 @@ events into 32-step chunks, never crosses an event boundary, samples the three
 camera frames at each chunk start, and compares decoded RPU predictions with
 the recorded master-arm absolute trajectory. It never commands a robot.
 
+Vision defaults to one Graph for all three images (shared dense operations,
+three isolated attention calls per layer, per-image residual reductions).
+No extra enable flag is needed. Rebuild/reinstall the matching Python/native
+package after source changes: python -m pip install . --no-build-isolation
+The runner rejects an old package/native ABI before loading model weights.
+
 Options:
       --dataset-dir PATH       Recorded flat episode directory.
       --checkpoint PATH        Exact Wall Qwen3.5 checkpoint directory.
@@ -462,6 +468,7 @@ printf '  %-22s %s\n' 'instruction source:' "$INSTRUCTION_SOURCE"
 printf '  %-22s %s\n' 'robot id:' "$ROBOT_ID"
 printf '  %-22s %s\n' 'normalizer:' "$NORM_KEY"
 printf '  %-22s %s\n' 'inference steps:' "$NUM_INFERENCE_STEPS"
+printf '  %-22s %s\n' 'Vision mode:' '3 images -> 1 Graph (per-image attention/reduction)'
 printf '  %-22s %s\n' 'max requests:' "$([[ $MAX_REQUESTS == 0 ]] && printf all || printf '%s' "$MAX_REQUESTS")"
 if [[ -n "$FLOW_NOISE" ]]; then
     printf '  %-22s %s\n' 'noise seed base:' 'ignored (explicit flow noise)'

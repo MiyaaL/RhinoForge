@@ -181,7 +181,8 @@ public:
         const std::optional<at::Tensor>& fusion_target = std::nullopt,
         at::IntArrayRef fusion_row_starts = {},
         int64_t temporal_num_frames = 1,
-        int64_t camera_batch_count = 1);
+        int64_t camera_batch_count = 1,
+        at::IntArrayRef image_patch_counts = {});
 
 protected:
     // Graph-plan hooks + SPM layout + per-layer build (framework calls these).
@@ -189,12 +190,18 @@ protected:
     ModelDynamicConfig      dynamic_config(const ChunkPlan& plan) override;
     bool                    subclass_chunk_size_valid(int64_t cs, int64_t seq,
                                                       int64_t pos) const override;
+    int64_t                 subclass_layout_hash() const override;
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override;
     void                    build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override;  // Phase 2
 
     // KV_FIRST helpers + weight preload (referenced by member-fn-pointer in static_config).
     void      emit_preload_weights();
     void      emit_kv_first_body(int layer_idx, const ChunkInfo& chunk);   // Phase 1
+    // Packed spatial attention boundary. A future varlen kernel replaces this
+    // scheduler, not the packed projections, positions, or merger contract.
+    void      emit_packed_spatial_attention(int layer_idx);
+    void      emit_spatial_residual_reduce(uint32_t input, uint32_t residual,
+                                           uint32_t output, const ChunkInfo& chunk);
     ChunkPlan plan_kv_first_chunks(const ChunkPlan& compute_plan);
     void      emit_temporal_layer(int layer_idx);
     void      emit_spatial_group(int first_layer_idx, int last_layer_idx,
@@ -238,6 +245,13 @@ private:
     int64_t current_num_patches_ = 0;
     int64_t current_output_patches_ = 0;
     int64_t current_camera_batch_count_ = 1;
+    // Wall's three independent single-frame streams. Offsets count real rows,
+    // not alignment padding. Empty preserves generic and G0.5 behavior.
+    std::vector<FmbExecutionSpan> spatial_image_spans_;
+    // Keep each batch view's TensorImpl stable across typed-register REPLAY,
+    // not just its DDR address. Recreating narrow() inside an emitter is unsafe.
+    std::vector<std::array<at::Tensor, 3>> spatial_k_caches_;
+    std::vector<std::array<at::Tensor, 3>> spatial_v_caches_;
     at::Tensor q_ddr_buf_;   // KV_FIRST Phase1→Phase2 的 rope 后 Q（DDR 暂存）
 
     // G0.5 K=6 factorized temporal attention. Only the temporal SDPA caches

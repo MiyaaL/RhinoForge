@@ -24,6 +24,20 @@ model-specific execution code.
 The one-chunk input, QKV, and compute case is valid and follows the same path.
 Do not add a second executor for it.
 
+Wall Qwen3.5's source-only packed-spatial candidate uses one shared dense chunk
+and three real image spans (at most 196 patches each). Its encoder residual
+reductions also preserve each image's geometry inside that Graph: changing the
+ring's flattened row partition can change rounding despite identical partials.
+Use the shared reduction wrapper per span; do not add a new route selector.
+Spans do not create an
+attention mask: the current host wrapper explicitly inserts and attends to
+each image's independent KV slot. Ordered lengths belong in Graph identity and
+the workspace layout hash. Retain narrow KV views across replay so their
+TensorImpl identities remain stable. The merger processes packed rows and
+scatters intersections to independent mutable text destinations, including an
+image crossing the 512-patch merger chunk boundary. This is a source contract,
+not board numerical, lifecycle, or performance evidence.
+
 ## Failure signals
 
 - a chunk crosses a semantic stream boundary;
@@ -38,3 +52,5 @@ Do not add a second executor for it.
 - [`FmbThreeStageChunkPlan`](../../src/core/fused_model_base.h)
 - [Plan construction and attention policy](../../src/core/fmb_three_stage_chunk_plan.cpp)
 - [Shared execution lifecycle](../../src/core/fused_model_base.cpp)
+- [Wall packed-spatial host wrapper](../../src/fused/rpu_qwen3_5_vision_model.cpp)
+- [Qwen3.5 Vision adapter and signatures](../../python/rpu_backend/adapters/qwen3_5/vision.py)

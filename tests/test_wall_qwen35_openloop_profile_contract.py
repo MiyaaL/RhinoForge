@@ -550,7 +550,7 @@ def test_ready_replay_admission_accepts_retained_prefix_bucket(
     }
     after = {
         "action": retained(19),
-        "vision": retained(4),
+        "vision": retained(2),
         "base_prefill": retained(1, signature="bucket=320"),
     }
     warm_output = SimpleNamespace(
@@ -818,6 +818,8 @@ def test_wrapper_exposes_and_forwards_profile_options() -> None:
     assert "--torch-profile-memory" in result.stdout
     assert "--torch-profile-with-stack" in result.stdout
     assert "READY-probe output directory" in result.stdout
+    assert "Vision defaults to one Graph" in result.stdout
+    assert "No extra enable flag is needed" in result.stdout
 
     source = WRAPPER.read_text(encoding="utf-8")
     assert '--torch-profile-output "$TORCH_PROFILE_OUTPUT"' in source
@@ -825,6 +827,40 @@ def test_wrapper_exposes_and_forwards_profile_options() -> None:
     assert "PYTHON_ARGS+=(--torch-profile-record-shapes)" in source
     assert "PYTHON_ARGS+=(--torch-profile-memory)" in source
     assert "PYTHON_ARGS+=(--torch-profile-with-stack)" in source
+
+
+def test_runner_rejects_old_installed_vision_before_checkpoint_load(
+    openloop_namespace, monkeypatch,
+) -> None:
+    from rpu_backend.adapters.qwen3_5 import vision
+
+    monkeypatch.delattr(vision, "_require_packed_spatial_vision_native")
+    with pytest.raises(RuntimeError, match="rebuild and reinstall"):
+        openloop_namespace["_require_packed_vision_runtime"]()
+    source = inspect.getsource(openloop_namespace["main"])
+    assert source.index("_require_packed_vision_runtime()") < source.index(
+        "WallQwen35Policy.from_checkpoint("
+    )
+    assert "if not args.check_config:\n        _require_packed_vision_runtime()" in source
+
+
+def test_runner_validates_native_and_reports_loaded_adapter(
+    openloop_namespace, monkeypatch, capsys,
+) -> None:
+    from rpu_backend.adapters.qwen3_5 import vision
+
+    calls = []
+    monkeypatch.setattr(vision, "_require_packed_spatial_vision_native", lambda: calls.append(1))
+    openloop_namespace["_require_packed_vision_runtime"]()
+    assert calls == [1]
+    assert str(Path(vision.__file__).resolve()) in capsys.readouterr().out
+
+    def stale_native():
+        raise RuntimeError("native ABI mismatch")
+
+    monkeypatch.setattr(vision, "_require_packed_spatial_vision_native", stale_native)
+    with pytest.raises(RuntimeError, match="native ABI mismatch"):
+        openloop_namespace["_require_packed_vision_runtime"]()
 
 
 def test_wrapper_rejects_profile_in_check_mode_before_environment_setup() -> None:

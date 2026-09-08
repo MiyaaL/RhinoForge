@@ -207,6 +207,7 @@ INTERNAL_HW_ATTRS_TRANSITIONAL: frozenset[str] = frozenset({
     "_rpu_vision_step0_pos_camera_batch_count",
     "_rpu_vision_merger_refs", "_rpu_vision_has_merger",
     "_rpu_vision_kv_cache",
+    "_rpu_vision_packed_spatial",
     "_rpu_vision_graph_disable", "_rpu_vision_rope_disable",
     "_rpu_vision_graph_cache",
     "_rpu_vision_graph_key", "_rpu_vision_graph_sig",
@@ -236,6 +237,7 @@ _MONOTONIC_INTERNAL_HW_ATTRS: frozenset[str] = frozenset({
     # Bound once alongside the GraphCache constructor. A later write would
     # make shape-eviction policy disagree with the cache's immutable capacity.
     "_rpu_vision_graph_max_entries",
+    "_rpu_vision_packed_spatial",
 })
 
 

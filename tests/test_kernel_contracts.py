@@ -293,6 +293,7 @@ def test_qwen3_5_vision_runtime_requires_matching_graph_capacity() -> None:
         _rpu_vision_patch_embed_b=None,
         _rpu_vision_has_merger=False,
         _rpu_vision_kv_cache=object(),
+        _rpu_vision_packed_spatial=False,
         _rpu_vision_graph_disable=False,
         _rpu_vision_graph_cache=Cache(2),
         _rpu_vision_graph_max_entries=2,

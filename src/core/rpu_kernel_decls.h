@@ -2502,7 +2502,8 @@ at::Tensor rpu_qwen3_5_vision_forward(
     const std::optional<at::Tensor>& fusion_target = std::nullopt,
     at::IntArrayRef fusion_row_starts = {},
     int64_t temporal_num_frames = 1,
-    int64_t camera_batch_count = 1);
+    int64_t camera_batch_count = 1,
+    at::IntArrayRef image_patch_counts = {});
 
 // Per-handle SPM-budget-resolved chunk_size (0 before any forward).
 int64_t rpu_qwen3_5_vision_get_resolved_chunk_size(int64_t handle);

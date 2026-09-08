@@ -381,11 +381,24 @@ def _qwen3_5_vision_destroy_handle(h: int) -> None:
         pass
 
 
+def _require_packed_spatial_vision_native() -> None:
+    """Fail before weight loading/conversion when Python and native ABIs differ."""
+    try:
+        schema = torch.ops.rpu.qwen3_5_vision_forward.default._schema
+        compatible = "image_patch_counts" in {arg.name for arg in schema.arguments}
+    except AttributeError:
+        compatible = False
+    if not compatible:
+        raise RuntimeError("Wall packed vision requires rebuilding the native extension")
+
+
 def _make_dummy_vision_kv_caches(
     num_layers: int,
     max_seq_len: int,
     num_heads: int,
     head_dim: int,
+    *,
+    batch_size: int = 1,
 ) -> RPUCache:
     """Create an RPUCache sized for bidirectional vision SDPA.
 
@@ -395,7 +408,7 @@ def _make_dummy_vision_kv_caches(
     """
     return RPUCache(
         num_layers=num_layers,
-        batch_size=1,
+        batch_size=batch_size,
         max_seq_len=max_seq_len,
         num_kv_heads=num_heads,
         head_dim=head_dim,
@@ -423,6 +436,7 @@ _QWEN3_5_VISION_READY_ATTRS = (
     "_rpu_vision_patch_embed_b",
     "_rpu_vision_has_merger",
     "_rpu_vision_kv_cache",
+    "_rpu_vision_packed_spatial",
     "_rpu_vision_graph_disable",
     "_rpu_vision_graph_cache",
     "_rpu_vision_graph_max_entries",
@@ -456,6 +470,16 @@ def _qwen3_5_vision_runtime_complete(
     if any(not hasattr(vision_model, name)
            for name in _QWEN3_5_VISION_READY_ATTRS):
         return False
+    packed_spatial = vision_model._rpu_vision_packed_spatial
+    if type(packed_spatial) is not bool or packed_spatial != getattr(
+        vision_model, "_wall_qwen35_packed_vision", False
+    ):
+        return False
+    if packed_spatial:
+        cache = vision_model._rpu_vision_kv_cache
+        if (getattr(cache, "batch_size", None) != 3
+                or getattr(cache, "max_seq_len", None) != 196):
+            return False
     handle = getattr(vision_model, "_rpu_vision_handle", None)
     finalizer = getattr(
         vision_model, "_rpu_vision_handle_finalizer", None
@@ -640,6 +664,14 @@ def _install_qwen3_5_vision_for_rpu_impl(
     """
     vision_model = _resolve_vision_model(model)
     cfg = vision_config or vision_model.config
+    packed_spatial = getattr(vision_model, "_wall_qwen35_packed_vision", False)
+    if type(packed_spatial) is not bool:
+        raise ValueError("Wall packed vision mode must be a cold boolean setting")
+    if packed_spatial:
+        # Reject an old native extension before transforming any weights.
+        _require_packed_spatial_vision_native()
+        if max_seq_len < 588 or max_hw < 14:
+            raise ValueError("Wall packed vision requires capacity for three 14x14 grids")
 
     num_layers = len(vision_model.blocks)
     num_heads = cfg.num_heads
@@ -851,13 +883,12 @@ def _install_qwen3_5_vision_for_rpu_impl(
     # Step 8: allocate dummy KV caches and the optional debug graph.
     # ------------------------------------------------------------------ #
     vision_model._rpu_vision_kv_cache = _make_dummy_vision_kv_caches(
-        num_layers, max_seq_len, num_heads, head_dim
+        num_layers, 196 if packed_spatial else max_seq_len, num_heads, head_dim,
+        batch_size=3 if packed_spatial else 1,
     )
-    # One cached shape is enough for same-size images/repeated requests and bounds the
-    # private Queue_t cost.  A Wall request contains two geometries, so its
-    # controlled path sets QWEN3_5_VISION_GRAPH_MAX_ENTRIES=2 before this lazy
-    # installer runs. Keep the generic default at one; capacity was validated
-    # and the empty cache constructed before any model mutation above.
+    vision_model._rpu_vision_packed_spatial = packed_spatial
+    # One signature now covers the complete Wall image triple. Capacity was
+    # validated and the empty cache constructed before any model mutation.
     vision_model._rpu_vision_graph_disable = (
         os.environ.get("QWEN3_5_VISION_GRAPH_DISABLE", "0") != "0"
     )
@@ -909,7 +940,8 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
     Returns ``BaseModelOutputWithPooling(last_hidden_state, pooler_output)`` (no
     deepstack). Generic multi-image input runs once per image. G0.5's exact
     three-camera, six-frame, 256-pixel profile may instead use one camera-major
-    packed call.
+    packed call. Wall's explicit packed-spatial mode shares one dense pass
+    across three variable-length images with independent attention spans.
     """
     from transformers.modeling_outputs import BaseModelOutputWithPooling
 
@@ -928,6 +960,24 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
     grid_thw_cpu = grid_thw.detach().cpu() if grid_thw.device.type != "cpu" else grid_thw
     _validate_vision_grid(
         grid_thw_cpu, spatial_merge_size, "Qwen3.5 vision forward")
+    packed_spatial = getattr(self, "_rpu_vision_packed_spatial", False)
+    image_patch_counts = ()
+    if packed_spatial:
+        if (
+            tuple(grid_thw_cpu.shape) != (3, 3)
+            or not bool(torch.all(grid_thw_cpu[:, 0] == 1))
+            or not bool(torch.all(grid_thw_cpu[:, 1:] <= 14))
+            or spatial_merge_size != 2
+            or temporal_num_frames != 1 or camera_batch_count != 1
+            or hidden_states.dim() != 2
+        ):
+            raise ValueError(
+                "Wall packed vision requires exactly three single-frame images "
+                "with even H/W <=14 patches and spatial_merge_size=2"
+            )
+        image_patch_counts = tuple(int(x) for x in grid_thw_cpu.prod(-1).tolist())
+        if hidden_states.size(0) != sum(image_patch_counts):
+            raise ValueError("Wall packed vision pixel rows do not match image grids")
     step0_on = getattr(self, "_rpu_vision_step0", False)
     compact_input = hidden_states.dim() == 4
     if compact_input and not step0_on:
@@ -990,7 +1040,9 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         raise ValueError(
             "Qwen3.5 temporal vision requires a whole number of frame groups"
         )
-    if camera_batch_count == 3:
+    if packed_spatial:
+        groups = [(0, total_patches, total_patches)]
+    elif camera_batch_count == 3:
         if (
             temporal_num_frames != 6
             or len(patches_per_image) != 18
@@ -1053,7 +1105,8 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
     if direct_fusion:
         if not merger_on:
             raise RuntimeError("Qwen3.5 direct vision fusion requires the RPU merger")
-        expected_starts = camera_batch_count if camera_batch_count == 3 else len(groups)
+        expected_starts = 3 if packed_spatial else (
+            camera_batch_count if camera_batch_count == 3 else len(groups))
         if fusion_run_starts is None or len(fusion_run_starts) != expected_starts:
             raise RuntimeError(
                 "Qwen3.5 direct vision fusion requires one run start per image")
@@ -1070,7 +1123,8 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         pos_idx_cpu = _cached_vision_position_idx_cpu(
             self,
             grid_thw_cpu[
-                grid_start : grid_start + temporal_num_frames * camera_batch_count
+                grid_start : grid_start + (
+                    3 if packed_spatial else temporal_num_frames * camera_batch_count)
             ],
             spatial_merge_size,
             max_hw=int(self._rpu_vision_freq_cos.size(0)),
@@ -1100,11 +1154,12 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
             fusion_target if direct_fusion else None,
             (
                 [int(x) for x in fusion_run_starts]
-                if direct_fusion and camera_batch_count == 3
+                if direct_fusion and (packed_spatial or camera_batch_count == 3)
                 else [int(fusion_run_starts[i])] if direct_fusion else []
             ),
             temporal_num_frames,
             camera_batch_count,
+            image_patch_counts,
         )
 
         if getattr(self, "_rpu_vision_graph_disable", False):
@@ -1119,14 +1174,11 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
                 n_i, self._rpu_vision_hidden_size, num_layers,
                 temporal_num_frames, camera_batch_count, direct_fusion,
                 compact_input, tuple(embed_i.shape),
+                image_patch_counts,
             )
             if self._rpu_vision_graph_key != key:
-                # The generic path deliberately retains one shape.  Wall's
-                # controlled path sets a bounded two-entry cache so face and
-                # wrist geometries can coexist; do not evict the previous
-                # signature in that mode.  GraphCache has no implicit LRU, so
-                # a third geometry fails at the explicit capacity bound rather
-                # than silently changing the admitted profile.
+                # A bounded one-entry cache evicts on a changed triple. Larger
+                # explicit budgets retain signatures without implicit LRU.
                 if (
                     getattr(self, "_rpu_vision_graph_max_entries", 1) <= 1
                     and self._rpu_vision_graph_sig is not None
@@ -1141,6 +1193,7 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
                     dyn_dims=[
                         num_layers, temporal_num_frames, camera_batch_count,
                         int(direct_fusion), int(compact_input),
+                        *image_patch_counts,
                     ],
                     dtypes=[torch.float16],
                 )

@@ -2,6 +2,16 @@
 
 对应表格：[wall_qwen35_rpu_performance_upper_bound.xlsx](wall_qwen35_rpu_performance_upper_bound.xlsx)
 
+更新说明（2026-09-08）：源码已将 Wall 三图改为一次 packed Vision Graph 调用，
+共享 dense 运算，每层暂时保留三次独立 attention；两次残差 AllReduce 各按原图
+边界分三段，保持逐图参考的求和边界，仍在同一 Graph 内。重建安装后直接运行
+`bash run_wall_qwen35_openloop.sh --max-requests 1` 即启用，无额外开关；
+加 `--torch-profile` 可检查一次 BUILD 后的 REPLAY，但不代表整链数值门槛通过。
+下文和工作簿仍是合并前的
+三次调用基线账本，未改写为新版本实测。尤其 `1,881 MiB / 14.088 ms` 的 Vision
+weight-stream 情景不能直接当作合并版结果；是否减少实际 DDR reread、以及收益大小，
+仍需新版本板端正确性、Graph replay 和无 profiler 性能验证。
+
 本次提交中的工作簿 SHA256 为 `d3d30638a20407e0a41895e9c49a5628175f0ec56f405eca05bc53246a8c0f07`；它包含 4 张可见工作表和 210 个公式，不含宏或外部链接。
 
 这份表按当前仓库中的 Wall Qwen3.5 受控 profile、RPU 运行时和八核 SPM/DDR 架构重建了算子账本。你给出的 **FP16 峰值 100 TOPS、DDR 带宽 140 GB/s** 被作为可编辑的情景参数写入“阶段汇总”`B3:B4`。当前 `B3=100` 表示公式使用 **100 TFLOP/s**；这对应芯片规格把一次 MAC 的乘、加分别计作两个 operation。带宽按十进制 GB/s 计算。`B5` 是 launch/replay floor，当前为 0 ms，仅表示理想化 compute+DDR 情景下界，不能当作实测启动开销。

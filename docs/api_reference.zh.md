@@ -148,6 +148,12 @@ API。初版范围固定为 FP16 batch 1、精确三个规范相机、初始多�
 native pad-zeroing 即使在 bucket 边界也会发出稳定的 fill 节点。Action fast replay
 仍按精确真实 prefix 长度建图，因为 KV 插入位置和 SDPA 寄存器会固化该值。
 这些只是 Wall profile 的内部优化，不扩展通用 Qwen3.5 API。
+Wall 将三张单帧图像合并为一次 retained Vision Graph 调用；每图为偶数 patch 网格，
+不超过 14x14，合计最多 588 patches。dense 运算共享 packed 行，每层 attention
+仍按真实图长隔离调用三次。encoder 的两处残差 AllReduce 也按原图边界分别执行，
+保留逐图执行的归约几何和浮点累加顺序；dense 计算仍共享一个 packed chunk。
+更新此 adapter 时需要重新编译 native 扩展；该源码改动
+不改变 numeric-blocked 状态，也不代表已经验证性能提升。
 `predict_action_chunk(..., initial_noise=...)` 接受 shape 为 `[32,26]` 或
 `[1,32,26]`、可转换成 CPU FP32 且所有元素有限的 tensor，用于精确的跨设备 flow 输入
 对齐；它与 `noise_seed` 互斥，两者均省略时保持确定性的 seed-0 行为。Qwen3.5 vision

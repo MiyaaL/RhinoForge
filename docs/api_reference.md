@@ -174,6 +174,14 @@ stable fill-node envelope even for an exact bucket boundary. Action fast replay
 remains keyed by the exact real prefix length because its KV insertion and SDPA
 registers bake in that value. These optimizations are internal to the Wall
 profile and do not broaden the generic Qwen3.5 execution API.
+Wall packs its three single-frame images into one retained Vision Graph call;
+each even patch grid is bounded by 14x14 (588 total patches maximum). Dense
+operations share the packed rows, while each layer still calls the existing
+attention kernel three times with isolated real-length image spans. Encoder
+residual reductions retain per-image ring geometry inside that same Graph to
+preserve the per-image reference's accumulation boundaries. Rebuild
+the native extension when updating this adapter. This source implementation
+does not change the numeric-blocked status or certify a speedup.
 `predict_action_chunk(..., initial_noise=...)` accepts a finite CPU FP32-
 convertible tensor with shape `[32,26]` or `[1,32,26]` for exact cross-device
 flow-input parity. It is mutually exclusive with `noise_seed`; omitting both

@@ -34,6 +34,21 @@ release-matched operator asset is unavailable.
 
 ## Save a reusable answer
 
+When packing independent image streams, update the
+[three-stage contract](concepts/three-stage-chunk-plan.md), Graph replay-count
+expectations, and runtime capacity documentation together. Keep historical
+multi-call timing/traffic ledgers explicitly separate from an unmeasured
+single-call candidate.
+For packed numerical parity, compare row-parallel partials and residuals before
+and after reduction. Preserve semantic reduction spans when the reference
+depends on ring geometry; matching GEMM outputs alone does not establish final
+parity. Verify the installed Python/native package used by the public launcher,
+not only a temporary validation package.
+Also exercise consecutive requests with changing exact prefixes: a cold Action
+priming call can leave a temporary-SPM watermark that a single warmup/replay
+probe misses. Check the [component handoff](concepts/component-handoff.md)
+boundaries before changing workspace sizes or clearing Graph caches.
+
 1. First update an existing concept or synthesis page when it owns the result.
 2. Add a short page under [queries/](queries/README.md) only when the original
    question and decision context remain useful.

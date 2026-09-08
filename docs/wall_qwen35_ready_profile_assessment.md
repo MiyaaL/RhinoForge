@@ -3,6 +3,61 @@
 This assessment is limited to the exact controlled-evaluation profile below. It
 does not promote the model-support status or transfer evidence from Wall-OSS.
 
+## Packed-spatial source update (2026-09-08)
+
+The new candidate supersedes the two-signature/three-call Vision design
+described in the historical assessment below. Wall now submits one packed
+Vision Graph call per request. Dense work shares all image rows; each layer
+still makes three independent real-length attention calls using persistent KV
+views. The signature includes ordered image lengths. The envelope is three
+single-frame even grids up to 14x14 each; the usual lengths are `[112,140,140]`,
+and the maximum is `[196,196,196]`. Default Vision cache capacity is one.
+The shared FusedModelBase executor, mutable input/output DMA, and maximum-
+envelope cross-chunk merger scatter are retained. A future varlen kernel can
+replace the isolated attention emitter without changing the image contract.
+The encoder's two residual AllReduce sites also retain per-image boundaries
+inside that same Graph. This preserves the old ring geometry and accumulation
+order while leaving dense work packed; changing the reduction's row count can
+otherwise introduce FP16 rounding differences even from identical partials.
+The open-loop wrapper checks the installed packed-Vision Python/native ABI
+before weight loading and prints the loaded adapter and Vision cache counters.
+The runtime closes the Action-to-Vision and Text-to-Action temporary-SPM
+boundaries outside Graph capture, including the prefix error path. This avoids
+appending packed Vision's workspace to dead Action priming allocations while
+preserving retained Graphs and persistent state.
+
+Classification remains Runtime extension / uncertified. Board-free checks
+do not transfer the historical r4 timings or Graph receipts to this candidate.
+Fresh native build, board numerical/FP32-anchor/task gates, maximum-envelope
+SPM admission, one-BUILD/stable-REPLAY, changing inputs/destinations, and clean
+latency measurements are required. No device kernel or operator asset was
+changed. Sections below retain the previous candidate's context and evidence.
+
+### Installed-candidate diagnostic (2026-09-08)
+
+The rebuilt installed candidate completed the original open-loop wrapper's
+full 16-request / 468-frame episode with `--torch-profile` (prefixes 299--313).
+Vision had one BUILD, one cache entry, one segment, replay counts 1 through 16,
+zero recaptures, and a true invariant throughout. The first-request READY probe
+accepted exact Vision/Text/Action replay deltas of 1/1/10; physical and
+normalized actions were bit-exact. Later requests return to WARMING and may
+rebuild Action for a changed exact prefix, so this is not dataset-wide frozen
+READY. The previously reproduced third-request temporary-SPM OOM did not recur
+after closing the component handoff boundaries.
+
+Standalone component checks using the exact checkpoint and seed 7241 compared
+packed and per-image paths for `[112,140,140]`, `[140,112,140]`, and
+`[196,196,196]`. Final hidden and merger outputs were bit-exact in all cases;
+repeats, retained outputs, image isolation, and maximum-envelope fusion
+scatter/fresh destinations/canaries passed. Native SHA256:
+`0907000f7ce6c0577936c79c0b548b43dd56fe9766da4d7a79f74b565b6bf8af`;
+installed Wall runtime Python SHA256:
+`20230e4c40c6b9cffae2e3b2519459c94443f4e459243b0b024762d9131ef792`.
+The related board-free suite passed 123 tests. Raw application/profile
+artifacts remain outside Git. These bounded diagnostics do not certify the
+FP32-anchor/task gates, eliminate every prior intermittent numerical issue,
+promote the support status, or establish a speedup.
+
 ## 1. Candidate identity
 
 | Field | Value |
@@ -97,7 +152,8 @@ Before a complete READY claim:
 2. Freeze Vision, Base Prefill, and Action caches before measurement. Reject any
    READY miss instead of building online.
 3. Prove fixed cache sizes, unchanged signatures, zero recaptures,
-   `cache_invariant_ok()`, and replay deltas of Vision 3, Prefill 1, and Action 10
+   `cache_invariant_ok()`, and replay deltas of Vision 1 (3 in the historical
+   per-image design), Prefill 1, and Action 10
    for the measured policy call.
 4. Exercise prefix-envelope minimum/maximum and A/B/A same-shape input refresh;
    retain the first returned output across later calls and verify independent

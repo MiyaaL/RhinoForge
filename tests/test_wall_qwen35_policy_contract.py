@@ -296,6 +296,74 @@ def _empty_runtime_for_install_test():
     return runtime
 
 
+@pytest.mark.parametrize("failure", [None, "forward", "logits", "position"])
+def test_prefix_handoff_retires_previous_component_temps_outside_capture(
+    monkeypatch, failure,
+) -> None:
+    from rpu_backend.adapters.wall_qwen35.runtime import WallQwen35Runtime
+
+    events = []
+    # Exact failing board watermark: action Temps plus packed Vision would
+    # exceed the available arena, though each component fits by itself.
+    arena = {"temporary": 3372288, "capturing": False}
+    persistent = object()
+
+    def reset_temporary():
+        assert not arena["capturing"]
+        arena["temporary"] = 0
+        events.append("reset_temp")
+
+    monkeypatch.setattr(torch.ops.rpu, "spm_alloc_reset_temporary",
+                        reset_temporary, raising=False)
+
+    def reset_cache():
+        assert arena["temporary"] == 0
+        cache.position = 0
+        events.append("reset_cache")
+
+    cache = SimpleNamespace(position=0, persistent=persistent, reset=reset_cache)
+    prepared = SimpleNamespace(
+        pixel_values=torch.zeros((392, 4)), prefix_input_ids=object(),
+        prefix_attention_mask=object(), prefix_position_ids=object(),
+        image_grid_thw=object(), prefix_mm_token_type_ids=object(),
+        prefix_length=308,
+    )
+
+    def forward(**kwargs):
+        assert arena["temporary"] + 4817408 <= 7598080
+        assert kwargs["past_key_values"] is cache
+        assert kwargs["pixel_values"].device.type == "cpu"
+        assert kwargs["pixel_values"].dtype == torch.float16
+        arena["capturing"] = True
+        arena["temporary"] = 4817408
+        events.append("prefix")
+        try:
+            if failure == "forward":
+                raise RuntimeError("synthetic prefix failure")
+            cache.position = prepared.prefix_length + int(failure == "position")
+            return SimpleNamespace(logits=torch.empty((1, 1, 1 if failure == "logits" else 0)))
+        finally:
+            arena["capturing"] = False
+
+    runtime = WallQwen35Runtime.__new__(WallQwen35Runtime)
+    runtime.base_cache = cache
+    runtime.base_model = forward
+    if failure is not None:
+        with pytest.raises(RuntimeError):
+            runtime._build_prefix(prepared)
+    else:
+        for prefix in (308, 310, 311):
+            arena["temporary"] = 3372288  # previous completed action component
+            prepared.prefix_length = prefix
+            assert runtime._build_prefix(prepared) is cache
+            assert arena["temporary"] == 0  # Text -> Action handoff
+            assert cache.persistent is persistent
+    assert arena["temporary"] == 0
+    assert events == ["reset_temp", "reset_cache", "prefix", "reset_temp"] * (
+        1 if failure else 3
+    )
+
+
 def test_runtime_rejects_conflicting_cold_multi_handle_setting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -316,12 +384,18 @@ def test_runtime_restores_owned_cold_environment_after_install_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rpu_backend.adapters.wall_qwen35 import runtime as wall_runtime
+    from rpu_backend.adapters.qwen3_5 import vision as vision_adapter
+
+    monkeypatch.setattr(vision_adapter, "_require_packed_spatial_vision_native", lambda: None)
 
     coexist = "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
     vision = "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED"
     monkeypatch.delenv(coexist, raising=False)
     monkeypatch.delenv(vision, raising=False)
+    entries = "QWEN3_5_VISION_GRAPH_MAX_ENTRIES"
+    monkeypatch.delenv(entries, raising=False)
     def fail_processor(*_args, **_kwargs):
+        assert os.environ[entries] == "1"
         raise RuntimeError("synthetic processor failure")
 
     monkeypatch.setattr(wall_runtime, "_load_processor", fail_processor)
@@ -333,7 +407,23 @@ def test_runtime_restores_owned_cold_environment_after_install_failure(
 
     assert coexist not in os.environ
     assert vision not in os.environ
+    assert entries not in os.environ
     assert runtime._closed is True
+
+
+def test_runtime_rejects_old_vision_native_before_loading(monkeypatch):
+    from rpu_backend.adapters.wall_qwen35 import runtime as wall_runtime
+
+    monkeypatch.setattr(torch.ops.rpu, "qwen3_5_vision_forward", object(), raising=False)
+    monkeypatch.setenv("RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN", "1")
+    monkeypatch.setattr(wall_runtime, "_load_processor",
+                        lambda *a, **kw: pytest.fail("must reject before loading"))
+    monkeypatch.setattr(wall_runtime, "_load_base_model",
+                        lambda *a, **kw: pytest.fail("must reject before loading"))
+    runtime = _empty_runtime_for_install_test()
+    with pytest.raises(RuntimeError, match="rebuilding the native extension"):
+        runtime.install()
+    assert runtime._closed
 
 
 class _PredictRuntime:

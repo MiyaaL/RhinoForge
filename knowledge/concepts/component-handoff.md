@@ -35,6 +35,15 @@ just the next function call.
 6. Before returning to an earlier component, repeat its public admission and
    ownership path; do not assume its previous temporary state remains live.
 
+Wall Qwen3.5 resets temporary SPM before its Vision/Text prefix call and in a
+`finally` block after that call, outside all component capture scopes. The
+Vision adapter already closes the internal Vision-to-Text boundary. An Action
+exact-prefix miss can run an uncaptured priming forward and leave a nonzero
+temporary watermark; without the next handoff reset, packed Vision's Path-2
+allocation appends to those dead Temps and can OOM on a later request. Retire
+temporary storage with the shared reset helper, not by clearing retained
+Graphs or resetting persistent generations.
+
 ## Failure signals
 
 - The first forward is correct but a repeated or multi-image forward changes:
@@ -56,4 +65,5 @@ just the next function call.
 - [DDR/SPM DMA wrappers](ddr-dma-wrappers.md)
 - [Pi0.5 adapter](../../python/rpu_backend/adapters/pi05/__init__.py)
 - [Wall-OSS adapter](../../python/rpu_backend/adapters/wall_oss/__init__.py)
+- [Wall Qwen3.5 runtime](../../python/rpu_backend/adapters/wall_qwen35/runtime.py)
 - [RhinoVLA facade](../../python/rpu_backend/api/rhinovla.py)

@@ -60,7 +60,7 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
   and profile admission.
 - [Three-stage chunk execution](concepts/three-stage-chunk-plan.md): shared
   input/QKV/compute schedules, semantic spans, exact plan identity, and
-  attention-storage fallback.
+  attention-storage fallback; Wall packed-spatial independent-attention example.
 - [Multi-component ownership and handoff](concepts/component-handoff.md):
   Graph, SPM, DMA, output, and teardown boundaries between model components.
 - [Automatic residual reduction](concepts/allreduce-routing.md): one generated

@@ -150,6 +150,26 @@ def _flow_noise_schedule(
     return values, source
 
 
+def _require_packed_vision_runtime() -> None:
+    # The wrapper executes this source file but imports the installed package.
+    # Reject an old per-image adapter/native ABI before loading the checkpoint.
+    from rpu_backend.adapters.qwen3_5 import vision
+
+    require_native = getattr(vision, "_require_packed_spatial_vision_native", None)
+    if not callable(require_native):
+        raise RuntimeError(
+            "the installed RhinoForge package lacks packed one-Graph Wall Vision; "
+            "rebuild and reinstall this source tree with the wrapper's Python: "
+            "python -m pip install . --no-build-isolation"
+        )
+    require_native()
+    print(
+        "[wall-qwen35-openloop] packed Vision runtime OK: "
+        f"{Path(vision.__file__).resolve()}",
+        flush=True,
+    )
+
+
 def _runtime_provenance(policy: Any) -> dict[str, Any]:
     import rpu_backend
 
@@ -1307,10 +1327,10 @@ def _ready_replay_admission(
     action = _retained_replay_admission(
         before.get("action"), after.get("action"), expected_replays=10
     )
-    # One request invokes Vision once for the face geometry and twice for the
-    # shared wrist geometry. A READY cache must replay all three invocations.
+    # One packed Vision invocation covers all three cameras. A READY request
+    # must replay that signature exactly once.
     vision = _retained_replay_admission(
-        before.get("vision"), after.get("vision"), expected_replays=3
+        before.get("vision"), after.get("vision"), expected_replays=1
     )
     parity = _profile_output_parity(warm, measured)
     base_before = before.get("base_prefill")
@@ -1515,6 +1535,9 @@ def main() -> int:
 
     from rpu_backend.api import WallQwen35Policy
 
+    if not args.check_config:
+        _require_packed_vision_runtime()
+
     # Exact checkpoint admission is intentionally completed before image decode
     # and before any irreversible model installation.
     policy = WallQwen35Policy.from_checkpoint(
@@ -1616,6 +1639,12 @@ def main() -> int:
         "dof_mask": MASK26.tolist(),
         "controlled_evaluation": True,
         "numeric_blocked_vision_opt_in": True,
+        "vision_execution": {
+            "mode": "packed_spatial",
+            "images_per_graph": 3,
+            "attention_calls_per_layer": 3,
+            "encoder_residual_reduce": "per_image_spans",
+        },
         "cold_runtime_profile": {
             "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN": os.environ.get(
                 "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
@@ -1843,10 +1872,18 @@ def main() -> int:
                 "action", action_graph, calls=10
             )
             _validate_retained_graph_stats(
-                "vision", vision_graph, calls=3 * completed_requests
+                "vision", vision_graph, calls=completed_requests
             )
             _validate_retained_graph_stats(
                 "base prefill", graph["base_prefill"], calls=completed_requests
+            )
+            print(
+                "[wall-qwen35-openloop] Vision Graph: "
+                f"entries={vision_graph['size']}, "
+                f"replays={vision_graph['replays']}, "
+                f"recaptures={vision_graph['recaptures']}, "
+                f"invariant_ok={vision_graph['invariant_ok']}",
+                flush=True,
             )
             predictions_relative.append(relative)
             predictions_absolute.append(predicted_eval)

@@ -114,6 +114,29 @@ bash run_wall_qwen35_openloop.sh --max-events 1 \
 bash run_wall_qwen35_openloop.sh
 ```
 
+三图合并的 Vision 路径默认开启，不需要额外 flag。脚本使用所选 Python 环境中
+**已安装**的 `rpu_backend`；仅修改源码不会更新该安装包。从当前源码重建并安装后运行：
+
+```bash
+source /home/hx/miyaa/work/env.sh
+CMAKE_PREFIX_PATH=/home/hx/.local/opt/rhino-launch-kernel-v1.0.0-linux-aarch64 \
+  python -m pip install . --no-build-isolation -Cbuild.tool-args=-j2
+bash run_wall_qwen35_openloop.sh --max-requests 1
+```
+
+启动时会检查 packed Vision adapter 和 native ABI，输出实际 adapter 路径；旧安装包
+会在加载 checkpoint 前被拒绝。请求结束时输出的 `Vision Graph: entries=1` 表示
+三图共用一个缓存条目；增加 `--torch-profile` 会在 warmup 后重复同一请求，检查
+Vision 的 replay 增量精确为 1。它不代表 Text/Action 也合并进同一 Graph，亦不代表
+READY 数值或任务质量门禁通过。`segments.json` 记录 Graph 诊断，`meta.json` 记录
+`vision_execution` 与实际安装包、native 扩展和运行时资产 provenance。
+
+packed dense 计算共享全部图像行；attention 仍按图隔离，encoder 的两处残差
+AllReduce 也按原图边界调用，以保留逐图执行的归约几何。通用和 temporal Vision
+路径不变。
+Wall runtime 在 Vision/Text 前及 Text 后、Graph 捕获范围之外释放临时 SPM，
+保留持久状态，避免 Action priming 遗留的临时区叠加到下一次 packed Vision 分配上。
+
 板上命令默认使用 `sudo`，并 source `/home/hx/miyaa/work/env.sh`。输出包含与参考脚本
 兼容的 NumPy 文件名、物理单位指标、精确 profile provenance 和 retained-Graph
 诊断。脚本会在 Python 启动前固定多 handle 所需的冷配置
@@ -124,8 +147,8 @@ bash run_wall_qwen35_openloop.sh
 然后只记录同一请求的一次重复执行；`--torch-profile-output DIR` 指定输出目录。
 脚本生成带时间戳和 PID 的 `.trace.json` 以及配套 `.summary.json`，不会覆盖旧文件。
 summary 包含精简的 Torch key averages、warmup/重复执行 action 的精确一致性，以及
-各组件 Graph 生命周期证据。只有两种 Vision geometry、base Prefill bucket/末块拓扑
-签名和精确 prefix Action 都已冻结为只查找 READY，并分别证明精确的 `3/1/10` replay
+各组件 Graph 生命周期证据。只有 packed Vision、base Prefill bucket/末块拓扑
+签名和精确 prefix Action 都已冻结为只查找 READY，并分别证明精确的 `1/1/10` replay
 增量时，才会标记 `accepted`；生成 trace 本身不等于 READY。base-text prefix 会映射到
 `64..384` 的固定 64 行 bucket，签名还区分末个 native chunk 的 1 行、2--31 行和 32+
 行拓扑，避免跨 node/grid 分支 replay。Action fast replay 会固化真实 prefix 的 KV 插入

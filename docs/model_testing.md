@@ -136,6 +136,36 @@ bash run_wall_qwen35_openloop.sh \
   --flow-noise /path/to/common_flow_noise.npy
 ```
 
+The wrapper defaults to **one Vision Graph for the three images**; no opt-in
+switch beyond the wrapper's existing controlled-evaluation mode is needed.
+It uses the installed `rpu_backend`, not the source-tree Python package. After
+changing the adapter or native code, use the same Python environment to rebuild:
+
+```bash
+source /home/hx/miyaa/work/env.sh
+CMAKE_PREFIX_PATH=/home/hx/.local/opt/rhino-launch-kernel-v1.0.0-linux-aarch64 \
+  python -m pip install . --no-build-isolation -Cbuild.tool-args=-j2
+bash run_wall_qwen35_openloop.sh --max-requests 1
+```
+
+Real execution rejects an old packed-Vision Python/native ABI before checkpoint
+loading and prints the loaded adapter path. `Vision Graph: entries=1` confirms
+the retained cache for the usual image triple. A fresh `--max-requests 1
+--torch-profile` run additionally exercises one warmup BUILD and one Vision
+REPLAY (`replays=1`, zero recaptures). Any action repeat drift still fails the
+READY summary's numerical gate; one Vision Graph is not a whole-policy
+READY or quality certification. Graph details are in `segments.json`, and
+`meta.json` records the package/native identities and `vision_execution` mode.
+
+The encoder retains per-image AllReduce boundaries inside the single Graph:
+GEMMs are packed, each layer has three isolated attention calls, and its two
+residual reductions each use three image spans. Changing ring geometry by
+reducing all packed rows together can change FP16 rounding even with identical
+partials. Generic single-image and temporal execution remain unchanged.
+The Wall runtime also resets temporary SPM outside capture before Vision/Text
+and after Text, preserving persistent state while preventing a previous Action
+priming call's workspace from accumulating under the next packed Vision call.
+
 The live commands use `sudo` by default for board access and source
 `/home/hx/miyaa/work/env.sh`. Their output includes reference-compatible NumPy
 filenames, physical-unit metrics, exact-profile provenance, and retained-Graph
@@ -171,8 +201,13 @@ request once without a profiler, then records exactly one identical repeat.
 compact Torch key averages, exact warmup/repeat action parity, and component
 Graph lifecycle evidence. It reports `accepted` only when Vision, a retained
 base Prefill bucket/topology signature, and exact-prefix Action are frozen in
-lookup-only READY and prove exact replay deltas of 3, 1, and 10 respectively; a
-generated trace is not itself a READY claim. Wall base-text prefixes are assigned
+lookup-only READY and prove exact replay deltas of 1, 1, and 10 respectively; a
+generated trace is not itself a READY claim. Vision now packs all three images
+in one call with three independent attention calls per layer. Test both the
+usual `[112,140,140]` lengths and maximum `[196,196,196]`, changed image data,
+changed output addresses, and equal totals with different ordered lengths.
+Rebuild the native extension before running this candidate; previous traces
+with three Vision calls are historical evidence only. Wall base-text prefixes are assigned
 to fixed 64-row buckets up to 384. The signature also separates the native
 one-row, 2--31-row, and 32+-row final-chunk envelopes, so compatible requests in
 one bucket can REPLAY without crossing a node/grid topology branch. Action

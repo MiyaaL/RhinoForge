@@ -396,7 +396,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 |---|---|---|---|
 | `QWEN3_5_VISION_DBG_Q` | 关闭；精确 `1` 或小写 `true` | 首次原生 debug 检查 / **NATIVE** | 启用 Qwen3.5 Vision query probe 路径。会增加 capture/同步，并可能暴露 intermediate。 |
 | `QWEN3_5_VISION_GRAPH_DISABLE` | `0`；除精确 `0` 外的任意值都会禁用 | Vision forward / **CALL**；重建/清除 Graph | 绕过 Qwen3.5 Vision GraphCache，用于受控比较。replay 和 latency 结论不再适用。 |
-| `QWEN3_5_VISION_GRAPH_MAX_ENTRIES` | `1`；正整数 | Vision Graph 构建 / **MODEL** | 限制保留的 Vision geometry 数量。受控 Wall 路径设为 `2`，使 face/wrist shape 可以 replay；更大值会增加 persistent queue/Graph 内存，并要求新建 model。 |
+| `QWEN3_5_VISION_GRAPH_MAX_ENTRIES` | `1`；正整数 | Vision Graph 构建 / **MODEL** | 限制保留的 Vision signature 数量。Wall 默认 `1`：三张图合并为一次 Graph 调用，signature 包含各图有序 patch 长度。更大值会增加 persistent queue/Graph 内存，并要求新建 model。 |
 | `RPU_QWEN35_WALL_FUSED_SILU_MUL` | `0`；精确 `1` 启用 | Wall Qwen3.5 action Graph 构建 / **BUILD**；新进程 | 仅诊断 arm：用已准入的 standalone `silu` + `mul` 对替换为 `llama_silu_mul` launch。它不是 GEMM epilogue asset，必须重新通过 same-noise FP16 parity 与 Graph/lifecycle 校验。 |
 | `RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE` | `0`；精确 `1` 启用 | Wall Qwen3.5 action Graph 构建 / **BUILD**；新进程 | 仅诊断 arm：在 row-partitioned partial 上提前乘 residual gate，再进入现有 ring reduction，并跳过不再读取的 zero bridge。它改变 FP16 reduction order，尚未通过 release 认证。 |
 | `RPU_QWEN35_WALL_GEMM_TILES` | 未设置；以逗号/分号分隔的 `MxNxK=n_tile` 项，其中 `n_tile` 必须是 `128,112,96,80,64,48,32` 之一 | Wall Qwen3.5 action Graph 构建 / **BUILD**；新进程 | 仅用于 board-free/board A/B。为精确 local shape 覆盖 generated FP16 ACC32 tile；未知 shape 保留 auto-tiling。该项为冷启动、仅诊断，不会添加 GEMM epilogue asset。 |
