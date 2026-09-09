@@ -32,6 +32,7 @@
 #include <cstdio>    // std::sscanf (diagnostic tile-search spec)
 #include <cstdlib>   // std::getenv (diagnostic Wall decode fusion toggle)
 #include <cstring>   // std::strcmp
+#include <limits>
 
 using namespace at;
 using namespace ::rhino_lkn;
@@ -577,6 +578,12 @@ at::Tensor Qwen3_5Model::forward_action_step(
     action_output_live_base_ =
         ::rhino_lkn::RpuGetDevAddr(action_out.data_ptr<c10::Half>());
     rpu_ddr_flush_force(action_out.data_ptr<c10::Half>());
+    if (action_prefix_mask_.defined()) {
+        TORCH_CHECK(wall_action_mode_ && num_steps == 10
+                    && action_prefix_mask_.size(0) == action_len_
+                    && action_prefix_mask_.size(1) == max_prefix + action_len_,
+                    "Wall Action bucket mask must match the 10-step physical prefix");
+    }
     action_step_active_ = true;
     fast_replay_active_ = fast_replay_enabled_;
     set_chunk_size_override(action_len_);
@@ -1117,11 +1124,18 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
         ? action_prefix_lens_[layer_idx] + ctx().seq_len
         : chunk.kv_seq_len;
     bool sdpa_causal = ctx().is_causal && (seq_len > 1);
+    const int mask_type = action_mode_ ? action_sdpa_mask_type() : (sdpa_causal ? 1 : 0);
+    uint32_t mask_off = 0;
+    if (mask_type == 4) {
+        mask_off = addr_offset("action_prefix_mask").value;
+        sdpa_dma_mask_to_spm({action_prefix_mask_, 4}, mask_off,
+                            seq_len, kv_seq_len, tp);
+    }
     // SDPA on tp cores; virtual_num_cores=NUM_CORES governs the KV-cache 7D swizzle.
     rpu_launch_sdpa_spm_dispatch(
-        sdpa_kernel_, k_cache, v_cache, sdpa_causal ? 1 : 0, c10::nullopt,
+        sdpa_kernel_, k_cache, v_cache, mask_type, c10::nullopt,
         addr_offset("q").value, addr_offset("output").value,
-        addr_offset("sdpa_tmp").value, 0,
+        addr_offset("sdpa_tmp").value, mask_off,
         seq_len, nq, nkv, hd, kv_seq_len, tp, NUM_CORES);
 
     // Gated-attention output gate (Qwen3.5 attn_output_gate=true):
@@ -1684,7 +1698,8 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     int64_t mlp = A(cs * (is_ / NUM_CORES) * DWIDTH);
     int64_t nw  = A(h * DWIDTH);
     int64_t hnw = A(hd * DWIDTH);
-    int64_t tmp = A(sdpa_compute_tmp_v16_size(make_sdpa_config(), cs) * 32);
+    int64_t tmp = A(sdpa_compute_tmp_v16_size(
+        make_sdpa_config(action_mode_ ? action_sdpa_mask_type() : 1), cs) * 32);
 
     std::vector<BufferDecl> decls;
     decls.push_back({"residual1",  res,  1, 8, StorageClass::Temp, 0, nullptr});
@@ -1704,6 +1719,12 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     decls.push_back({"attn_gate",  q,    2, 5, StorageClass::Temp, 0, nullptr});
     decls.push_back({"oproj",      res,  5, 5, StorageClass::Temp, 0, nullptr});
     decls.push_back({"sdpa_tmp",   tmp,  5, 5, StorageClass::Temp, 0, nullptr});
+    if (action_prefix_mask_.defined()) {
+        // Fixed maximum, NOT current bucket size: all retained bucket graphs
+        // share one allocation layout. Reload immediately before each SDPA.
+        decls.push_back({"action_prefix_mask", A(32 * (384 + 32) * DWIDTH),
+                         4, 5, StorageClass::Temp, 0, nullptr});
+    }
     decls.push_back({"gate",       mlp,  7, 8, StorageClass::Temp, 0, nullptr});
     decls.push_back({"up",         mlp,  7, 7, StorageClass::Temp, 0, nullptr});
     decls.push_back({"down",       res,  7, 8, StorageClass::Temp, 0, nullptr});
@@ -1916,9 +1937,10 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
 
 int64_t Qwen3_5Model::subclass_layout_hash() const {
     // Action I/O changes declarations independently of the shared model shape.
-    return action_input_w_.defined()
+    const int64_t io_hash = action_input_w_.defined()
         ? (action_dim_pad_ << 16) ^ (action_len_ << 2) ^ int64_t(wall_action_mode_) ^ 2
         : int64_t(wall_action_mode_);
+    return io_hash ^ (action_prefix_mask_.defined() ? (int64_t(1) << 40) : 0);
 }
 
 ModelStaticConfig Qwen3_5Model::static_config() {
@@ -1951,9 +1973,9 @@ bool Qwen3_5Model::subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
         // both sparse layer families: shared VLM prefix and action-only.
         return cs >= seq_len
             && sdpa_is_valid_chunk_size(
-                make_sdpa_config(/*mask=*/0), cs, seq_len, position)
+                make_sdpa_config(action_sdpa_mask_type()), cs, seq_len, position)
             && sdpa_is_valid_chunk_size(
-                make_sdpa_config(/*mask=*/0), cs, seq_len, /*position=*/0);
+                make_sdpa_config(action_sdpa_mask_type()), cs, seq_len, /*position=*/0);
     }
     if (!sdpa_is_valid_chunk_size(make_sdpa_config(), cs, seq_len, position))
         return false;
@@ -1986,6 +2008,27 @@ int64_t Qwen3_5Model::subclass_chunk_size_cap(int64_t seq_len,
     if (chunk_size_cap_ <= 0) return envelope_chunk;
     if (envelope_chunk <= 0) return chunk_size_cap_;
     return std::min(chunk_size_cap_, envelope_chunk);
+}
+
+void Qwen3_5Model::set_wall_action_prefix_bucket(int64_t prefix_len, int64_t bucket_len) {
+    TORCH_CHECK(wall_action_mode_ && action_input_w_.defined() && action_len_ == 32,
+                "Wall Action bucketing requires the installed FP16 I/O profile");
+    TORCH_CHECK(prefix_len >= 1 && prefix_len <= 384
+                && bucket_len == ((prefix_len + 63) / 64) * 64,
+                "Wall Action requires prefix in [1,384] and its 64-row bucket");
+    // [real prefix | masked gap | action]. RoPE stays logical, independently
+    // refreshed by set_prefill_rope; this changes only physical KV placement.
+    auto host_mask = at::zeros({action_len_, bucket_len + action_len_},
+                              at::TensorOptions().dtype(at::kHalf).device(at::kCPU));
+    host_mask.narrow(1, prefix_len, bucket_len - prefix_len)
+        .fill_(-std::numeric_limits<float>::infinity());
+    const bool first = !action_prefix_mask_.defined();
+    action_prefix_mask_ = sdpa_prepare_mask(
+        host_mask, false, action_len_, bucket_len + action_len_,
+        sdpa_stable_mask_cache()).ddr_tensor;
+    // Subsequent setters refresh a stable slot without invalidating allocation
+    // or any cached Graph, including when returning to an older bucket.
+    if (first) invalidate_model_state();
 }
 
 // Per-forward prefill M-RoPE tables. Generic Qwen3.5 uses a fresh oneshot graph;
@@ -2149,6 +2192,7 @@ void Qwen3_5Model::set_weights(
     action_hidden_stage_ = action_velocity_stage_ = at::Tensor();
     action_euler_scale_pinned_ = false;
     action_prefix_lens_.clear();
+    action_prefix_mask_ = at::Tensor();
     layer_weights_.assign(N, LayerWeights{});
     for (int64_t i = 0; i < N; ++i) {
         auto& lw = layer_weights_[i];
@@ -2285,6 +2329,12 @@ void rpu_qwen3_5_set_linear_acc32(int64_t handle, bool enabled) {
 void rpu_qwen3_5_set_fast_replay(int64_t handle, bool enabled) {
     Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_fast_replay")
         ->set_fast_replay(enabled);
+}
+
+void rpu_qwen3_5_set_wall_action_prefix_bucket(
+    int64_t handle, int64_t prefix_len, int64_t bucket_len) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_wall_action_prefix_bucket")
+        ->set_wall_action_prefix_bucket(prefix_len, bucket_len);
 }
 
 void rpu_qwen3_5_enable_action_mode(int64_t handle) {

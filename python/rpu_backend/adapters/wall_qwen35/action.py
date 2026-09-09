@@ -778,12 +778,11 @@ def patch_wall_qwen35_action_for_rpu(
             handle, *state.action_io_keepalive,
             ACTION_DIM, _ACTION_PACKED_DIM, ACTION_HORIZON,
         )
-        # Action fast replay bakes the real prefix into KV-insert and SDPA
-        # registers. Keep one exact-prefix signature and rebuild on a prefix
-        # change; hiding the real length behind the text execution bucket would
-        # replay stale insertion positions and attention lengths.
+        # Optimized Action fixes KV insertion/SDPA lengths per 64-row bucket.
+        # Real prefix visibility and RoPE are refreshed before every capture.
+        # Keep all six buckets: returning to an earlier bucket must REPLAY.
         state.action_graph_cache = rpu_backend.graph.GraphCache(
-            max_entries=1, require_single_segment=True
+            max_entries=6 if one_graph else 1, require_single_segment=True
         )
         state.action_cache = Qwen3_5Cache.from_config(
             expert.config,
@@ -800,6 +799,7 @@ def patch_wall_qwen35_action_for_rpu(
         state.action_v_caches = state.action_cache.v_caches
         state.action_prefix_lens = [0] * ACTION_NUM_LAYERS
         state.action_prefix_len = None
+        state.action_prefix_bucket = None
         state.action_rope_cache = None
         state.action_modulation_cache = {}
         state.action_loop_modulation = None
@@ -1007,10 +1007,11 @@ def require_wall_fp16_loop_runtime() -> None:
     import rpu_backend
 
     if (getattr(getattr(rpu_backend, "_cpp_ext", None), "graph_single_segment_abi", 0) != 1
-            or not hasattr(torch.ops.rpu, "qwen3_5_wall_action_loop")):
+            or not hasattr(torch.ops.rpu, "qwen3_5_wall_action_loop")
+            or not hasattr(torch.ops.rpu, "qwen3_5_set_wall_action_prefix_bucket")):
         raise RuntimeError(
             "FP16 Wall Action loop requires a rebuilt Python/native RhinoForge package "
-            "with qwen3_5_wall_action_loop and single-segment Graph support"
+            "with Wall Action prefix bucketing and single-segment Graph support"
         )
     for name, default, minimum, maximum in (
         ("LKN_MAX_BATCH_ENTRIES", 65536, 65536, 4194304),
@@ -1096,22 +1097,30 @@ def run_wall_qwen35_action_loop(
             or not 1 <= prefix_len <= ACTION_MAX_PREFIX_LEN):
         raise ValueError("Wall action prefix_len must be an integer in [1,384]")
     positions = _canonical_action_positions(position_ids, prefix_len)
+    bucket_len = _action_prefix_bucket(prefix_len) if state.action_one_graph else int(prefix_len)
     packed, keep, padding = _pack_wall_fp16_loop_inputs(action, dof_mask, padding_velocity)
     import rpu_backend
 
     signature = rpu_backend.graph.GraphSignature(
         op_id="rpu_wall_qwen35_action_fp16_loop",
-        shapes=[1, 32, 64, int(prefix_len)],
+        shapes=[1, 32, 64, bucket_len],
         dyn_dims=[steps_per_graph, 24, *_FULL_LAYERS], dtypes=[torch.float16],
     )
     cache = state.action_graph_cache
     cold = cache.lookup(signature) is None
     if cold:
         if cache.is_frozen():
-            raise RuntimeError(f"Wall action GraphCache READY miss for exact real prefix {prefix_len}")
-        if cache.size():
+            raise RuntimeError(f"Wall action GraphCache READY miss for prefix extent {bucket_len}")
+        if not state.action_one_graph and cache.size():
             cache.clear()
-    prefix_lens = _copy_physical_prefix(state, prefix_cache, int(prefix_len))
+    prefix_lens = _copy_physical_prefix(state, prefix_cache, int(prefix_len), bucket_len)
+    if state.action_one_graph:
+        # This setter uploads to a model-owned, per-bucket stable DDR slot.
+        # It runs even on fast REPLAY (which skips the native layer builder).
+        torch.ops.rpu.qwen3_5_set_wall_action_prefix_bucket(
+            state.handle, int(prefix_len), bucket_len,
+        )
+    state.action_prefix_bucket = bucket_len
     _ensure_action_rope(state, positions)
     modulation = _wall_loop_modulation(expert)
     packed, keep, padding = (t.to("rpu") for t in (packed, keep, padding))
@@ -1229,7 +1238,34 @@ def _ensure_action_rope(state, position_ids: torch.Tensor) -> None:
     state.action_rope_cache = (key, cos, sin)
 
 
-def _copy_physical_prefix(state, prefix_cache, prefix_len: int) -> list[int]:
+def _action_prefix_bucket(prefix_len: int) -> int:
+    if (isinstance(prefix_len, bool) or not isinstance(prefix_len, Integral)
+            or not 1 <= prefix_len <= ACTION_MAX_PREFIX_LEN):
+        raise ValueError("Wall action prefix_len must be an integer in [1,384]")
+    return ((int(prefix_len) + 63) // 64) * 64
+
+
+def _zero_action_prefix_padding(k, v, prefix_len: int, bucket_len: int) -> None:
+    """Clear only the gap, including a partial swizzled block (K/V differ)."""
+    if prefix_len == bucket_len:
+        return
+    block, tail = divmod(prefix_len, 16)
+    if tail:
+        k[:, block:block + 1, :, :, :, tail:, :].zero_()
+        v[:, block:block + 1, :, :, :, :, tail:].zero_()
+        block += 1
+    if block < bucket_len // 16:
+        k[:, block:bucket_len // 16].zero_()
+        v[:, block:bucket_len // 16].zero_()
+
+
+def _copy_physical_prefix(
+    state, prefix_cache, prefix_len: int, bucket_len: int | None = None,
+) -> list[int]:
+    if bucket_len is None:
+        bucket_len = prefix_len
+    if bucket_len not in (prefix_len, _action_prefix_bucket(prefix_len)):
+        raise ValueError("Wall action physical prefix must be exact or its 64-row bucket")
     if prefix_cache is None:
         raise TypeError("Wall action requires a base physical prefix cache")
     position = getattr(prefix_cache, "position", None)
@@ -1274,7 +1310,7 @@ def _copy_physical_prefix(state, prefix_cache, prefix_len: int) -> list[int]:
                 or source.shape[0] != 1
                 or destination.shape[0] != 1
                 or source.shape[1] < blocks
-                or destination.shape[1] < blocks
+                or destination.shape[1] * 16 < bucket_len + ACTION_HORIZON
                 or source.data_ptr() == destination.data_ptr()
             ):
                 raise ValueError(
@@ -1284,7 +1320,8 @@ def _copy_physical_prefix(state, prefix_cache, prefix_len: int) -> list[int]:
         # in place and intentionally has no generation marker.
         dst_k[:, :blocks].copy_(src_k[:, :blocks])
         dst_v[:, :blocks].copy_(src_v[:, :blocks])
-        prefix_lens[index] = prefix_len
+        _zero_action_prefix_padding(dst_k, dst_v, prefix_len, bucket_len)
+        prefix_lens[index] = bucket_len
     state.action_prefix_lens = prefix_lens
     state.action_prefix_len = prefix_len
     return prefix_lens

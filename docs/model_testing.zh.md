@@ -104,13 +104,10 @@ Source-only 状态。可选 state mask 和自由度 mask 必须都精确等于
 ```bash
 bash run_wall_qwen35_openloop.sh --check --no-sudo
 bash run_wall_qwen35_openloop.sh --max-requests 1
-bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
-bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile \
-  --torch-profile-output /tmp/qwen35-openloop-ready-profile
 bash run_wall_qwen35_openloop.sh --max-events 1 \
   --torch-profile-dir /tmp/qwen35-openloop-profile
 bash run_wall_qwen35_openloop.sh --max-events 1 \
-  --hw-perf-output /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
+  --hw-perf-dir /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
 bash run_wall_qwen35_openloop.sh
 ```
 
@@ -126,20 +123,29 @@ bash run_wall_qwen35_openloop.sh --max-requests 1
 
 启动时会检查 packed Vision adapter 和 native ABI，输出实际 adapter 路径；旧安装包
 会在加载 checkpoint 前被拒绝。请求结束时输出的 `Vision Graph: entries=1` 表示
-三图共用一个缓存条目；增加 `--torch-profile` 会在 warmup 后重复同一请求，检查
-Vision 的 replay 增量精确为 1。它不代表 Text/Action 也合并进同一 Graph，亦不代表
-READY 数值或任务质量门禁通过。`segments.json` 记录 Graph 诊断，`meta.json` 记录
+三图共用一个缓存条目；增加 `--torch-profile-dir DIR` 会记录每个请求，首请求包含
+初始化/BUILD，不额外插入 warmup/repeat，也不代表 READY 数值或任务质量门禁通过。
+`segments.json` 记录 Graph 诊断，`meta.json` 记录
 `vision_execution` 与实际安装包、native 扩展和运行时资产 provenance。
 
 统一冷开关为 `WALL_QWEN35_OPT`，默认 `1`，无需逐阶段选项：
 
 ```bash
 # Vision 1 + Language/Prefill 1 + Action 1
-bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+bash run_wall_qwen35_openloop.sh --max-requests 1 \
+  --torch-profile-dir /tmp/qwen35-opt-profile
 
 # 本录制数据集的 Vision 3 + Language/Prefill 3 + Action 10
-WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 \
+  --torch-profile-dir /tmp/qwen35-split-profile
 ```
+
+优化 Action 将真实 prefix 映射到固定 64 行桶（`64..384`），最多保留六个单段图，
+在 capture 外刷新 padding 可见性和真实 RoPE。runner 检查累计 replay 数，并逐请求
+记录 `action_prefix_bucket`。测性能时不要提供两种 profiling 目录参数，并复用相同
+`--flow-noise` 文件；需覆盖同桶变长和 A/B/A 返回旧桶。缓存桶数不等于每请求提交数。
+具体局部生命周期、数值差异和无 profiling 性能记录见
+[Action 分桶验证记录](wall_qwen35_action_bucket_validation.md)，不改变 Source-only 状态。
 
 两种配置都使用 FP16 Action 投影/Euler、ACC32 GEMM 和一次性 CPU FP32 时间/Ada
 预计算。关闭优化只改变 Graph 组织方式，不恢复历史 FP32 host 路径。
@@ -150,8 +156,9 @@ WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-prof
 SDK 为 65536 / 8 / 64。非 Wall 通用默认值不变；切换需新进程。
 
 须检查实际 segment 数，而非缓存条目数。开启时 Vision、Prefill、Action 各要求
-一段；关闭时 Action 复用单步图十次，Vision 保留各相机形状。READY 核验三次或
-十六次物理提交、稳定 replay 和同输入重复数值一致性，冷启动 priming/BUILD 不计入。
+一段；关闭时 Action 复用单步图十次，Vision 保留各相机形状。历史 READY 探测核验
+三次或十六次物理提交、稳定 replay 和同输入重复数值一致性，不计冷启动 priming/BUILD。
+当前逐请求 profiler 包含冷启动工作，不执行该 READY 探测。
 其他输入长度可能产生不同的保守 Prefill 分段数，`3+3+10` 对应此 runner 的录制
 数据集。metadata 记录开关、图计划与实际预算；旧包在加载前拒绝。
 比较时使用相同 `--flow-noise`，这些受控配置不代表发布质量认证。
@@ -168,44 +175,39 @@ Wall runtime 在 Vision/Text 前及 Text 后、Graph 捕获范围之外释放临
 `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1`。确定性 CPU noise seed schedule 会明确记录
 为不与参考 CUDA RNG stream 逐位一致。
 
-默认 `--torch-profile` 路径是 READY 探测：先在 profiler 外运行第一个准入请求，
-然后只记录同一请求的一次重复执行；`--torch-profile-output DIR` 指定输出目录。
-脚本生成带时间戳和 PID 的 `.trace.json` 以及配套 `.summary.json`，不会覆盖旧文件。
-summary 包含精简的 Torch key averages、warmup/重复执行 action 的精确一致性，以及
-各组件 Graph 生命周期证据。只有 packed Vision、base Prefill bucket/末块拓扑
-签名和精确 prefix Action 都已冻结为只查找 READY，并分别证明精确的 `1/1/10` replay
-增量时，才会标记 `accepted`；生成 trace 本身不等于 READY。base-text prefix 会映射到
-`64..384` 的固定 64 行 bucket，签名还区分末个 native chunk 的 1 行、2--31 行和 32+
-行拓扑，避免跨 node/grid 分支 replay。Action fast replay 会固化真实 prefix 的 KV 插入
-位置和 SDPA 长度，因此 prefix 改变时会重建。这个有界同请求探测结束后，cache 会回到
-WARMING，允许后续数据集 prefix 合法 BUILD；该探测不构成全数据集 frozen-READY 声明。
-若硬件上的 FP16 重复执行有数值漂移，仍会导出 trace，并在 summary 中保留
-`actions_exact=false` / `actions_norm_exact=false` 及各自的最大绝对差；只有物理/归一化
-输出的 shape、prefix、归一化输出缺失或非有限值不匹配才会中止。
-trace 中会直接出现
+Torch profiling 统一使用 `--torch-profile-dir DIR`：请求 CPU 与 `PrivateUse1`
+activity，每个推理请求分别导出为
+`qwen35_generate_flow_action_batch_*.trace.json.gz`。文件名包含时间戳、PID、
+请求序号和纳秒时间戳。固定开启 `record_shapes`、`with_stack`，关闭
+`profile_memory`。每个请求新建 profiler，使用 `acc_events=True`，不累积前面
+请求的事件。保留 `generate_flow_action_batch` range，以及
 `wall_qwen35_preprocess`、`wall_qwen35_vision_text_prefill`、
 `wall_qwen35_action_denoise_loop` 和 `wall_qwen35_action_decoder` 阶段。
 
-与旧参考实现兼容的 `--torch-profile-dir DIR` 模式仍会请求 CPU 与 `PrivateUse1`
-activity，并把安装完成后的每个 action request 分别导出为
-`qwen35_generate_flow_action_batch_*.trace.json.gz`；它保留
-`generate_flow_action_batch` range，并默认记录 shape 和 stack。可选的
-`--torch-profile-record-shapes`、
-`--torch-profile-memory` 和 `--torch-profile-with-stack` 与通用 runner 的诊断开关
-一致。两种模式互斥；profile 目标会在 checkpoint 加载或 RPU 初始化前完成校验；
-profiling 不能与 `--check` 组合，不会覆盖已有 trace 或 summary，且其延迟只可用于
-诊断。trace 可能包含应用 shape、源码路径和算子元数据，必须保存在仓库外。显式的
-`policy.to("rpu")` 安装和 READY 探测 warmup 都不在默认 trace 内。旧逐请求模式的
-首请求中，按设计延迟执行的 Vision handle
-准备仍会记录在第一个 profiled request 中。当前组件缺口和按 release 匹配的厂商接口
-需求见 [Wall Qwen3.5 READY-profile assessment](wall_qwen35_ready_profile_assessment.md)。
+不再自动插入 profiler 外的 warmup 或同请求 READY 重复探测。
+显式 `policy.to("rpu")` 安装不在 Torch trace 内，但首请求的延迟初始化和
+Graph BUILD 会记录；后续请求签名变化时也可能 BUILD。trace 仅为诊断证据，
+不构成 frozen-READY 或数值一致性声明；`meta.json` 保留逐请求 artifact 清单，
+不报告 READY admission。历史同请求重复测量见
+[Wall Qwen3.5 READY-profile assessment](wall_qwen35_ready_profile_assessment.md)。
+本 Wall runner 已移除旧 `--torch-profile`、`--torch-profile-output`、
+`--torch-profile-record-shapes`、`--torch-profile-memory`、
+`--torch-profile-with-stack` 参数。
 
-`--hw-perf-output DIR` 会在 policy 安装前启用 r4 设备 trace；`--hw-perf` 使用
-`OUTPUT_DIR/rpu_hwperf`。wrapper 会将 `LKN_RPU_FREQ_MHZ` 透传给 sudo（默认
-800 MHz），并用 `--hw-perf-max-dumps` 限制 segment JSON 文件数。文件名包含时间戳、
-PID、BUILD/REPLAY/oneshot 阶段和 segment 序号。在 Perfetto 中主要查看
-`*_replay_segN.json`，并合并推理区域对应的全部 segment。r4 Release runtime 会按设计
-脱敏这些 trace，采集本身也会扰动延迟；最终 latency 必须关闭硬件 trace 后另跑。
+硬件采集统一使用 `--hw-perf-dir DIR`，在 policy 安装前启用 r4 设备 trace。
+旧 `--hw-perf`、`--hw-perf-output` 参数已移除。wrapper 将
+`LKN_RPU_FREQ_MHZ` 透传给 sudo（默认 800 MHz），保留
+`--hw-perf-max-dumps` 限制 segment JSON 文件数（默认 32）。
+文件名包含时间戳、PID、BUILD/REPLAY/oneshot 阶段和 segment 序号。
+在 Perfetto 中主要查看 `*_replay_segN.json`，并检查推理区域对应的全部 segment。
+r4 Release runtime 会按设计脱敏这些 trace。
+
+两个目录参数可同时使用，也可单独使用；未提供对应目录时，不启用该采集。
+wrapper 支持等价环境变量 `TORCH_PROFILE_DIR`、`HW_PERF_DIR`，不再读取其他
+旧的 profiling 启用、输出、shape、memory 或 stack 环境开关。
+目录在 checkpoint 加载或 RPU 初始化前校验，可复用已有目录但不会覆盖 trace。
+两种采集都不能与 `--check` 组合。trace 可能包含应用 shape、源码路径和算子元数据，
+必须保存在仓库外；采集会扰动延迟，最终 latency 应关闭 profiling 后另跑。
 
 Pi0.5 的 `batch_file` 不随仓库分发。请使用与权重匹配的 LeRobot policy 预处理流水线生成它，再用 `torch.save` 保存张量字典。该字典至少包含权重 `image_features` 配置中每个 key 对应的一份 batched image tensor，以及 `observation.language.tokens` 和 `observation.language.attention_mask`；预处理流水线也可保留该配置拥有的其他字段。相机名称、分辨率和 token 长度属于具体配置，应从权重/配置读取，不要照搬其他配置的 shape。
 

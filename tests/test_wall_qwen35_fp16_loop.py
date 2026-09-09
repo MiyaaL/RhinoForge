@@ -119,6 +119,7 @@ def test_sdk_budget_guard_rejects_before_install(monkeypatch):
     import rpu_backend
     monkeypatch.setattr(rpu_backend, "_cpp_ext", SimpleNamespace(graph_single_segment_abi=1), raising=False)
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_wall_action_loop", object(), raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3_5_set_wall_action_prefix_bucket", object(), raising=False)
     monkeypatch.setenv("LKN_MAX_BATCH_ENTRIES", "65536")
     monkeypatch.setenv("LKN_KD_BUF_MB", "4")
     monkeypatch.setenv("LKN_INSTR_BUF_MB", "64")

@@ -16,14 +16,8 @@ NOISE_SEED="${NOISE_SEED:-${SEED:-3407}}"
 FLOW_NOISE="${FLOW_NOISE:-}"
 WALL_QWEN35_OPT="${WALL_QWEN35_OPT-1}"
 RUN_WITH_SUDO="${RUN_WITH_SUDO:-1}"
-TORCH_PROFILE="${TORCH_PROFILE:-0}"
-TORCH_PROFILE_OUTPUT="${TORCH_PROFILE_OUTPUT:-}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
-TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
-TORCH_PROFILE_MEMORY="${TORCH_PROFILE_MEMORY:-0}"
-TORCH_PROFILE_WITH_STACK="${TORCH_PROFILE_WITH_STACK:-0}"
-HW_PERF="${HW_PERF:-0}"
-HW_PERF_OUTPUT="${HW_PERF_OUTPUT:-}"
+HW_PERF_DIR="${HW_PERF_DIR:-}"
 HW_PERF_MAX_DUMPS="${HW_PERF_MAX_DUMPS:-32}"
 LKN_RPU_FREQ_MHZ="${LKN_RPU_FREQ_MHZ:-800}"
 WALL_FUSED_SILU_MUL="${RPU_QWEN35_WALL_FUSED_SILU_MUL:-0}"
@@ -70,22 +64,12 @@ Options:
                                schedule (base + request index; default: 3407).
       --flow-noise PATH        Common FP32 .npy noise [requests,32,26]; bypasses
                                --noise-seed and is copied into the run output.
-      --torch-profile          Warm the first request without recording, then
-                               profile exactly one identical repeat with CPU +
-                               PrivateUse1 activities and Graph admission.
-      --torch-profile-output D READY-probe output directory; implies
-                               --torch-profile (default: OUTPUT_DIR). Trace and
-                               summary filenames include a timestamp and PID.
-      --torch-profile-dir DIR  Reference-compatible mode: profile every action
-                               request into a separate *.trace.json.gz file.
-      --torch-profile-record-shapes
-                               Include tensor shapes in the trace.
-      --torch-profile-memory   Include Torch memory events in the trace.
-      --torch-profile-with-stack
-                               Include source stacks in the trace.
-      --hw-perf                Collect r4 hardware kernel/DMA Chrome traces.
-      --hw-perf-output DIR     Hardware trace directory; implies --hw-perf
-                               (default: OUTPUT_DIR/rpu_hwperf). Filenames carry
+      --torch-profile-dir DIR  Enable CPU + PrivateUse1 profiling: one separate
+                               *.trace.json.gz per inference request, including
+                               first-request setup/BUILD (no extra warmup).
+                               Shapes and stacks on; memory events off.
+      --hw-perf-dir DIR        Enable r4 hardware kernel/DMA Chrome traces.
+                               Filenames carry
                                timestamp, PID, phase, and segment index.
       --hw-perf-max-dumps N    Maximum segment trace files (default: 32).
       --check                  Validate checkpoint, data, videos, mappings, and
@@ -99,9 +83,8 @@ Environment overrides:
   ENV_SH, DATASET_DIR, CHECKPOINT_PATH, OUTPUT_DIR, INSTRUCTION_SOURCE, ROBOT_ID,
   NORM_KEY, NUM_INFERENCE_STEPS, MAX_REQUESTS/MAX_EVENTS, NOISE_SEED/SEED,
   FLOW_NOISE, WALL_QWEN35_OPT (default 1; set 0 for 3+3+10),
-  RUN_WITH_SUDO, TORCH_PROFILE, TORCH_PROFILE_OUTPUT, TORCH_PROFILE_DIR,
-  TORCH_PROFILE_RECORD_SHAPES, TORCH_PROFILE_MEMORY, TORCH_PROFILE_WITH_STACK,
-  HW_PERF, HW_PERF_OUTPUT, HW_PERF_MAX_DUMPS, LKN_RPU_FREQ_MHZ,
+  RUN_WITH_SUDO, TORCH_PROFILE_DIR, HW_PERF_DIR, HW_PERF_MAX_DUMPS,
+  LKN_RPU_FREQ_MHZ,
   RPU_QWEN35_WALL_FUSED_SILU_MUL, RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE,
   RPU_KERNEL_LIB_PATH, RHINO_LAUNCH_LIB_DIR, RUN_ID.
 
@@ -109,9 +92,10 @@ Examples:
   WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1
   bash run_wall_qwen35_openloop.sh --check
   bash run_wall_qwen35_openloop.sh --max-requests 1
-  bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
   bash run_wall_qwen35_openloop.sh --max-requests 1 \
-    --hw-perf-output /home/hx/miyaa/work/prof/wall_qwen35_hwperf
+    --torch-profile-dir /tmp/wall_qwen35_torch_profile
+  bash run_wall_qwen35_openloop.sh --max-requests 1 \
+    --hw-perf-dir /home/hx/miyaa/work/prof/wall_qwen35_hwperf
   bash run_wall_qwen35_openloop.sh --max-events 1 \
     --torch-profile-dir /tmp/wall_qwen35-openloop-profile
   bash run_wall_qwen35_openloop.sh \
@@ -239,25 +223,9 @@ while (($#)); do
             [[ -n "$FLOW_NOISE" ]] || fatal "--flow-noise requires a value"
             shift
             ;;
-        --torch-profile)
-            TORCH_PROFILE=1
-            shift
-            ;;
-        --torch-profile-output)
-            require_value "$1" "${2:-}"
-            TORCH_PROFILE_OUTPUT="$2"
-            TORCH_PROFILE=1
-            shift 2
-            ;;
-        --torch-profile-output=*)
-            TORCH_PROFILE_OUTPUT="${1#*=}"
-            [[ -n "$TORCH_PROFILE_OUTPUT" ]] \
-                || fatal "--torch-profile-output requires a value"
-            TORCH_PROFILE=1
-            shift
-            ;;
         --torch-profile-dir)
             require_value "$1" "${2:-}"
+            [[ "$2" != --* ]] || fatal "$1 requires a directory value"
             TORCH_PROFILE_DIR="$2"
             shift 2
             ;;
@@ -267,33 +235,16 @@ while (($#)); do
                 || fatal "--torch-profile-dir requires a value"
             shift
             ;;
-        --torch-profile-record-shapes)
-            TORCH_PROFILE_RECORD_SHAPES=1
-            shift
-            ;;
-        --torch-profile-memory)
-            TORCH_PROFILE_MEMORY=1
-            shift
-            ;;
-        --torch-profile-with-stack)
-            TORCH_PROFILE_WITH_STACK=1
-            shift
-            ;;
-        --hw-perf)
-            HW_PERF=1
-            shift
-            ;;
-        --hw-perf-output)
+        --hw-perf-dir)
             require_value "$1" "${2:-}"
-            HW_PERF_OUTPUT="$2"
-            HW_PERF=1
+            [[ "$2" != --* ]] || fatal "$1 requires a directory value"
+            HW_PERF_DIR="$2"
             shift 2
             ;;
-        --hw-perf-output=*)
-            HW_PERF_OUTPUT="${1#*=}"
-            [[ -n "$HW_PERF_OUTPUT" ]] \
-                || fatal "--hw-perf-output requires a value"
-            HW_PERF=1
+        --hw-perf-dir=*)
+            HW_PERF_DIR="${1#*=}"
+            [[ -n "$HW_PERF_DIR" ]] \
+                || fatal "--hw-perf-dir requires a value"
             shift
             ;;
         --hw-perf-max-dumps)
@@ -356,26 +307,11 @@ fi
 [[ "$NUM_INFERENCE_STEPS" == 10 ]] \
     || fatal "--inference-steps is fixed to 10 for this profile: $NUM_INFERENCE_STEPS"
 normalize_bool use_sudo RUN_WITH_SUDO "$RUN_WITH_SUDO"
-normalize_bool profile_enabled TORCH_PROFILE "$TORCH_PROFILE"
-normalize_bool profile_record_shapes \
-    TORCH_PROFILE_RECORD_SHAPES "$TORCH_PROFILE_RECORD_SHAPES"
-normalize_bool profile_memory TORCH_PROFILE_MEMORY "$TORCH_PROFILE_MEMORY"
-normalize_bool profile_with_stack \
-    TORCH_PROFILE_WITH_STACK "$TORCH_PROFILE_WITH_STACK"
-normalize_bool hw_perf_enabled HW_PERF "$HW_PERF"
-[[ -z "$HW_PERF_OUTPUT" ]] || hw_perf_enabled=1
-[[ -z "$TORCH_PROFILE_OUTPUT" ]] || profile_enabled=1
-if [[ -n "$TORCH_PROFILE_DIR" ]] && ((profile_enabled)); then
-    fatal "choose either --torch-profile/--torch-profile-output or --torch-profile-dir"
-fi
+profile_enabled=0
+hw_perf_enabled=0
+[[ -z "$HW_PERF_DIR" ]] || hw_perf_enabled=1
 if [[ -n "$TORCH_PROFILE_DIR" ]]; then
     profile_mode=per-request
-    profile_enabled=1
-    # Match the Harrix per-request profiler contract.
-    profile_record_shapes=1
-    profile_with_stack=1
-elif ((profile_enabled || profile_record_shapes || profile_memory || profile_with_stack)); then
-    profile_mode=ready-replay
     profile_enabled=1
 else
     profile_mode=disabled
@@ -418,15 +354,7 @@ fi
 if [[ "$OUTPUT_DIR" != /* ]]; then
     OUTPUT_DIR="$(pwd -P)/$OUTPUT_DIR"
 fi
-if [[ "$profile_mode" == ready-replay ]]; then
-    if [[ -z "$TORCH_PROFILE_OUTPUT" ]]; then
-        TORCH_PROFILE_OUTPUT="$OUTPUT_DIR"
-    elif [[ "$TORCH_PROFILE_OUTPUT" != /* ]]; then
-        TORCH_PROFILE_OUTPUT="$(pwd -P)/$TORCH_PROFILE_OUTPUT"
-    fi
-    [[ ! -e "$TORCH_PROFILE_OUTPUT" || -d "$TORCH_PROFILE_OUTPUT" ]] \
-        || fatal "torch profile output is not a directory: $TORCH_PROFILE_OUTPUT"
-elif [[ "$profile_mode" == per-request ]]; then
+if ((profile_enabled)); then
     if [[ "$TORCH_PROFILE_DIR" != /* ]]; then
         TORCH_PROFILE_DIR="$(pwd -P)/$TORCH_PROFILE_DIR"
     fi
@@ -434,13 +362,11 @@ elif [[ "$profile_mode" == per-request ]]; then
         || fatal "torch profile path is not a directory: $TORCH_PROFILE_DIR"
 fi
 if ((hw_perf_enabled)); then
-    if [[ -z "$HW_PERF_OUTPUT" ]]; then
-        HW_PERF_OUTPUT="$OUTPUT_DIR/rpu_hwperf"
-    elif [[ "$HW_PERF_OUTPUT" != /* ]]; then
-        HW_PERF_OUTPUT="$(pwd -P)/$HW_PERF_OUTPUT"
+    if [[ "$HW_PERF_DIR" != /* ]]; then
+        HW_PERF_DIR="$(pwd -P)/$HW_PERF_DIR"
     fi
-    [[ ! -e "$HW_PERF_OUTPUT" || -d "$HW_PERF_OUTPUT" ]] \
-        || fatal "hardware profile output is not a directory: $HW_PERF_OUTPUT"
+    [[ ! -e "$HW_PERF_DIR" || -d "$HW_PERF_DIR" ]] \
+        || fatal "hardware profile output is not a directory: $HW_PERF_DIR"
 fi
 
 TORCH_LIB_DIR="$($PYTHON_BIN -c 'from pathlib import Path; import torch; print(Path(torch.__file__).resolve().parent / "lib")')"
@@ -467,22 +393,12 @@ else
         --allow-numeric-blocked-vision
     )
 fi
-if [[ "$profile_mode" == ready-replay ]]; then
-    PYTHON_ARGS+=(
-        --torch-profile
-        --torch-profile-output "$TORCH_PROFILE_OUTPUT"
-    )
-elif [[ "$profile_mode" == per-request ]]; then
-    PYTHON_ARGS+=(--torch-profile-dir "$TORCH_PROFILE_DIR")
-fi
 if ((profile_enabled)); then
-    ((profile_record_shapes)) && PYTHON_ARGS+=(--torch-profile-record-shapes)
-    ((profile_memory)) && PYTHON_ARGS+=(--torch-profile-memory)
-    ((profile_with_stack)) && PYTHON_ARGS+=(--torch-profile-with-stack)
+    PYTHON_ARGS+=(--torch-profile-dir "$TORCH_PROFILE_DIR")
 fi
 if ((hw_perf_enabled)); then
     PYTHON_ARGS+=(
-        --hw-perf-output "$HW_PERF_OUTPUT"
+        --hw-perf-dir "$HW_PERF_DIR"
         --hw-perf-max-dumps "$HW_PERF_MAX_DUMPS"
     )
 fi
@@ -518,23 +434,15 @@ printf '  %-22s %s\n' 'flow noise:' "${FLOW_NOISE:-generated and exported}"
 printf '  %-22s %s\n' 'sudo:' "$([[ $use_sudo == 1 ]] && printf enabled || printf disabled)"
 printf '  %-22s %s\n' 'torch profile:' "$profile_mode"
 if ((profile_enabled)); then
-    if [[ "$profile_mode" == ready-replay ]]; then
-        printf '  %-22s %s\n' 'profile scope:' 'one repeat after unprofiled warmup'
-    else
-        printf '  %-22s %s\n' 'profile scope:' 'one trace per inference request'
-    fi
-    if [[ "$profile_mode" == ready-replay ]]; then
-        printf '  %-22s %s\n' 'profile directory:' "$TORCH_PROFILE_OUTPUT"
-    else
-        printf '  %-22s %s\n' 'profile directory:' "$TORCH_PROFILE_DIR"
-    fi
-    printf '  %-22s %s\n' 'profile shapes:' "$profile_record_shapes"
-    printf '  %-22s %s\n' 'profile memory:' "$profile_memory"
-    printf '  %-22s %s\n' 'profile stacks:' "$profile_with_stack"
+    printf '  %-22s %s\n' 'profile scope:' 'one trace per inference request (including first BUILD)'
+    printf '  %-22s %s\n' 'profile directory:' "$TORCH_PROFILE_DIR"
+    printf '  %-22s %s\n' 'profile shapes:' '1'
+    printf '  %-22s %s\n' 'profile memory:' '0'
+    printf '  %-22s %s\n' 'profile stacks:' '1'
 fi
 printf '  %-22s %s\n' 'RPU hardware trace:' "$([[ $hw_perf_enabled == 1 ]] && printf enabled || printf disabled)"
 if ((hw_perf_enabled)); then
-    printf '  %-22s %s\n' 'hwperf directory:' "$HW_PERF_OUTPUT"
+    printf '  %-22s %s\n' 'hwperf directory:' "$HW_PERF_DIR"
     printf '  %-22s %s\n' 'hwperf max dumps:' "$HW_PERF_MAX_DUMPS"
     printf '  %-22s %s MHz\n' 'RPU trace frequency:' "$LKN_RPU_FREQ_MHZ"
 fi

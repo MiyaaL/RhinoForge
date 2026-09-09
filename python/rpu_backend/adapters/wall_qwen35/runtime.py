@@ -540,6 +540,7 @@ class WallQwen35Runtime:
                 "wall_qwen35_opt": self.wall_qwen35_opt,
                 "action_execution": "fp16_one_graph" if self.wall_qwen35_opt else "fp16_steps",
                 "action_graph_calls": 1 if self.wall_qwen35_opt else 10,
+                "action_prefix_bucket": self.action_expert._rpu_qwen3_5.action_prefix_bucket,
                 "vision_graph_calls": 1 if self.wall_qwen35_opt else 3,
                 "prefix_bucket": plan_extra.pop("bucket_len", None),
                 "base_prefill": plan_extra,

@@ -170,9 +170,15 @@ prefill into fixed 64-row execution buckets from 64 through 384. A retained
 Prefill signature also distinguishes the native final-chunk topology classes
 (one row, 2--31 rows, or at least 32 rows); valid prefix length and M-RoPE
 values remain per-call mutable state within a class. Native pad-zeroing emits a
-stable fill-node envelope even for an exact bucket boundary. Action fast replay
-remains keyed by the exact real prefix length because its KV insertion and SDPA
-registers bake in that value. These optimizations are internal to the Wall
+stable fill-node envelope even for an exact bucket boundary. With optimization
+enabled, Action also uses 64-row prefix buckets (`64..384`): KV insertion is at
+the bucket boundary, an additive mask hides the gap after the real prefix,
+and logical RoPE positions remain unchanged. Six retained entries share a fixed
+SPM layout; model-owned per-bucket mask DDR slots and prefix KV are refreshed
+outside capture, so both same-bucket changes and A/B/A requests can replay.
+The fallback retains exact-prefix, per-step Action execution. Padding can change
+FP16 attention rounding; this is not a bitwise-equivalence claim.
+These optimizations are internal to the Wall
 profile and do not broaden the generic Qwen3.5 execution API.
 The single cold environment switch `WALL_QWEN35_OPT` is sampled by
 `from_checkpoint()`: unset/`1` enables Vision1 + Prefill1 + Action1;

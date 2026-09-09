@@ -88,6 +88,8 @@ public:
     // Tables are [N, rotary_dim/2] fp16 on RPU, indexed by absolute position
     // (kernel reads [pos_offset + token]). Text-only degenerates to arange.
     void set_prefill_rope(const at::Tensor& cos, const at::Tensor& sin);
+    // Called OUTSIDE capture; mask DDR slots remain alive across all six buckets.
+    void set_wall_action_prefix_bucket(int64_t prefix_len, int64_t bucket_len);
 
     // Route B: the REAL (pre-pad) prefill length. The adapter pads input_ids up to a multiple of
     // 64 so every chunk.len is 64-aligned (full-attn SDPA + GDN chunk core both need that), then
@@ -205,6 +207,8 @@ private:
                 /*num_cores=*/(int)attn_tp(), mask};
     }
 
+    int action_sdpa_mask_type() const { return action_prefix_mask_.defined() ? 4 : 0; }
+
     struct LayerWeights {
         at::Tensor q_w, k_w, v_w, o_w;
         at::Tensor q_norm_w, k_norm_w;
@@ -250,6 +254,7 @@ private:
     at::Tensor                 adaptive_mod_ref_;
     uint64_t                   adaptive_mod_live_base_ = 0;
     std::vector<int64_t>       action_prefix_lens_;
+    at::Tensor                 action_prefix_mask_;
     at::Tensor                 action_input_w_, action_input_b_;
     at::Tensor                 action_output_w_, action_output_b_;
     at::Tensor                 action_hidden_stage_, action_velocity_stage_;

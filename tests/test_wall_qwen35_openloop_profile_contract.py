@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import inspect
 import json
+import os
 import numpy as np
 from pathlib import Path
 import re
 import runpy
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +19,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "wall_qwen35_openloop.py"
 WRAPPER = ROOT / "run_wall_qwen35_openloop.sh"
+REMOVED_PROFILE_OPTIONS = (
+    "--torch-profile", "--torch-profile-output", "--torch-profile-record-shapes",
+    "--torch-profile-memory", "--torch-profile-with-stack", "--hw-perf",
+    "--hw-perf-output",
+)
 
 
 @pytest.fixture(scope="module")
@@ -25,12 +33,9 @@ def openloop_namespace():
 
 def _profile_args(**overrides):
     values = {
-        "torch_profile": False,
-        "torch_profile_output": None,
         "torch_profile_dir": None,
-        "torch_profile_record_shapes": False,
-        "torch_profile_memory": False,
-        "torch_profile_with_stack": False,
+        "hw_perf_dir": None,
+        "hw_perf_max_dumps": 32,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -50,6 +55,14 @@ def test_action_runtime_always_checks_fp16_abi(openloop_namespace, monkeypatch):
     guard = openloop_namespace["_require_action_execution_runtime"]
     guard()
     assert calls == [1]
+
+
+def test_action_runtime_rejects_pre_bucket_adapter(openloop_namespace, monkeypatch):
+    from rpu_backend.adapters.wall_qwen35 import action
+    monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", lambda: None)
+    monkeypatch.delattr(action, "_action_prefix_bucket")
+    with pytest.raises(RuntimeError, match="prefix-bucket.*rebuild and reinstall"):
+        openloop_namespace["_require_action_execution_runtime"]()
 
 
 def test_unified_switch_rejects_stale_package(openloop_namespace, monkeypatch):
@@ -169,7 +182,7 @@ def test_profile_is_disabled_by_default(openloop_namespace, tmp_path: Path) -> N
     }
 
 
-def test_profile_requests_cpu_and_privateuse1_and_uses_default_trace(
+def test_profile_requests_cpu_and_privateuse1_with_fixed_options(
     openloop_namespace,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -187,16 +200,13 @@ def test_profile_requests_cpu_and_privateuse1_and_uses_default_trace(
     output_dir = tmp_path / "run"
     output_dir.mkdir()
     profiler, metadata = create(
-        _profile_args(
-            torch_profile=True,
-            torch_profile_record_shapes=True,
-            torch_profile_memory=True,
-            torch_profile_with_stack=True,
-        ),
+        _profile_args(torch_profile_dir=output_dir),
         output_dir,
     )
 
-    assert profiler is marker
+    assert profiler is None
+    assert not captured  # Preparation does not create or enter a profiler.
+    assert openloop_namespace["_new_torch_profiler"](metadata, acc_events=True) is marker
     assert captured["activities"][0] is torch.profiler.ProfilerActivity.CPU
     private_use = getattr(torch.profiler.ProfilerActivity, "PrivateUse1", None)
     expected_names = ["CPU"]
@@ -204,28 +214,19 @@ def test_profile_requests_cpu_and_privateuse1_and_uses_default_trace(
         assert captured["activities"][1] is private_use
         expected_names.append("PrivateUse1")
     assert captured["record_shapes"] is True
-    assert captured["profile_memory"] is True
+    assert captured["profile_memory"] is False
     assert captured["with_stack"] is True
     assert captured["acc_events"] is True
     assert metadata["activities"] == expected_names
-    assert metadata["mode"] == "ready_replay"
-    trace_path = Path(metadata["output"])
-    summary_path = Path(metadata["summary_output"])
-    assert trace_path.parent == output_dir
-    assert re.fullmatch(
-        r"wall_qwen35_torch_profile_\d{8}_\d{6}_\d+\.trace\.json",
-        trace_path.name,
-    )
-    assert summary_path.parent == output_dir
-    assert summary_path.name == trace_path.name.replace(
-        ".trace.json", ".summary.json"
-    )
+    assert metadata["mode"] == "per_request"
+    assert metadata["output"] is None
+    assert metadata["summary_output"] is None
     assert metadata["directory"] == str(output_dir)
     assert metadata["scope"] == (
-        "one repeated first request after an unprofiled warmup"
+        "one trace per open-loop inference request"
     )
-    assert metadata["includes_graph_build"] is None
-    assert metadata["includes_lazy_first_request_setup"] is False
+    assert metadata["includes_graph_build"] is True
+    assert metadata["includes_lazy_first_request_setup"] is True
     assert metadata["profiler_acc_events"] is True
     assert metadata["accumulate_request_events"] is False
 
@@ -250,84 +251,74 @@ def test_reference_profile_directory_forces_per_request_shapes_and_stacks(
     assert metadata["summary_output"] is None
     assert metadata["record_shapes"] is True
     assert metadata["with_stack"] is True
+    assert metadata["profile_memory"] is False
     assert metadata["profiler_acc_events"] is True
     assert metadata["accumulate_request_events"] is False
 
 
-def test_profile_modes_are_mutually_exclusive(
+def test_torch_and_hardware_profiles_can_be_enabled_together(
     openloop_namespace,
     tmp_path: Path,
 ) -> None:
-    create = openloop_namespace["_create_torch_profiler"]
-
-    with pytest.raises(SystemExit, match="choose either ready-replay"):
-        create(
-            _profile_args(
-                torch_profile=True,
-                torch_profile_dir=tmp_path / "profiles",
-            ),
-            tmp_path / "run",
-        )
+    args = _profile_args(
+        torch_profile_dir=tmp_path / "torch",
+        hw_perf_dir=tmp_path / "hardware",
+    )
+    for plan in ("_plan_torch_profile", "_plan_hw_perf"):
+        assert openloop_namespace[plan](args, tmp_path / "run")["enabled"]
+    assert not (tmp_path / "torch").exists()
+    assert not (tmp_path / "hardware").exists()
 
 
-def test_ready_replay_profile_output_is_a_reusable_directory(
+def test_profile_output_is_a_reusable_directory_without_overwriting_traces(
     openloop_namespace,
     tmp_path: Path,
 ) -> None:
     plan = openloop_namespace["_plan_torch_profile"]
-    create = openloop_namespace["_create_torch_profiler"]
     output_dir = tmp_path / "run"
     profile_dir = tmp_path / "profiles"
     profile_dir.mkdir()
 
     metadata = plan(
-        _profile_args(
-            torch_profile=True,
-            torch_profile_output=profile_dir,
-        ),
+        _profile_args(torch_profile_dir=profile_dir),
         output_dir,
     )
-    trace_path = Path(metadata["output"])
-    summary_path = Path(metadata["summary_output"])
+    trace_path = openloop_namespace["_request_trace_path"](metadata, 0)
 
     assert metadata["directory"] == str(profile_dir)
     assert trace_path.parent == profile_dir
     assert re.fullmatch(
-        r"wall_qwen35_torch_profile_\d{8}_\d{6}_\d+\.trace\.json",
+        r"qwen35_generate_flow_action_batch_\d{8}_\d{6}_\d+_000001_\d+\.trace\.json.gz",
         trace_path.name,
     )
-    assert summary_path.name == trace_path.name.replace(
-        ".trace.json", ".summary.json"
-    )
-
     trace_path.write_text("keep", encoding="utf-8")
-    with pytest.raises(SystemExit, match="already exists"):
-        create(
-            _profile_args(
-                torch_profile=True,
-                torch_profile_output=profile_dir,
-            ),
-            output_dir,
-            profile_plan=metadata,
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        openloop_namespace["_export_torch_profile"](
+            None, metadata, trace_path=trace_path, request_index=0,
         )
     assert trace_path.read_text(encoding="utf-8") == "keep"
+    assert plan(_profile_args(torch_profile_dir=profile_dir), output_dir) == metadata
 
 
-def test_ready_replay_profile_rejects_a_file_as_its_directory(
+@pytest.mark.parametrize("parent_is_file", [False, True])
+@pytest.mark.parametrize("kind", ["torch", "hw"])
+def test_profile_rejects_a_file_as_its_directory(
     openloop_namespace,
     tmp_path: Path,
+    parent_is_file,
+    kind,
 ) -> None:
-    plan = openloop_namespace["_plan_torch_profile"]
+    plan = openloop_namespace["_plan_torch_profile" if kind == "torch" else "_plan_hw_perf"]
     output_dir = tmp_path / "run"
     profile_file = tmp_path / "profile.json"
     profile_file.write_text("keep", encoding="utf-8")
 
     with pytest.raises(SystemExit, match="not a directory"):
         plan(
-            _profile_args(
-                torch_profile=True,
-                torch_profile_output=profile_file,
-            ),
+            _profile_args(**{
+                "torch_profile_dir" if kind == "torch" else "hw_perf_dir":
+                    profile_file / "child" if parent_is_file else profile_file,
+            }),
             output_dir,
         )
 
@@ -338,6 +329,157 @@ def test_profile_destination_is_planned_before_backend_import() -> None:
     assert main_source.index("profile_plan = _plan_torch_profile") < main_source.index(
         "from rpu_backend.api import WallQwen35Policy"
     )
+    assert main_source.index("hw_perf_meta = _plan_hw_perf") < main_source.index(
+        "from rpu_backend.api import WallQwen35Policy"
+    )
+    assert "ready_replay" not in main_source
+    assert "_frozen_policy_graph_caches" not in main_source
+
+
+@pytest.mark.parametrize("flag", REMOVED_PROFILE_OPTIONS)
+def test_removed_profile_options_are_rejected_by_both_entrypoints(
+    openloop_namespace, monkeypatch, capsys, flag,
+):
+    result = subprocess.run(
+        ["bash", str(WRAPPER), flag], capture_output=True, text=True,
+        env={**os.environ, "ENV_SH": "/must-not-be-read"},
+    )
+    assert result.returncode == 2
+    assert "unknown option" in result.stderr
+    # In particular, argparse must not treat --torch-profile as an abbreviation.
+    monkeypatch.setattr(sys, "argv", [str(EXAMPLE), "--dataset-dir", "/unused",
+                                    "--checkpoint", "/unused", flag])
+    with pytest.raises(SystemExit) as exc:
+        openloop_namespace["_parse_args"]()
+    assert exc.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--torch-profile-dir", "--hw-perf-dir"])
+@pytest.mark.parametrize("values", [None, "", "--check-config"])
+def test_profile_directory_requires_nonempty_value(
+    openloop_namespace, monkeypatch, capsys, flag, values,
+):
+    options = [flag] if values is None else [flag + "="] if values == "" else [flag, values]
+    result = subprocess.run(["bash", str(WRAPPER), *options],
+                            capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "requires a" in result.stderr
+    monkeypatch.setattr(sys, "argv", [str(EXAMPLE), "--dataset-dir", "/unused",
+                                    "--checkpoint", "/unused", *options])
+    with pytest.raises(SystemExit) as exc:
+        openloop_namespace["_parse_args"]()
+    assert exc.value.code == 2
+    assert "error:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("style", ["space", "equals", "environment", "disabled"])
+def test_wrapper_forwards_only_profile_directories(tmp_path, style):
+    env_sh = tmp_path / "env.sh"
+    env_sh.write_text(f'export CONDA_PREFIX="{tmp_path}"\n')
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        '#!/bin/bash\nif [[ "$1" == -c ]]; then printf "/tmp\\n"; else\n'
+        'printf "TEST_ARG=%s\\n" "$@"\nfi\n'
+    )
+    fake_python.chmod(0o755)
+    asset = tmp_path / "placeholder.ref"
+    asset.touch()
+    env = {**os.environ, "ENV_SH": str(env_sh), "PYTHON_BIN": str(fake_python),
+           "DATASET_DIR": str(tmp_path), "CHECKPOINT_PATH": str(tmp_path),
+           "RHINO_LAUNCH_LIB_DIR": str(tmp_path), "RPU_KERNEL_LIB_PATH": str(asset),
+           "OUTPUT_DIR": str(tmp_path / "run"), "WALL_QWEN35_OPT": "1",
+           "TORCH_PROFILE_DIR": "", "HW_PERF_DIR": "", "HW_PERF_MAX_DUMPS": "7",
+           # Removed environment controls cannot enable or modify profiling.
+           "TORCH_PROFILE": "1", "TORCH_PROFILE_OUTPUT": str(tmp_path / "old"),
+           "TORCH_PROFILE_RECORD_SHAPES": "0", "TORCH_PROFILE_WITH_STACK": "0",
+           "TORCH_PROFILE_MEMORY": "1", "HW_PERF": "1",
+           "HW_PERF_OUTPUT": str(tmp_path / "old_hw")}
+    dirs = {"--torch-profile-dir": "torch traces", "--hw-perf-dir": "hardware traces"}
+    options = []
+    for flag, directory in dirs.items():
+        if style == "space":
+            options.extend([flag, directory])
+        elif style == "equals":
+            options.append(f"{flag}={directory}")
+        elif style == "environment":
+            env[flag[2:].upper().replace("-", "_")] = directory
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--no-sudo", *options], cwd=tmp_path,
+        env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    forwarded = [line.removeprefix("TEST_ARG=") for line in result.stdout.splitlines()
+                 if line.startswith("TEST_ARG=")]
+    assert not set(REMOVED_PROFILE_OPTIONS) & set(forwarded)
+    for flag, directory in dirs.items():
+        if style == "disabled":
+            assert flag not in forwarded
+        else:
+            assert forwarded[forwarded.index(flag) + 1] == str(tmp_path / directory)
+    if style != "disabled":
+        assert forwarded[forwarded.index("--hw-perf-max-dumps") + 1] == "7"
+
+
+def test_python_profile_directories_and_defaults(openloop_namespace, monkeypatch, tmp_path):
+    base = [str(EXAMPLE), "--dataset-dir", "/unused", "--checkpoint", "/unused"]
+    monkeypatch.setattr(sys, "argv", base)
+    args = openloop_namespace["_parse_args"]()
+    assert args.torch_profile_dir is None and args.hw_perf_dir is None
+    assert not openloop_namespace["_plan_hw_perf"](args, tmp_path)["enabled"]
+    monkeypatch.setattr(sys, "argv", [*base, "--torch-profile-dir=./torch traces",
+                                    "--hw-perf-dir", "./hardware traces"])
+    args = openloop_namespace["_parse_args"]()
+    assert args.torch_profile_dir == Path("torch traces")
+    assert args.hw_perf_dir == Path("hardware traces")
+    assert args.hw_perf_max_dumps == 32
+
+
+@pytest.mark.parametrize("bound", [0, -1])
+def test_hardware_profile_requires_positive_dump_bound(openloop_namespace, tmp_path, bound):
+    with pytest.raises(SystemExit, match="greater than zero"):
+        openloop_namespace["_plan_hw_perf"](
+            _profile_args(hw_perf_dir=tmp_path, hw_perf_max_dumps=bound), tmp_path,
+        )
+
+
+def test_real_per_request_profiles_export_separate_gzip_traces(
+    openloop_namespace, monkeypatch, tmp_path,
+):
+    torch = openloop_namespace["torch"]
+    new_profiler = openloop_namespace["_new_torch_profiler"]
+    monkeypatch.setitem(new_profiler.__globals__, "_torch_profiler_activities",
+                        lambda: ([torch.profiler.ProfilerActivity.CPU], ["CPU"]))
+    _, metadata = openloop_namespace["_create_torch_profiler"](
+        _profile_args(torch_profile_dir=tmp_path / "traces"), tmp_path / "run",
+    )
+
+    class Policy:
+        def predict_action_chunk(self, *, index):
+            with torch.profiler.record_function(f"request_{index}"):
+                return torch.ones(2, 3) + index
+
+    for index in range(2):
+        profiler = new_profiler(metadata, acc_events=True)
+        with profiler:
+            result = openloop_namespace["_profiled_predict_action_chunk"](
+                Policy(), profiler, index=index,
+            )
+        assert torch.equal(result, torch.full((2, 3), index + 1))
+        path = openloop_namespace["_request_trace_path"](metadata, index)
+        openloop_namespace["_export_torch_profile"](
+            profiler, metadata, trace_path=path, request_index=index,
+        )
+        with gzip.open(path, "rt") as trace_file:
+            events = json.load(trace_file)["traceEvents"]
+        names = {event["name"] for event in events}
+        assert f"request_{index}" in names and f"request_{1 - index}" not in names
+        assert "generate_flow_action_batch" in names
+        assert "[memory]" not in names
+        assert any([2, 3] in event.get("args", {}).get("Input Dims", []) for event in events)
+    assert len(metadata["artifacts"]) == 2
+    assert [a["request_idx"] for a in metadata["artifacts"]] == [0, 1]
+    assert metadata["admission"] is None
 
 
 def test_profiled_policy_call_marks_one_step(
@@ -883,24 +1025,19 @@ def test_wrapper_exposes_and_forwards_profile_options() -> None:
         capture_output=True,
         text=True,
     )
-    assert "--torch-profile" in result.stdout
-    assert "--torch-profile-output" in result.stdout
     assert "--torch-profile-dir" in result.stdout
-    assert "--torch-profile-record-shapes" in result.stdout
-    assert "--torch-profile-memory" in result.stdout
-    assert "--torch-profile-with-stack" in result.stdout
-    assert "READY-probe output directory" in result.stdout
+    assert "--hw-perf-dir" in result.stdout
+    assert "Shapes and stacks on; memory events off" in result.stdout
+    options = set(re.findall(r"--[a-z-]+", result.stdout))
+    assert not set(REMOVED_PROFILE_OPTIONS) & options
     assert "WALL_QWEN35_OPT=1 (default)" in result.stdout
     assert "WALL_QWEN35_OPT=0" in result.stdout
     assert "--language-one-graph" not in result.stdout
     assert "--action-execution" not in result.stdout
 
     source = WRAPPER.read_text(encoding="utf-8")
-    assert '--torch-profile-output "$TORCH_PROFILE_OUTPUT"' in source
     assert '--torch-profile-dir "$TORCH_PROFILE_DIR"' in source
-    assert "PYTHON_ARGS+=(--torch-profile-record-shapes)" in source
-    assert "PYTHON_ARGS+=(--torch-profile-memory)" in source
-    assert "PYTHON_ARGS+=(--torch-profile-with-stack)" in source
+    assert '--hw-perf-dir "$HW_PERF_DIR"' in source
 
 
 def test_runner_rejects_old_installed_vision_before_checkpoint_load(
@@ -966,23 +1103,14 @@ def test_runner_rejects_bad_graph_budget_before_loading(
         openloop_namespace["_require_graph_budget_runtime"]()
 
 
-def test_wrapper_rejects_profile_in_check_mode_before_environment_setup() -> None:
-    result = subprocess.run(
-        ["bash", str(WRAPPER), "--check", "--torch-profile"],
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 2
-    assert "Torch profiling requires real execution" in result.stderr
-
+@pytest.mark.parametrize("flag", ["--torch-profile-dir", "--hw-perf-dir"])
+def test_wrapper_rejects_profile_in_check_mode_before_environment_setup(flag) -> None:
     directory_result = subprocess.run(
         [
             "bash",
             str(WRAPPER),
             "--check",
-            "--torch-profile-dir",
+            flag,
             "/tmp/qwen35-profile-contract-test",
         ],
         cwd=ROOT,
@@ -991,4 +1119,4 @@ def test_wrapper_rejects_profile_in_check_mode_before_environment_setup() -> Non
         text=True,
     )
     assert directory_result.returncode == 2
-    assert "Torch profiling requires real execution" in directory_result.stderr
+    assert "profiling requires real execution" in directory_result.stderr

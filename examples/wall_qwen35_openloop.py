@@ -216,9 +216,9 @@ def _require_action_execution_runtime() -> None:
     from rpu_backend.adapters.wall_qwen35 import action
 
     guard = getattr(action, "require_wall_fp16_loop_runtime", None)
-    if not callable(guard):
+    if not callable(guard) or not callable(getattr(action, "_action_prefix_bucket", None)):
         raise RuntimeError(
-            "the installed Wall Action adapter lacks the FP16 loop implementation; "
+            "the installed Wall Action adapter lacks the FP16 loop/prefix-bucket implementation; "
             "rebuild and reinstall this source tree with the wrapper's Python"
         )
     guard()
@@ -257,23 +257,7 @@ def _torch_profile_requested(args: argparse.Namespace) -> bool:
 
 
 def _torch_profile_mode(args: argparse.Namespace) -> str:
-    ready_replay = bool(args.torch_profile or args.torch_profile_output is not None)
-    per_request = args.torch_profile_dir is not None
-    if ready_replay and per_request:
-        raise SystemExit(
-            "choose either ready-replay --torch-profile/--torch-profile-output "
-            "or reference-compatible --torch-profile-dir"
-        )
-    if per_request:
-        return "per_request"
-    if (
-        ready_replay
-        or args.torch_profile_record_shapes
-        or args.torch_profile_memory
-        or args.torch_profile_with_stack
-    ):
-        return "ready_replay"
-    return "disabled"
+    return "per_request" if args.torch_profile_dir is not None else "disabled"
 
 
 def _torch_profiler_activities() -> tuple[list[Any], list[str]]:
@@ -301,11 +285,10 @@ def _new_torch_profiler(
     )
 
 
-def _timestamped_torch_profile_stem() -> str:
-    return (
-        "wall_qwen35_torch_profile_"
-        f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    )
+def _profile_directory_arg(value: str) -> Path:
+    if not value:
+        raise argparse.ArgumentTypeError("profile directory must not be empty")
+    return Path(value)
 
 
 def _resolve_output_path(path: Path) -> Path:
@@ -319,7 +302,7 @@ def _validate_profile_directory(profile_dir: Path) -> None:
     if profile_dir.exists():
         if not profile_dir.is_dir():
             raise SystemExit(
-                f"torch profile output is not a directory: {profile_dir}"
+                f"profile output is not a directory: {profile_dir}"
             )
         return
 
@@ -328,7 +311,7 @@ def _validate_profile_directory(profile_dir: Path) -> None:
         existing_parent = existing_parent.parent
     if existing_parent.exists() and not existing_parent.is_dir():
         raise SystemExit(
-            "torch profile output parent is not a directory: "
+            "profile output parent is not a directory: "
             f"{existing_parent}"
         )
 
@@ -341,28 +324,22 @@ def _plan_torch_profile(
 
     mode = _torch_profile_mode(args)
     enabled = mode != "disabled"
-    record_shapes = bool(args.torch_profile_record_shapes or mode == "per_request")
-    with_stack = bool(args.torch_profile_with_stack or mode == "per_request")
     metadata: dict[str, Any] = {
         "enabled": enabled,
         "mode": mode,
         "scope": (
-            "one repeated first request after an unprofiled warmup"
-            if mode == "ready_replay"
-            else "one trace per open-loop inference request"
-            if mode == "per_request"
+            "one trace per open-loop inference request"
+            if enabled
             else "post-install open-loop inference requests"
         ),
-        "includes_graph_build": (
-            True if mode == "per_request" else None if enabled else False
-        ),
-        "includes_lazy_first_request_setup": mode == "per_request",
+        "includes_graph_build": enabled,
+        "includes_lazy_first_request_setup": enabled,
         "profiler_acc_events": enabled,
         "accumulate_request_events": False,
         "latency_is_diagnostic_only": enabled,
-        "record_shapes": record_shapes,
-        "profile_memory": bool(args.torch_profile_memory),
-        "with_stack": with_stack,
+        "record_shapes": enabled,
+        "profile_memory": False,
+        "with_stack": enabled,
         "output": None,
         "summary_output": None,
         "directory": None,
@@ -374,35 +351,16 @@ def _plan_torch_profile(
     if not enabled:
         return metadata
 
-    requested_dir = (
-        args.torch_profile_dir
-        if mode == "per_request"
-        else args.torch_profile_output
-    )
-    profile_dir = _resolve_output_path(
-        requested_dir if requested_dir is not None else output_dir
-    )
+    profile_dir = _resolve_output_path(args.torch_profile_dir)
     _validate_profile_directory(profile_dir)
     metadata["directory"] = str(profile_dir)
-    if mode == "per_request":
-        return metadata
-
-    stem = _timestamped_torch_profile_stem()
-    trace_path = profile_dir / f"{stem}.trace.json"
-    summary_path = profile_dir / f"{stem}.summary.json"
-    if trace_path.exists():
-        raise SystemExit(f"torch profile output already exists: {trace_path}")
-    if summary_path.exists():
-        raise SystemExit(f"torch profile summary already exists: {summary_path}")
-    metadata["output"] = str(trace_path)
-    metadata["summary_output"] = str(summary_path)
     return metadata
 
 
 def _plan_hw_perf(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     """Resolve the bounded r4 hardware trace directory without touching RPU."""
 
-    enabled = bool(args.hw_perf or args.hw_perf_output is not None)
+    enabled = args.hw_perf_dir is not None
     if args.hw_perf_max_dumps <= 0:
         raise SystemExit("--hw-perf-max-dumps must be greater than zero")
     metadata: dict[str, Any] = {
@@ -418,10 +376,7 @@ def _plan_hw_perf(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     }
     if not enabled:
         return metadata
-    requested = args.hw_perf_output
-    profile_dir = _resolve_output_path(
-        requested if requested is not None else output_dir / "rpu_hwperf"
-    )
+    profile_dir = _resolve_output_path(args.hw_perf_dir)
     _validate_profile_directory(profile_dir)
     metadata["output_dir"] = str(profile_dir)
     return metadata
@@ -467,19 +422,8 @@ def _create_torch_profiler(
     profile_dir = Path(metadata["directory"])
     _validate_profile_directory(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
-    if metadata["mode"] == "per_request":
-        return None, metadata
-
-    trace_path = Path(metadata["output"])
-    if trace_path.exists():
-        raise SystemExit(f"torch profile output already exists: {trace_path}")
-
-    # PyTorch 2.10 warns that the default false setting discards the current
-    # cycle at profiler shutdown. The READY probe records only one request, so
-    # retaining that single cycle has bounded size while avoiding ambiguous
-    # export behavior.
-    profiler = _new_torch_profiler(metadata, acc_events=True)
-    return profiler, metadata
+    # Each request gets its own profiler; preparation must not start recording.
+    return None, metadata
 
 
 def _request_trace_path(metadata: dict[str, Any], request_index: int) -> Path:
@@ -1512,7 +1456,7 @@ def _write_plot(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
@@ -1531,41 +1475,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--torch-profile",
-        action="store_true",
-        help="profile post-install inference requests with CPU and PrivateUse1",
-    )
-    parser.add_argument(
-        "--torch-profile-output",
-        type=Path,
-        help=(
-            "READY-probe trace/summary directory; implies --torch-profile "
-            "(default: OUTPUT_DIR; filenames include a timestamp and PID)"
-        ),
-    )
-    parser.add_argument(
         "--torch-profile-dir",
-        type=Path,
+        type=_profile_directory_arg,
         help=(
-            "reference-compatible directory mode: export one compressed "
-            "Chrome trace per request"
+            "enable CPU + PrivateUse1 profiling: one *.trace.json.gz per "
+            "inference request, including first-request setup/BUILD (no extra "
+            "warmup); shapes and stacks on, memory events off"
         ),
     )
-    parser.add_argument("--torch-profile-record-shapes", action="store_true")
-    parser.add_argument("--torch-profile-memory", action="store_true")
-    parser.add_argument("--torch-profile-with-stack", action="store_true")
     parser.add_argument(
-        "--hw-perf",
-        action="store_true",
-        help="collect bounded r4 kernel/DMA Chrome traces",
-    )
-    parser.add_argument(
-        "--hw-perf-output",
-        type=Path,
-        help=(
-            "r4 hardware trace directory; implies --hw-perf "
-            "(default: OUTPUT_DIR/rpu_hwperf)"
-        ),
+        "--hw-perf-dir",
+        type=_profile_directory_arg,
+        help="enable bounded r4 kernel/DMA Chrome traces in this directory",
     )
     parser.add_argument("--hw-perf-max-dumps", type=int, default=32)
     parser.add_argument("--check-config", action="store_true")
@@ -1580,7 +1501,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     profile_requested = _torch_profile_requested(args)
-    hw_perf_requested = bool(args.hw_perf or args.hw_perf_output is not None)
+    hw_perf_requested = args.hw_perf_dir is not None
     if args.check_config and (profile_requested or hw_perf_requested):
         raise SystemExit("profiling requires real execution; remove --check-config")
     if args.max_requests < 0:
@@ -1668,7 +1589,7 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
         raise SystemExit(f"output directory already exists: {output_dir}") from exc
-    profiler, torch_profile_meta = _create_torch_profiler(
+    _, torch_profile_meta = _create_torch_profiler(
         args,
         output_dir,
         profile_plan=profile_plan,
@@ -1810,8 +1731,6 @@ def main() -> int:
     ground_truth_chunks: list[np.ndarray] = []
     time_chunks: list[np.ndarray] = []
     segment_results: list[dict[str, Any]] = []
-    ready_profile_entered = False
-    ready_profile_exported = False
     try:
         for request_index, segment in enumerate(parsed["segments"]):
             start = int(segment["start"])
@@ -1836,86 +1755,7 @@ def main() -> int:
                 "dof_mask": MASK26,
                 "initial_noise": flow_noise[request_index],
             }
-            if (
-                torch_profile_meta["mode"] == "ready_replay"
-                and request_index == 0
-            ):
-                assert profiler is not None
-                print(
-                    "[wall-qwen35-openloop] profile warmup: first request "
-                    "(not recorded)",
-                    flush=True,
-                )
-                warmup_started = time.perf_counter()
-                warm_output = _profiled_predict_action_chunk(
-                    policy,
-                    None,
-                    **request_kwargs,
-                )
-                warmup_seconds = time.perf_counter() - warmup_started
-                with _frozen_policy_graph_caches(policy):
-                    graph_before = _policy_graph_stats(policy)
-
-                    print(
-                        "[wall-qwen35-openloop] profile measure: frozen "
-                        "READY repeat of the same request",
-                        flush=True,
-                    )
-                    measured_started = time.perf_counter()
-                    with profiler:
-                        ready_profile_entered = True
-                        output = _profiled_predict_action_chunk(
-                            policy,
-                            profiler,
-                            **request_kwargs,
-                        )
-                    request_seconds = time.perf_counter() - measured_started
-                    graph_after = _policy_graph_stats(policy)
-                    admission = _ready_replay_admission(
-                        graph_before,
-                        graph_after,
-                        warm_output,
-                        output,
-                    )
-                torch_profile_meta["warmup_seconds"] = warmup_seconds
-                torch_profile_meta["measured_seconds"] = request_seconds
-                torch_profile_meta["admission"] = admission
-                # A completed call while all caches are lookup-only cannot
-                # contain an online BUILD, even if numerical parity later
-                # keeps the overall admission from being accepted.
-                torch_profile_meta["includes_graph_build"] = False
-                _export_torch_profile(profiler, torch_profile_meta)
-                ready_profile_exported = True
-                print(
-                    "[wall-qwen35-openloop] profile admission: "
-                    f"{admission['status']}",
-                    flush=True,
-                )
-                parity = admission["output_parity"]
-                if (
-                    not parity["same_shape"]
-                    or not parity["prefix_equal"]
-                    or not parity["finite"]
-                    or not parity["actions_norm_present"]
-                    or not parity["actions_norm_same_shape"]
-                    or not parity["actions_norm_finite"]
-                ):
-                    raise RuntimeError(
-                        "profile warmup/repeat physical/normalized "
-                        "shape/prefix/finite "
-                        f"contract failed: {parity}"
-                    )
-                if not parity["accepted"]:
-                    print(
-                        "[wall-qwen35-openloop] WARNING: warmup/repeat "
-                        "action values are not bit-exact; keeping the exported "
-                        "profile as diagnostic evidence "
-                        f"(physical_max_abs={parity['actions_max_abs']}, "
-                        "normalized_max_abs="
-                        f"{parity['actions_norm_max_abs']})",
-                        flush=True,
-                    )
-            elif torch_profile_meta["mode"] == "per_request":
+            if torch_profile_meta["mode"] == "per_request":
                 request_profiler = _new_torch_profiler(
                     torch_profile_meta,
                     acc_events=True,
@@ -1968,12 +1808,11 @@ def main() -> int:
             vision_graph = graph["vision"]
             completed_requests = request_index + 1
             _validate_retained_graph_stats(
-                # Action fast replay is exact-prefix keyed. A changed prefix
-                # deliberately replaces the prior entry, so validate the
-                # selected profile's calls in the current request rather than a
-                # cumulative count across evicted signatures.
+                # Optimized Action retains all prefix buckets: require one
+                # BUILD per bucket and cumulative REPLAY for every other call.
+                # Only the fallback evicts exact-prefix per-step entries.
                 "action", action_graph,
-                calls=1 if opt else 10
+                calls=completed_requests if opt else 10
             )
             _validate_retained_graph_stats(
                 "vision", vision_graph, calls=completed_requests * (1 if opt else 3)
@@ -1984,6 +1823,7 @@ def main() -> int:
             print(
                 "[wall-qwen35-openloop] Action Graph: "
                 f"mode={action_mode}, entries={action_graph['size']}, "
+                f"prefix_bucket={getattr(output, 'extra', {}).get('action_prefix_bucket')}, "
                 f"segments={[entry['segment_count'] for entry in action_graph['entries']]}, "
                 f"replays={action_graph['replays']}, "
                 f"recaptures={action_graph['recaptures']}, "
@@ -2017,6 +1857,7 @@ def main() -> int:
                     **segment,
                     "request_idx": request_index,
                     "prefix_length": prefix_preflight[request_index]["prefix_length"],
+                    "action_prefix_bucket": getattr(output, "extra", {}).get("action_prefix_bucket"),
                     "noise_seed": request_noise_seed,
                     "flow_noise_sha256": hashlib.sha256(
                         flow_noise[request_index].tobytes()
@@ -2066,26 +1907,12 @@ def main() -> int:
                 flush=True,
             )
     finally:
-        try:
-            if (
-                profiler is not None
-                and ready_profile_entered
-                and not ready_profile_exported
-            ):
-                torch_profile_meta["admission"] = {
-                    "status": "incomplete",
-                    "full_ready": False,
-                    "blockers": ["measured request did not complete"],
-                }
-                torch_profile_meta["includes_graph_build"] = None
-                _export_torch_profile(profiler, torch_profile_meta)
-        finally:
-            if hw_perf_meta["enabled"]:
-                hw_perf_meta["native_state_before_disable"] = dict(
-                    torch.rpu.get_hw_perf_trace()
-                )
-            runtime_stack.close()
-            _finalize_hw_perf_metadata(hw_perf_meta)
+        if hw_perf_meta["enabled"]:
+            hw_perf_meta["native_state_before_disable"] = dict(
+                torch.rpu.get_hw_perf_trace()
+            )
+        runtime_stack.close()
+        _finalize_hw_perf_metadata(hw_perf_meta)
 
     prediction_concat = np.concatenate(predictions_absolute).astype(np.float32)
     ground_truth_concat = np.concatenate(ground_truth_chunks).astype(np.float32)

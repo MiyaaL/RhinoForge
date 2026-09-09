@@ -145,8 +145,12 @@ API。初版范围固定为 FP16 batch 1、精确三个规范相机、初始多�
 10 个 Euler step。受控 runtime 会把 base-text prefill 映射到固定 64 行 bucket
 `64..384`；retained Prefill 签名还会区分末个 native chunk 的三种拓扑类别
 （1 行、2--31 行、至少 32 行），同一类别内的有效 prefix 长度和 M-RoPE 仍按调用刷新。
-native pad-zeroing 即使在 bucket 边界也会发出稳定的 fill 节点。Action fast replay
-仍按精确真实 prefix 长度建图，因为 KV 插入位置和 SDPA 寄存器会固化该值。
+native pad-zeroing 即使在 bucket 边界也会发出稳定的 fill 节点。优化开启时，Action
+也按 64 行分桶（`64..384`），在桶边界插入 action KV，通过 additive mask 屏蔽
+真实 prefix 到桶边界的空隙，逻辑 RoPE 位置不变。最多保留六个 Graph，共用固定
+SPM 布局；各桶独立、地址稳定的 mask DDR 和 prefix KV 在 capture 外刷新，支持
+同桶变长和 A/B/A 跨桶复用。关闭优化仍使用精确 prefix、逐步 Action 路径。
+padding 可能改变 FP16 attention 舍入，不承诺逐位一致。
 这些只是 Wall profile 的内部优化，不扩展通用 Qwen3.5 API。
 统一冷环境开关 `WALL_QWEN35_OPT` 在 `from_checkpoint()` 时绑定：
 未设置或 `1` 为 Vision1 + Prefill1 + Action1；`0` 恢复逐图 Vision、

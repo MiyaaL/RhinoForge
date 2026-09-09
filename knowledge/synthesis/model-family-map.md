@@ -146,18 +146,25 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
   installation so their persistent generations can coexist; an explicit
   conflicting value fails before weight loading. Multimodal action RoPE
   positions remain distinct from the larger physical KV-cache prefix length.
+  With `WALL_QWEN35_OPT=1`, Action maps real prefixes to 64-row buckets and
+  retains up to six one-segment Graphs. The suffix starts at the bucket boundary;
+  a refreshed additive mask hides padding and real logical RoPE is unchanged.
+  Cache count is not per-request submission count: each request still executes
+  Vision1 + Prefill1 + Action1. OPT=0 retains exact-prefix per-step Action.
 - This entry remains Source-only controlled evaluation because its Qwen3.5
   vision path is numeric-blocked and on-board numerical, Graph-lifecycle, and
   representative task gates are pending. The standalone example is a direct
   exact-checkpoint CLI, not a full-runner target, and its explicit opt-in does
-  not promote the support status. The repository-root open-loop wrapper has a
-  reference-compatible per-request trace-directory mode plus a focused CPU and
-  `PrivateUse1` READY probe. The focused probe warms one request outside the
-  profiler, records one identical repeat, and writes a lifecycle/key-average
-  summary; a failed component admission remains explicit. These diagnostic
-  artifacts stay outside the repository and do not establish a performance or
-  support claim.
-  [Wall Qwen3.5 example](../../examples/wall_qwen35.py)
+  not promote the support status. The repository-root open-loop wrapper uses
+  `--torch-profile-dir DIR` for CPU + `PrivateUse1` per-request compressed
+  traces with shapes/stacks enabled and memory events disabled, and
+  `--hw-perf-dir DIR` for bounded hardware traces. No directory means no
+  corresponding profiler. The first Torch trace includes lazy setup/BUILD;
+  no automatic warmup or frozen READY repeat is inserted. These diagnostic
+  artifacts stay outside the repository and do not establish READY, numerical,
+  performance or support claims.
+  [Wall Qwen3.5 example](../../examples/wall_qwen35.py),
+  [open-loop profiling](../../docs/model_testing.md)
 
 ### RhinoVLA
 

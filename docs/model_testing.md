@@ -124,13 +124,10 @@ sends a robot command:
 ```bash
 bash run_wall_qwen35_openloop.sh --check --no-sudo
 bash run_wall_qwen35_openloop.sh --max-events 1
-bash run_wall_qwen35_openloop.sh --max-events 1 --torch-profile
-bash run_wall_qwen35_openloop.sh --max-events 1 --torch-profile \
-  --torch-profile-output /tmp/qwen35-openloop-ready-profile
 bash run_wall_qwen35_openloop.sh --max-events 1 \
   --torch-profile-dir /tmp/qwen35-openloop-profile
 bash run_wall_qwen35_openloop.sh --max-events 1 \
-  --hw-perf-output /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
+  --hw-perf-dir /tmp/qwen35-openloop-hwperf --hw-perf-max-dumps 32
 bash run_wall_qwen35_openloop.sh
 bash run_wall_qwen35_openloop.sh \
   --flow-noise /path/to/common_flow_noise.npy
@@ -151,10 +148,9 @@ bash run_wall_qwen35_openloop.sh --max-requests 1
 Real execution rejects an old packed-Vision Python/native ABI before checkpoint
 loading and prints the loaded adapter path. `Vision Graph: entries=1` confirms
 the retained cache for the usual image triple. A fresh `--max-requests 1
---torch-profile` run additionally exercises one warmup BUILD and one Vision
-REPLAY (`replays=1`, zero recaptures). Any action repeat drift still fails the
-READY summary's numerical gate; one Vision Graph is not a whole-policy
-READY or quality certification. Graph details are in `segments.json`, and
+--torch-profile-dir DIR` run records that request including setup/BUILD; it
+does not insert a warmup/repeat or certify whole-policy READY/parity.
+Graph details are in `segments.json`, and
 `meta.json` records the package/native identities and `vision_execution` mode.
 
 The unified cold switch is `WALL_QWEN35_OPT` (default `1`). No per-stage CLI
@@ -162,11 +158,24 @@ flags are needed:
 
 ```bash
 # Vision 1 + Language/Prefill 1 + Action 1
-bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+bash run_wall_qwen35_openloop.sh --max-requests 1 \
+  --torch-profile-dir /tmp/qwen35-opt-profile
 
 # Vision 3 + Language/Prefill 3 + Action 10 on this recorded episode
-WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 \
+  --torch-profile-dir /tmp/qwen35-split-profile
 ```
+
+Optimized Action maps real prefixes to fixed 64-row buckets (`64..384`),
+retains up to six one-segment graphs, and refreshes padding visibility and
+real RoPE outside capture. The runner checks cumulative replay counts and
+records `action_prefix_bucket` per request. For performance tests, omit both
+profiling-directory flags and reuse the same `--flow-noise` artifact. Validate
+same-bucket length changes and A/B/A returns separately from cold startup;
+more cached buckets do not mean more graph submissions per request.
+See the [Action bucket validation receipt](wall_qwen35_action_bucket_validation.md)
+for the bounded local lifecycle, numerical-difference and unprofiled timings;
+it does not promote the model's Source-only status.
 
 Both modes use FP16 Action projections/Euler with ACC32 GEMMs and one-time CPU
 FP32 time/Ada precomputation. Disabling optimization changes Graph organization,
@@ -180,9 +189,10 @@ Generic non-Wall defaults are unchanged. Use a fresh process to change modes.
 
 Count physical segments, not cache entries. Optimized Vision, Prefill and Action
 require one physical segment per Graph; the split Action reuses one single-step
-Graph ten times, and split Vision retains separate camera shapes. READY admission
-checks 3 versus 16 physical submissions as well as stable replay and same-input
-output parity. Cold priming/BUILD is excluded. Other input envelopes can produce
+Graph ten times, and split Vision retains separate camera shapes. The historical
+READY probe checked 3 versus 16 physical submissions, stable replay and
+same-input output parity, excluding cold priming/BUILD. The current per-request
+profiler includes cold work and does not perform that probe. Other input envelopes can produce
 different conservative Prefill segment counts; the `3+3+10` check is for this
 runner's recorded episode. Metadata records the switch, plan and effective budgets.
 Stale Python/native packages fail before loading. Compare outputs with the same
@@ -224,61 +234,48 @@ for `pred_concat.npy`. The output directory must not already exist. The full
 same-noise BF16/MXFP8/RPU evidence and FP64 aggregate metrics are in
 `reports/wall_qwen35_accuracy_comparison_20260901.html` and its sibling JSON.
 
-The default `--torch-profile` path is a READY probe: it runs the first admitted
-request once without a profiler, then records exactly one identical repeat.
-`--torch-profile-output DIR` selects its output directory. Timestamped
-`wall_qwen35_torch_profile_YYYYMMDD_HHMMSS_PID.trace.json` and matching
-`.summary.json` files make repeated runs non-overwriting. The summary contains
-compact Torch key averages, exact warmup/repeat action parity, and component
-Graph lifecycle evidence. It reports `accepted` only when Vision, a retained
-base Prefill bucket/topology signature, and exact-prefix Action are frozen in
-lookup-only READY and prove exact replay deltas of 1, 1, and 10 respectively; a
-generated trace is not itself a READY claim. Vision now packs all three images
-in one call with three independent attention calls per layer. Test both the
-usual `[112,140,140]` lengths and maximum `[196,196,196]`, changed image data,
-changed output addresses, and equal totals with different ordered lengths.
-Rebuild the native extension before running this candidate; previous traces
-with three Vision calls are historical evidence only. Wall base-text prefixes are assigned
-to fixed 64-row buckets up to 384. The signature also separates the native
-one-row, 2--31-row, and 32+-row final-chunk envelopes, so compatible requests in
-one bucket can REPLAY without crossing a node/grid topology branch. Action
-rebuilds when the real prefix changes because its fast replay bakes that length
-into KV-insert and SDPA registers. After the bounded exact-repeat probe, the
-caches return to WARMING so later dataset prefixes may build; no dataset-wide
-frozen-READY claim follows from that probe. On hardware that exhibits FP16
-repeat drift, the trace is still exported and the summary keeps
-`actions_exact=false` / `actions_norm_exact=false` with their respective maximum
-absolute differences; only physical/normalized shape, prefix, missing normalized
-output, or non-finite mismatches abort the run. Named ranges expose
-`wall_qwen35_preprocess`,
-`wall_qwen35_vision_text_prefill`, `wall_qwen35_action_denoise_loop`, and
-`wall_qwen35_action_decoder` directly in the trace.
+Torch profiling has one entry point: `--torch-profile-dir DIR`. It requests
+CPU and `PrivateUse1` activities and exports each post-install inference request
+as a separate `qwen35_generate_flow_action_batch_*.trace.json.gz`. Filenames
+include the timestamp, PID, request index and nanosecond timestamp. Shapes and
+source stacks are always enabled; memory events are disabled. A fresh profiler
+is used for each request with `acc_events=True`, without accumulating previous
+requests' events. The reference `generate_flow_action_batch` range and the
+`wall_qwen35_preprocess`, `wall_qwen35_vision_text_prefill`,
+`wall_qwen35_action_denoise_loop`, and `wall_qwen35_action_decoder` stage ranges
+remain visible.
 
-The legacy/reference-compatible `--torch-profile-dir DIR` mode still requests
-CPU and `PrivateUse1` activities and profiles every post-install action request
-into a separate `qwen35_generate_flow_action_batch_*.trace.json.gz` file. It
-retains the reference `generate_flow_action_batch` range name and enables
-shapes and stacks by default. Optional
-`--torch-profile-record-shapes`, `--torch-profile-memory`, and
-`--torch-profile-with-stack` diagnostics match the generic runner controls.
-The two modes are mutually exclusive. Profile destinations are validated
-before checkpoint loading or RPU initialization. Profiling cannot be combined
-with `--check`, never overwrites a trace or summary, and produces
-diagnostic-only latency. Keep traces outside the
-repository: it may expose application shapes, source paths, and operation
-metadata. The explicit `policy.to("rpu")` installation and the READY-probe
-warmup are both outside the default trace. The current component gaps and the
-release-matched vendor interface request are recorded in the
+There is no automatic unprofiled warmup or identical-repeat READY probe.
+Explicit `policy.to("rpu")` installation is outside the Torch trace, but lazy
+first-request setup and Graph BUILD are included. Later requests may BUILD
+when their signature changes. A trace is diagnostic evidence, not a frozen
+READY or numerical-parity claim; `meta.json` keeps the per-request artifact
+manifest and does not report READY admission. Historical exact-repeat
+measurements remain in the
 [Wall Qwen3.5 READY-profile assessment](wall_qwen35_ready_profile_assessment.md).
+The old `--torch-profile`, `--torch-profile-output`,
+`--torch-profile-record-shapes`, `--torch-profile-memory`, and
+`--torch-profile-with-stack` flags are removed from this Wall runner.
 
-`--hw-perf-output DIR` enables the r4 device trace before policy installation;
-`--hw-perf` uses `OUTPUT_DIR/rpu_hwperf`. The wrapper passes
+`--hw-perf-dir DIR` is the sole hardware-trace enable/destination option and
+enables r4 device tracing before policy installation. The former `--hw-perf`
+and `--hw-perf-output` options are removed. The wrapper passes
 `LKN_RPU_FREQ_MHZ` through sudo (default 800 MHz) and bounds the number of
-segment JSON files with `--hw-perf-max-dumps`. Filenames include a timestamp,
-PID, BUILD/REPLAY/oneshot phase, and segment index. Use the `*_replay_segN.json`
-files in Perfetto and merge every segment belonging to the inference region.
-These traces are intentionally redacted in the r4 Release runtime and perturb
-latency; rerun without hardware tracing for the final latency number.
+segment JSON files with `--hw-perf-max-dumps` (default 32). Filenames include a
+timestamp, PID, BUILD/REPLAY/oneshot phase, and segment index. Use the
+`*_replay_segN.json` files in Perfetto and inspect every segment belonging to
+the inference region. r4 Release traces are intentionally redacted.
+
+Both directory options can be used together, or independently. Omitting a
+directory leaves that profiler disabled; the wrapper also accepts
+`TORCH_PROFILE_DIR` and `HW_PERF_DIR` environment equivalents. No other
+profiling enable/output/shapes/memory/stack environment overrides are read.
+Destinations are validated before checkpoint loading or RPU initialization,
+and existing directories can be reused without overwriting trace files.
+Neither profiler can be combined with `--check`. Keep these sensitive traces
+outside the repository: they can contain application shapes, source paths and
+operation metadata. Both profilers perturb latency; rerun without profiling
+for final latency measurements.
 
 The Pi0.5 `batch_file` is not bundled. Produce it with the checkpoint-compatible
 LeRobot policy preprocessing pipeline, then save the tensor dictionary with

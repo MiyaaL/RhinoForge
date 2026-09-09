@@ -3,6 +3,19 @@
 This assessment is limited to the exact controlled-evaluation profile below. It
 does not promote the model-support status or transfer evidence from Wall-OSS.
 
+## Profiling CLI consolidation (2026-09-09)
+
+The current open-loop runner exposes only `--torch-profile-dir DIR` and
+`--hw-perf-dir DIR` for enabling the respective profilers. Torch uses one
+compressed trace per request, with shapes/stacks enabled and memory events
+disabled; it includes first-request setup/BUILD and does not insert an
+unprofiled warmup or frozen READY repeat. The hardware dump bound remains
+`--hw-perf-max-dumps`. See [model testing](model_testing.md) for current commands.
+Commands using `--torch-profile`, `--torch-profile-output` or `--hw-perf-output`
+below are historical receipts for the revisions measured at the time, not
+commands for the consolidated CLI. This CLI-only change does not supply new
+RPU numerical, READY or performance evidence.
+
 ## Packed-spatial source update (2026-09-08)
 
 The new candidate supersedes the two-signature/three-call Vision design

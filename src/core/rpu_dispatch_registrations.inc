@@ -83,6 +83,8 @@ TORCH_LIBRARY(rpu, m) {
   m.def("qwen3_5_set_weights(int handle, Tensor[] q_w_list, Tensor[] k_w_list, Tensor[] v_w_list, Tensor[] o_w_list, Tensor[] q_norm_list, Tensor[] k_norm_list, Tensor[] attn_gate_list, Tensor[] input_norm_list, Tensor[] post_norm_list, Tensor[] gate_list, Tensor[] up_list, Tensor[] down_list, Tensor cos, Tensor sin, Tensor final_norm_w, int[] layer_is_full, int num_q_heads, int num_kv_heads, int head_dim, int hidden_size, int intermediate_size, float eps, bool use_silu, int[] mrope_section, Tensor[] gdn_in_z_list, Tensor[] gdn_out_list, Tensor[] gdn_A_log_list, Tensor[] gdn_dt_bias_list, Tensor[] gdn_norm_list, int gdn_num_v_heads, int gdn_key_head_dim, int gdn_value_head_dim, int gdn_conv_dim, int gdn_conv_kernel, Tensor[] gdn_q_list, Tensor[] gdn_k_list, Tensor[] gdn_v_list, Tensor[] gdn_cq_list, Tensor[] gdn_ck_list, Tensor[] gdn_cv_list, Tensor[] gdn_b_bg_list, Tensor[] gdn_a_bg_list) -> ()");
   m.def("qwen3_5_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor[] gdn_states, Tensor[] conv_states, Tensor? attention_mask, int position, bool is_causal) -> Tensor");
   m.def("qwen3_5_set_prefill_rope(int handle, Tensor cos, Tensor sin) -> ()");
+  m.def("qwen3_5_set_wall_action_prefix_bucket",
+        TORCH_FN(rpu_qwen3_5_set_wall_action_prefix_bucket));
   // int-only (no tensor arg) ⇒ DEFAULT block only, no device dispatch (mirror
   // qwen3_5_get_resolved_chunk_size below; schema inferred from the function signature).
   m.def("qwen3_5_set_valid_prefill_len", TORCH_FN(rpu_qwen3_5_set_valid_prefill_len));

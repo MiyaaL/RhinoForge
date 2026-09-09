@@ -1247,6 +1247,8 @@ void rpu_qwen3_5_set_weights(
     at::TensorList gdn_cq_list, at::TensorList gdn_ck_list, at::TensorList gdn_cv_list,
     at::TensorList gdn_b_bg_list, at::TensorList gdn_a_bg_list);
 void rpu_qwen3_5_set_prefill_rope(int64_t handle, const at::Tensor& cos, const at::Tensor& sin);
+void rpu_qwen3_5_set_wall_action_prefix_bucket(
+    int64_t handle, int64_t prefix_len, int64_t bucket_len);
 void rpu_qwen3_5_set_valid_prefill_len(int64_t handle, int64_t n);
 void rpu_qwen3_5_set_mrope_position_delta(int64_t handle, int64_t d);
 int64_t rpu_qwen3_5_get_resolved_chunk_size(int64_t handle);

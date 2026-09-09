@@ -37,6 +37,13 @@ Both arms use FP16 Action math. The switch owns all six cold Graph/SDK budgets;
 verify both physical submission counts and the loaded package ABI. Historical
 FP32 measurements remain precision anchors, not a selectable runtime profile.
 
+For the Wall open-loop runner, profiling uses only `--torch-profile-dir DIR`
+and `--hw-perf-dir DIR` (with the existing hardware dump bound). Torch records
+one compressed trace per request with shapes/stacks enabled and memory events
+disabled. The first trace includes lazy setup/BUILD; do not infer frozen READY
+or steady-state latency from it. Keep historical READY-probe commands bound to
+their measured revision when updating the [testing guide](../docs/model_testing.md).
+
 1. Confirm the statement in public source or documentation.
 2. Update the existing page that owns the fact; create a page only for a new,
    reusable concept.
@@ -58,10 +65,16 @@ and after reduction. Preserve semantic reduction spans when the reference
 depends on ring geometry; matching GEMM outputs alone does not establish final
 parity. Verify the installed Python/native package used by the public launcher,
 not only a temporary validation package.
-Also exercise consecutive requests with changing exact prefixes: a cold Action
-priming call can leave a temporary-SPM watermark that a single warmup/replay
-probe misses. Check the [component handoff](concepts/component-handoff.md)
-boundaries before changing workspace sizes or clearing Graph caches.
+Also exercise changing real prefixes within a bucket and A/B/A bucket returns:
+Wall optimized Action retains all six 64-row buckets, masks the gap before its
+bucket-offset suffix, and refreshes real RoPE outside capture. Keep mask SPM
+size fixed across buckets, retain per-bucket DDR slots, and clear partial KV
+blocks using K axis 5 versus V axis 6. Require cumulative BUILD/REPLAY counts,
+not merely a single successful warm repeat. A cold Action prime can leave a
+temporary-SPM watermark: check the [component handoff](concepts/component-handoff.md)
+boundaries before changing workspace sizes or clearing Graph caches. Compare
+same-noise FP16 outputs and unprofiled full-wrapper timings separately; this
+host Graph extension does not certify numerical or robot-task quality.
 
 1. First update an existing concept or synthesis page when it owns the result.
 2. Add a short page under [queries/](queries/README.md) only when the original

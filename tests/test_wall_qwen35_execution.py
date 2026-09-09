@@ -130,7 +130,10 @@ def test_fp16_loop_refreshes_steps_inputs_and_retained_outputs(monkeypatch, one_
     monkeypatch.setattr(torch.Tensor, "to", to)
     prefix_updates = []
     monkeypatch.setattr(action, "_copy_physical_prefix",
-                        lambda *a: prefix_updates.append(a[-1]) or [308] * 24)
+                        lambda *a: prefix_updates.append(a[-2:]) or [a[-1]] * 24)
+    bucket_updates = []
+    monkeypatch.setattr(torch.ops.rpu, "qwen3_5_set_wall_action_prefix_bucket",
+                        lambda h, p, b: bucket_updates.append((p, b)), raising=False)
     monkeypatch.setattr(action, "_ensure_action_rope", lambda *a: None)
     mods = torch.arange(10, dtype=torch.float16).view(10, 1, 1).expand(10, 49, 3072).contiguous()
     monkeypatch.setattr(action, "_wall_loop_modulation", lambda _: mods)
@@ -147,13 +150,14 @@ def test_fp16_loop_refreshes_steps_inputs_and_retained_outputs(monkeypatch, one_
 
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_wall_action_loop", native, raising=False)
     outputs = []
-    for seed in (3407, 3408, 3407):
+    prefixes = (308, 309, 308) if one_graph else (308, 308, 308)
+    for seed, prefix in zip((3407, 3408, 3407), prefixes):
         x = torch.randn(1, 32, 26, generator=torch.Generator().manual_seed(seed))
         mask = torch.tensor([1] * 20 + [0] * 6)
         padding = 0.25 - x
         result = action.run_wall_qwen35_action_loop(
             expert, action=x, dof_mask=mask, padding_velocity=padding,
-            position_ids=torch.arange(231, 263), prefix_cache=object(), prefix_len=308,
+            position_ids=torch.arange(231, 263), prefix_cache=object(), prefix_len=prefix,
         )
         expected, keep, pv = action._pack_wall_fp16_loop_inputs(x, mask, padding)
         _, dt = action._wall_fp16_times()
@@ -164,13 +168,14 @@ def test_fp16_loop_refreshes_steps_inputs_and_retained_outputs(monkeypatch, one_
         outputs.append(result)
         cache.frozen = True
     assert cache.builds == 1 and cache.replays == (2 if one_graph else 29)
-    assert prefix_updates == [308] * 3
+    assert prefix_updates == [(p, 320 if one_graph else p) for p in prefixes]
+    assert bucket_updates == ([(p, 320) for p in prefixes] if one_graph else [])
     assert calls == ([list(range(10))] * 4 if one_graph else [[0]] + [[i] for i in range(10)] * 3)
     assert torch.equal(outputs[0], outputs[2]) and not torch.equal(outputs[0], outputs[1])
     assert len({x.data_ptr() for x in outputs}) == 3
     with pytest.raises(RuntimeError, match="READY miss"):
         action.run_wall_qwen35_action_loop(
             expert, action=x, dof_mask=mask, padding_velocity=padding,
-            position_ids=torch.arange(231, 263), prefix_cache=object(), prefix_len=309,
+            position_ids=torch.arange(231, 263), prefix_cache=object(), prefix_len=321,
         )
-    assert prefix_updates == [308] * 3
+    assert prefix_updates == [(p, 320 if one_graph else p) for p in prefixes]
