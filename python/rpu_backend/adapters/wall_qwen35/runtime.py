@@ -40,6 +40,23 @@ _VISION_GRAPH_MAX_ENTRIES = "QWEN3_5_VISION_GRAPH_MAX_ENTRIES"
 _COEXIST_PERSISTENT_ENV = "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "True", "on"})
 
+
+def _configure_prefill_chunks(text_state, *, optimized: bool) -> None:
+    """Cold, Wall-only whole-bucket prefill; leave generic/legacy admission alone."""
+    if not optimized:
+        return
+    maximum = max(WALL_PREFIX_BUCKETS)
+    handle = text_state.handle
+    torch.ops.rpu.qwen3_5_set_chunk_size_cap(handle, 0)
+    torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, maximum, maximum)
+    # The native override clamps to the execution length (the 64-row bucket).
+    # Unlike auto selection it raises on insufficient SPM instead of silently
+    # splitting. Native kernel-validity and co-resident SPM checks stay intact.
+    # Do not set the public exact_chunk_size field: this is a bounded maximum,
+    # not a demand to pad every request to 384 rows.
+    torch.ops.rpu.qwen3_5_set_prefill_chunk_size(handle, maximum)
+
+
 def _profile_scope(name: str):
     """Return a stable model-stage range for Torch profiler attribution.
 
@@ -317,6 +334,7 @@ class WallQwen35Runtime:
                 raise RuntimeError(
                     "Wall Qwen3.5 base install did not publish text runtime state"
                 )
+            _configure_prefill_chunks(text_state, optimized=self.wall_qwen35_opt)
             # A bucket's final GDN chunk has three possible native node/grid
             # envelopes (1, 2..31, or 32+ valid rows). Capacity covers the
             # finite cross-product; entries remain allocated lazily.

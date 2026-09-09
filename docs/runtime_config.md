@@ -202,9 +202,14 @@ Generic non-Wall defaults below are unchanged.
 Optimized Vision/Prefill and both Action modes use
 `GraphCache(require_single_segment=True)`: each invocation requires one
 physical segment under SDK-half bounded budgets, or fails before execution.
-The split Action invokes that one-step graph ten times. The larger Prefill
-budget changes segmentation, not arithmetic or SPM chunks; controlled evaluation
-still does not certify numerical/task-quality support.
+The split Action invokes that one-step graph ten times. The larger Graph budget
+alone changes segmentation, not SPM chunks. Separately, optimized Wall Prefill
+binds a cold whole-bucket override (64..384 rows), retaining GDN's internal
+64-row recurrence. It uses disjoint Full Attention/GDN scratch lifetimes above
+128 rows and rejects an SPM overflow without falling back to multiple chunks.
+Generic Qwen3.5 and the split Wall preset retain the128-row admission ceiling.
+This can change FP16 rounding; controlled evaluation still does not certify
+numerical/task-quality support.
 
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|

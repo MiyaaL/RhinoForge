@@ -39,8 +39,10 @@ the recorded master-arm absolute trajectory. It never commands a robot.
 WALL_QWEN35_OPT=1 (default): Vision 1 + Language/Prefill 1 + Action 1 Graph.
 WALL_QWEN35_OPT=0: Vision 3 + Language/Prefill 3 + Action 10 Graphs on this episode.
 Both arms use FP16 Action I/O/Euler with FP32 GEMM accumulation; time/Ada
-conditioning remains a one-time CPU FP32 precompute. Only Graph organization
-changes. Packed Vision retains three isolated attentions per layer.
+conditioning remains a one-time CPU FP32 precompute. Optimized Prefill executes
+its entire 64..384-row prefix bucket in one outer chunk; the internal 64-row
+Gated DeltaNet recurrence is retained. Packed Vision retains three isolated
+attentions per layer. Changing chunk/GEMM/reduction geometry can change FP16 rounding.
 The switch owns all six Graph/SDK budget settings, overriding individual values:
   enabled: 32768 / 8 / 64 MiB, SDK 65536 / 16 / 128 MiB;
   disabled: 8192 / 4 / 32 MiB, SDK 65536 / 8 / 64 MiB.

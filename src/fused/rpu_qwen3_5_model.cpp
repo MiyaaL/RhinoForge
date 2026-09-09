@@ -1693,9 +1693,19 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     int64_t tmp = A(sdpa_compute_tmp_v16_size(
         make_sdpa_config(action_mode_ ? action_sdpa_mask_type() : 1), cs) * 32);
 
+    // Full attention and GDN are mutually exclusive within a layer. For the
+    // wider Wall prefill, represent them on disjoint logical lifetime windows:
+    // attention 2..5, GDN 11..16, then shared MLP 21..22. These are allocator
+    // labels, NOT extra execution phases. Preserve GDN's internal ordering and
+    // setup-mask lifetimes; keep both residual streams live across either path.
+    // Retain existing phase windows for decode, <=128-row prefill and Action.
+    const bool wide_prefill = !action_mode_ && cs > 128;
+    const int mixer_shift = wide_prefill ? 10 : 0;
+    const int mlp_begin = wide_prefill ? 21 : 7;
+    const int layer_end = wide_prefill ? 22 : 8;
     std::vector<BufferDecl> decls;
-    decls.push_back({"residual1",  res,  1, 8, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"input_norm", res,  1, 8, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"residual1",  res,  1, layer_end, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"input_norm", res,  1, layer_end, StorageClass::Temp, 0, nullptr});
     decls.push_back({"residual2",  0,    0, 0, StorageClass::Temp, 0, "input_norm"});
     if (wall_action_mode_) {
         // Read-only dummy residual for pure mixed-branch AllReduce.  It is
@@ -1717,9 +1727,9 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
         decls.push_back({"action_prefix_mask", A(32 * (384 + 32) * DWIDTH),
                          4, 5, StorageClass::Temp, 0, nullptr});
     }
-    decls.push_back({"gate",       mlp,  7, 8, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"up",         mlp,  7, 7, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"down",       res,  7, 8, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"gate",       mlp,  mlp_begin, layer_end, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"up",         mlp,  mlp_begin, mlp_begin, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"down",       res,  mlp_begin, layer_end, StorageClass::Temp, 0, nullptr});
     if (action_mode_) {
         decls.push_back({
             "adaptive_mod", A(3 * h * DWIDTH), 1, 8,
@@ -1846,12 +1856,14 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
         const int64_t guarded_cs = CS + std::min(CS - 1, kGdnPrefillPaddingCap);
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
         auto B = [&](const char* n, int64_t elems) -> BufferDecl {
-            return {n, A(elems * DWIDTH), 1, 6, StorageClass::Temp, 0, nullptr};
+            return {n, A(elems * DWIDTH), 1 + mixer_shift, 6 + mixer_shift,
+                    StorageClass::Temp, 0, nullptr};
         };
         // BP: phase-tagged LayerWide Temp. This model is SEQUENTIAL, not KV_FIRST;
         // the phase windows therefore share the layer-loop timeline with attention/MLP.
         auto BP = [&](const char* n, int64_t elems, int p0, int p1) -> BufferDecl {
-            return {n, A(elems * DWIDTH), p0, p1, StorageClass::Temp, 0, nullptr};
+            return {n, A(elems * DWIDTH), p0 + mixer_shift, p1 + mixer_shift,
+                    StorageClass::Temp, 0, nullptr};
         };
         // Setup/state buffers are shared by both GDN modes.
         decls.insert(decls.end(), {

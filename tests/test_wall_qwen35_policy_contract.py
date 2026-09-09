@@ -461,6 +461,12 @@ def test_runtime_graph_labels_pass_real_install_attribute_validation(monkeypatch
     monkeypatch.setattr(execution, "configure_wall_qwen35_execution", lambda opt: None)
     monkeypatch.setattr(vision, "_require_packed_spatial_vision_native", lambda: None)
     monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", lambda: None)
+    chunk_calls = []
+    for name in ("qwen3_5_set_chunk_size_cap", "qwen3_5_set_chunk_envelope",
+                 "qwen3_5_set_prefill_chunk_size"):
+        monkeypatch.setattr(torch.ops.rpu, name,
+                            lambda *args, _name=name: chunk_calls.append((_name, args)),
+                            raising=False)
     monkeypatch.setattr(
         rpu_backend.graph, "GraphCache",
         lambda **kw: SimpleNamespace(**kw, clear=lambda: None),
@@ -485,7 +491,7 @@ def test_runtime_graph_labels_pass_real_install_attribute_validation(monkeypatch
             # weight installation is doubled; SimpleNamespace-only towers in
             # forward tests cannot catch a cold attribute namespace violation.
             validate_preinstall(self.model)
-            self.model.model.language_model._rpu_qwen3_5 = SimpleNamespace()
+            self.model.model.language_model._rpu_qwen3_5 = SimpleNamespace(handle=42)
             validate_postinstall(self.model)
             install_hw_attr_validator(self.model)
             installs.append(kwargs)
@@ -505,6 +511,11 @@ def test_runtime_graph_labels_pass_real_install_attribute_validation(monkeypatch
         assert runtime.install() is runtime
         assert runtime.install() is runtime
         assert len(installs) == 1
+        assert chunk_calls == ([
+            ("qwen3_5_set_chunk_size_cap", (42, 0)),
+            ("qwen3_5_set_chunk_envelope", (42, 384, 384)),
+            ("qwen3_5_set_prefill_chunk_size", (42, 384)),
+        ] if opt else [])
         tower = model.model.visual
         assert tower._wall_qwen35_packed_vision is opt
         assert tower._wall_qwen35_vision_graph_op_id == "rpu_wall_qwen35_vision"
