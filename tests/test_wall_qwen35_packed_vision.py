@@ -126,6 +126,34 @@ def test_three_images_share_one_call_and_keep_independent_outputs(packed_runtime
     assert not torch.equal(second.last_hidden_state[112:], original[112:])
 
 
+@pytest.mark.parametrize("packed", [True, False])
+@pytest.mark.parametrize("wall_label", [True, False])
+def test_graph_labels_are_policy_owned_in_both_vision_modes(
+    packed_runtime, packed, wall_label,
+):
+    tower, calls, graph = packed_runtime
+    tower._rpu_vision_packed_spatial = packed
+    if wall_label:
+        tower._rpu_vision_graph_op_id = "rpu_wall_qwen35_vision"
+    grid = torch.tensor([[1, 8, 14], [1, 10, 14], [1, 10, 14]])
+    pixels = torch.zeros((392, 4), dtype=torch.float16)
+    for _ in range(2):
+        vision._rpu_vision_forward(tower, pixels, grid)
+    assert len(calls) == len(graph.calls) == (2 if packed else 6)
+    expected = "rpu_wall_qwen35_vision" if wall_label else "qwen3_5_vision"
+    assert {sig.op_id for sig in graph.calls} == {expected}
+    if packed:
+        assert graph.calls[0] is graph.calls[1]
+
+
+def test_wall_sets_graph_labels_before_adapter_installation():
+    source = (Path(__file__).resolve().parents[1]
+              / "python/rpu_backend/adapters/wall_qwen35/runtime.py").read_text()
+    label = 'self.base_model.model.visual._rpu_vision_graph_op_id = "rpu_wall_qwen35_vision"'
+    assert source.index(label) < source.index("self._base_adapter.to_rpu(")
+    assert 'text_state.prefill_graph_op_id = "rpu_wall_qwen35_prefill"' in source
+
+
 def test_same_total_different_boundaries_change_signature_and_positions(packed_runtime):
     tower, calls, graph = packed_runtime
     pixels = torch.zeros((392, 4), dtype=torch.float16)

@@ -43,6 +43,10 @@ one compressed trace per request with shapes/stacks enabled and memory events
 disabled. The first trace includes lazy setup/BUILD; do not infer frozen READY
 or steady-state latency from it. Keep historical READY-probe commands bound to
 their measured revision when updating the [testing guide](../docs/model_testing.md).
+Wall's three Graph labels use the common `rpu_wall_qwen35_` prefix with
+`vision`, `prefill` and `action` suffixes in both OPT modes. Labels are assigned
+before capture; generic Qwen3.5 naming and historical trace artifacts remain
+unchanged. Keep precision/step mode in execution metadata, not stage labels.
 
 1. Confirm the statement in public source or documentation.
 2. Update the existing page that owns the fact; create a page only for a new,

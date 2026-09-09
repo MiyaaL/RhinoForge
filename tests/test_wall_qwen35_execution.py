@@ -168,6 +168,7 @@ def test_fp16_loop_refreshes_steps_inputs_and_retained_outputs(monkeypatch, one_
         outputs.append(result)
         cache.frozen = True
     assert cache.builds == 1 and cache.replays == (2 if one_graph else 29)
+    assert cache.signature["op_id"] == "rpu_wall_qwen35_action"
     assert prefix_updates == [(p, 320 if one_graph else p) for p in prefixes]
     assert bucket_updates == ([(p, 320) for p in prefixes] if one_graph else [])
     assert calls == ([list(range(10))] * 4 if one_graph else [[0]] + [[i] for i in range(10)] * 3)

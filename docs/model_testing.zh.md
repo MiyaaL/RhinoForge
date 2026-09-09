@@ -202,6 +202,13 @@ Graph BUILD 会记录；后续请求签名变化时也可能 BUILD。trace 仅�
 在 Perfetto 中主要查看 `*_replay_segN.json`，并检查推理区域对应的全部 segment。
 r4 Release runtime 会按设计脱敏这些 trace。
 
+Wall 两种 OPT 模式的 Graph 名称统一为 `rpu_wall_qwen35_vision`、
+`rpu_wall_qwen35_prefill`、`rpu_wall_qwen35_action`，同时用于硬件文件名、
+Graph capture range 和 BUILD/REPLAY 日志。`fp16_one_graph` / `fp16_steps`
+仍由执行元数据区分，不再放入阶段名称。通用 Qwen3.5 的 `qwen3_5_vision`
+名称不变。这只修改 Python adapter 命名；安装对应 Python 源码后在新进程中生效，
+不改变 native ABI、计算或 Graph 拓扑，也不重命名已有 trace 或改写历史记录。
+
 两个目录参数可同时使用，也可单独使用；未提供对应目录时，不启用该采集。
 wrapper 支持等价环境变量 `TORCH_PROFILE_DIR`、`HW_PERF_DIR`，不再读取其他
 旧的 profiling 启用、输出、shape、memory 或 stack 环境开关。

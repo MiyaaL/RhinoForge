@@ -63,7 +63,7 @@ def test_loop_refreshes_semantic_inputs_before_capture_and_checks_ready_first():
     assert src.index("cache.is_frozen()") < src.index("_copy_physical_prefix")
     assert src.count("_copy_physical_prefix(") == 1
     assert src.index("_ensure_action_rope") < src.index("with cache.capture")
-    assert 'op_id="rpu_wall_qwen35_action_fp16_loop"' in src
+    assert 'op_id="rpu_wall_qwen35_action"' in src
     assert "int(prefix_len)" in src and "dyn_dims=[steps_per_graph, 24" in src
     assert 'torch.empty_like(packed)' in src and '.contiguous().clone()' in src
 

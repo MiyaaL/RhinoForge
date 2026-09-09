@@ -1102,7 +1102,7 @@ def run_wall_qwen35_action_loop(
     import rpu_backend
 
     signature = rpu_backend.graph.GraphSignature(
-        op_id="rpu_wall_qwen35_action_fp16_loop",
+        op_id="rpu_wall_qwen35_action",
         shapes=[1, 32, 64, bucket_len],
         dyn_dims=[steps_per_graph, 24, *_FULL_LAYERS], dtypes=[torch.float16],
     )

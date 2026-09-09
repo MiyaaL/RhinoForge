@@ -266,6 +266,15 @@ timestamp, PID, BUILD/REPLAY/oneshot phase, and segment index. Use the
 `*_replay_segN.json` files in Perfetto and inspect every segment belonging to
 the inference region. r4 Release traces are intentionally redacted.
 
+Wall's Graph labels are consistently `rpu_wall_qwen35_vision`,
+`rpu_wall_qwen35_prefill` and `rpu_wall_qwen35_action` in both OPT modes. They
+appear in hardware filenames and Graph capture ranges/BUILD/REPLAY logs;
+`fp16_one_graph` versus `fp16_steps` remains in execution metadata, not the
+stage name. Generic Qwen3.5 keeps its `qwen3_5_vision` label. This is a Python
+adapter naming change: install the matching Python sources and start a fresh
+process; the native ABI, compute and Graph topology are unchanged. Existing
+trace files and their recorded provenance are not renamed.
+
 Both directory options can be used together, or independently. Omitting a
 directory leaves that profiler disabled; the wrapper also accepts
 `TORCH_PROFILE_DIR` and `HW_PERF_DIR` environment equivalents. No other
