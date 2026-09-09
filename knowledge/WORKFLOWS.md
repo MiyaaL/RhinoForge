@@ -54,6 +54,12 @@ Wall's three Graph labels use the common `rpu_wall_qwen35_` prefix with
 `vision`, `prefill` and `action` suffixes in both OPT modes. Labels are assigned
 before capture; generic Qwen3.5 naming and historical trace artifacts remain
 unchanged. Keep precision/step mode in execution metadata, not stage labels.
+For GDN padding fills, keep the grid equal to `ceil(actual_elements/2048)`;
+extra blocks in the release fill asset can corrupt adjacent live Q/K rows.
+Stable replay uses fixed writes into each target's contiguous trailing guard,
+not an oversized launch grid. See [the padding safety receipt](../docs/qwen35_gdn_padding_safety.md).
+Also allocate the cumsum workspace by its kernel ABI, not input tensor size.
+
 Cold Wall Vision labels belong to policy metadata (`_wall_qwen35_*`), not the
 reserved `_rpu_*` hardware-attribute namespace. Test the real recursive
 pre/post-install validators at the Wall-to-Qwen adapter boundary in both OPT

@@ -160,6 +160,10 @@ void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
     TORCH_CHECK(grid_element_count >= element_count,
                 "fill_spm: grid_num_elements (", grid_num_elements,
                 ") must cover num_elements (", num_elements, ")");
+    TORCH_CHECK((grid_element_count + 2047) / 2048 ==
+                    (element_count + 2047) / 2048,
+                "fill_spm: oversized grid is unsafe for the release fill kernel; "
+                "use a fixed write extent inside declared padding/guard storage");
     TORCH_CHECK(element_count <=
                     SpmAllocator::SPM_USABLE / sizeof(c10::Half),
                 "fill_spm: write byte count exceeds one core's usable SPM");

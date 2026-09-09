@@ -2984,10 +2984,10 @@ void rpu_launch_memset_spm_multicore(
 void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
                                 c10::Half value, int num_cores,
                                 int core_begin = 0,
-                                // Optional fixed launch envelope.  When set,
-                                // the fill count remains mutable but grid.x is
-                                // derived from this upper bound, which keeps a
-                                // retained prefix-bucket graph topology stable.
+                                // Compatibility hint: must round to the SAME
+                                // grid as num_elements. Extra blocks are unsafe.
+                                // Stable graphs must use a fixed actual write
+                                // extent inside explicitly allocated storage.
                                 int64_t grid_num_elements = 0);
 
 // Strict exactly-k FP16 MoE selector. `correction_bias` affects selection only;

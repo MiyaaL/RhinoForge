@@ -194,6 +194,10 @@ FP32 time/Ada precomputation. Disabling optimization changes Graph organization,
 not precision; it does not restore the historical FP32 host path. The former
 `--language-one-graph` and `--action-execution` options are removed.
 
+Both modes include the [GDN padding safety fix](qwen35_gdn_padding_safety.md).
+Old fixed-grid fill traces/predictions can contain overwritten live Q/K data;
+regenerate a repaired 128-chunk reference before comparing chunk-merge numerics.
+
 The switch overrides all six Graph/SDK budget environment values: enabled uses
 32768 entries / 8 MiB command / 64 MiB instruction with SDK capacities
 65536 / 16 MiB / 128 MiB; disabled uses 8192 / 4 / 32 with SDK 65536 / 8 / 64.

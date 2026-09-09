@@ -42,6 +42,9 @@ using namespace ::rhino_lkn;
 
 namespace {
 
+// Matches QWEN3_5_TOTAL_PADDING_CAP (63 alignment + 64 optional rows).
+constexpr int64_t kGdnPrefillPaddingCap = 127;
+
 constexpr int64_t kWallActionNumLayers = 24;
 constexpr int64_t kWallActionHiddenSize = 1024;
 constexpr int64_t kWallActionIntermediateSize = 2048;
@@ -1429,41 +1432,30 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
     // Zero the pad rows [Lv:L] of the chunk-core inputs (route B: the last chunk's [valid:L] are pad
     // tokens). k/β/g=0 makes the pad positions contribute NOTHING to the carried recurrent_state
     // (exact, not approx); q/v zeroed too so no NaN leaks through the chunk attn (their outputs get
-    // sliced off the padded logits by the adapter).  Keep the same five fill
-    // nodes even when Lv==L: those exact-length calls write one harmless row of
-    // the already-scratch gdn_c_decay buffer.  Their element-count registers
-    // remain mutable and grid.x is fixed to the bucket, so all lengths in one
-    // retained Graph share the same topology.
+    // sliced off the padded logits by the adapter). Each destination owns extra
+    // guard rows after its logical L rows. Write a CONSTANT number of rows from
+    // Lv: valid rows are untouched and excess zeros land only in the guard.
+    // This keeps all five fill grids stable WITHOUT launching blocks beyond n;
+    // the release fill kernel does not safely skip those extra blocks.
     {
-        const bool has_pad = Lv < L;
-        const int64_t np = has_pad ? (L - Lv) : 1;
-        const uint32_t q_zero = has_pad
-            ? rq + (uint32_t)(Lv * Hc * Dk * 2) : D("gdn_c_decay");
-        const uint32_t k_zero = has_pad
-            ? rk + (uint32_t)(Lv * Hc * Dk * 2) : D("gdn_c_decay");
-        const uint32_t v_zero = has_pad
-            ? a_v + (uint32_t)(Lv * lval * 2) : D("gdn_c_decay");
-        const uint32_t beta_zero = has_pad
-            ? D("gdn_c_beta") + (uint32_t)(Lv * vg_c * 2)
-            : D("gdn_c_decay");
-        const uint32_t g_zero = has_pad
-            ? D("gdn_c_g") + (uint32_t)(Lv * vg_c * 2)
-            : D("gdn_c_decay");
+        const int64_t np = std::min(L - 1, kGdnPrefillPaddingCap);
+        TORCH_CHECK(L - Lv <= np,
+                    "GDN prefill padding exceeds its declared guard rows");
         rpu_launch_fill_spm_kernel(
-            q_zero, np * Hc * Dk, c10::Half(0.0f), nc, 0,
-            L * Hc * Dk);
+            rq + (uint32_t)(Lv * Hc * Dk * 2),
+            np * Hc * Dk, c10::Half(0.0f), nc);
         rpu_launch_fill_spm_kernel(
-            k_zero, np * Hc * Dk, c10::Half(0.0f), nc, 0,
-            L * Hc * Dk);
+            rk + (uint32_t)(Lv * Hc * Dk * 2),
+            np * Hc * Dk, c10::Half(0.0f), nc);
         rpu_launch_fill_spm_kernel(
-            v_zero, np * lval, c10::Half(0.0f), nc, 0,
-            L * lval);
+            a_v + (uint32_t)(Lv * lval * 2),
+            np * lval, c10::Half(0.0f), nc);
         rpu_launch_fill_spm_kernel(
-            beta_zero, np * vg_c, c10::Half(0.0f), nc, 0,
-            L * vg_c);
+            D("gdn_c_beta") + (uint32_t)(Lv * vg_c * 2),
+            np * vg_c, c10::Half(0.0f), nc);
         rpu_launch_fill_spm_kernel(
-            g_zero, np * vg_c, c10::Half(0.0f), nc, 0,
-            L * vg_c);
+            D("gdn_c_g") + (uint32_t)(Lv * vg_c * 2),
+            np * vg_c, c10::Half(0.0f), nc);
     }
 
     // ===== Phase 4: CHUNK CORE (M-gen) — N-major [N,Hc,C,*] =====
@@ -1851,6 +1843,7 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
         const int64_t nkh = (conv_dim - H * Dv) / (2 * Dk), lkey = (nkh * Dk) / nc;
         const int64_t n_bg = ((Hc + 15) / 16) * 16, hist = Kc - 1;
         const int64_t CS = std::max<int64_t>(64, ctx.chunk_size), N = CS / 64;
+        const int64_t guarded_cs = CS + std::min(CS - 1, kGdnPrefillPaddingCap);
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
         auto B = [&](const char* n, int64_t elems) -> BufferDecl {
             return {n, A(elems * DWIDTH), 1, 6, StorageClass::Temp, 0, nullptr};
@@ -1894,11 +1887,11 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             // separate gdn_c_*_cso buffers (shared with decode; tail scatters gdn_cs → cache).
             BP("gdn_c_q_halo", 8 * hist * lkey, 2, 2), BP("gdn_c_k_halo", 8 * hist * lkey, 2, 2),
             BP("gdn_c_v_halo", 8 * hist * lval, 2, 2),
-            BP("gdn_c_query", CS * lkey, 2, 4), BP("gdn_c_key", CS * lkey, 2, 4),
-            BP("gdn_c_value", CS * lval, 2, 4),
+            BP("gdn_c_query", guarded_cs * lkey, 2, 4), BP("gdn_c_key", guarded_cs * lkey, 2, 4),
+            BP("gdn_c_value", guarded_cs * lval, 2, 4),
             // ---- phase 3: prep (beta/g [L,vg_c=Hc]) + GQA tile ----
-            BP("gdn_c_beta",  CS * Hc,  3, 4), BP("gdn_c_g", CS * Hc, 3, 4),
-            BP("gdn_c_q_rep", CS * Hc * Dk, 3, 4), BP("gdn_c_k_rep", CS * Hc * Dk, 3, 4),
+            BP("gdn_c_beta",  guarded_cs * Hc,  3, 4), BP("gdn_c_g", guarded_cs * Hc, 3, 4),
+            BP("gdn_c_q_rep", guarded_cs * Hc * Dk, 3, 4), BP("gdn_c_k_rep", guarded_cs * Hc * Dk, 3, 4),
             // ---- phase 3: token->N-major transpose [N,Hc,C,*] (== [Hc*CS,*] total) ----
             BP("gdn_c_q_h",    Hc * CS * Dk, 3, 5), BP("gdn_c_k_h", Hc * CS * Dk, 3, 5),
             BP("gdn_c_v_h",    Hc * CS * Dv, 3, 4),
@@ -1918,7 +1911,8 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             // decay·tril = ±691 instead of the 0/1-masked diff). The M *= -1 and q *= qk_scale are
             // separate binary_scalar ops.
             BP("gdn_c_tril",   64 * 64, 1, 4), BP("gdn_c_strict", 64 * 64, 1, 4),
-            BP("gdn_c_ws",     Hc * CS, 4, 4),           // cumsum workspace
+            // cumsum ABI: min(64,C)*17*16 halfs, independent of batch Hc*N.
+            BP("gdn_c_ws",     64 * 17 * 16, 4, 4),
             // ---- phase 5: recurrent per-chunk scratch [Hc,C,*] ----
             // q/k/v/kcd/decay/g/gexp/out use offset views into phase-4 storage.
             BP("gdn_c_attnc", Hc * 64 * 64, 5, 5),
