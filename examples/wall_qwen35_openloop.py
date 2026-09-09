@@ -170,6 +170,60 @@ def _require_packed_vision_runtime() -> None:
     )
 
 
+def _require_graph_budget_runtime() -> None:
+    # Older native extensions silently ignore the new budget controls. A
+    # conservative run remains compatible; any changed soft limit needs ABI 1.
+    defaults = {
+        "RPU_GRAPH_MAX_SEGMENT_ENTRIES": (8192, 32768),
+        "RPU_GRAPH_MAX_SEGMENT_COMMAND_MB": (4, 8),
+        "RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB": (32, 64),
+    }
+    changed = False
+    for name, (default, maximum) in defaults.items():
+        value = os.environ.get(name, str(default))
+        if (not value.isascii() or not value.isdecimal()
+                or not 1 <= int(value) <= maximum):
+            raise ValueError(f"{name} must be a decimal integer in [1, {maximum}]")
+        changed |= int(value) != default
+    if not changed:
+        return
+    import rpu_backend
+
+    extension = getattr(rpu_backend, "_cpp_ext", None)
+    if getattr(extension, "graph_segment_budget_abi", None) != 1:
+        raise RuntimeError(
+            "the installed RhinoForge native extension lacks Graph segment budget "
+            "controls; rebuild and reinstall this source tree with the wrapper's "
+            "Python: python -m pip install . --no-build-isolation"
+        )
+
+
+def _configure_execution_runtime() -> bool:
+    # The source wrapper may be newer than the installed package. Do not let
+    # an old adapter silently ignore the unified switch.
+    try:
+        from rpu_backend.adapters.wall_qwen35 import execution
+    except ImportError as exc:
+        raise RuntimeError("rebuild and reinstall RhinoForge for WALL_QWEN35_OPT") from exc
+    if getattr(execution, "WALL_QWEN35_OPT_ABI", None) != 1:
+        raise RuntimeError("rebuild and reinstall RhinoForge for WALL_QWEN35_OPT")
+    opt = execution.resolve_wall_qwen35_opt()
+    execution.configure_wall_qwen35_execution(opt)
+    return opt
+
+
+def _require_action_execution_runtime() -> None:
+    from rpu_backend.adapters.wall_qwen35 import action
+
+    guard = getattr(action, "require_wall_fp16_loop_runtime", None)
+    if not callable(guard):
+        raise RuntimeError(
+            "the installed Wall Action adapter lacks the FP16 loop implementation; "
+            "rebuild and reinstall this source tree with the wrapper's Python"
+        )
+    guard()
+
+
 def _runtime_provenance(policy: Any) -> dict[str, Any]:
     import rpu_backend
 
@@ -1325,12 +1379,19 @@ def _ready_replay_admission(
     measured: Any,
 ) -> dict[str, Any]:
     action = _retained_replay_admission(
-        before.get("action"), after.get("action"), expected_replays=10
+        before.get("action"), after.get("action"),
+        expected_replays=getattr(measured, "extra", {}).get("action_graph_calls", 10),
     )
-    # One packed Vision invocation covers all three cameras. A READY request
-    # must replay that signature exactly once.
+    extra = getattr(measured, "extra", {})
+    if extra.get("action_execution") in ("fp16_one_graph", "fp16_steps"):
+        entries = (after.get("action") or {}).get("entries", [])
+        action["single_physical_segment"] = bool(
+            len(entries) == 1 and entries[0].get("segment_count") == 1
+        )
+        action["accepted"] &= action["single_physical_segment"]
     vision = _retained_replay_admission(
-        before.get("vision"), after.get("vision"), expected_replays=1
+        before.get("vision"), after.get("vision"),
+        expected_replays=extra.get("vision_graph_calls", 1),
     )
     parity = _profile_output_parity(warm, measured)
     base_before = before.get("base_prefill")
@@ -1352,6 +1413,23 @@ def _ready_replay_admission(
             "before": base_before,
             "after": base_after,
         }
+    # Check physical submissions, not just logical capture calls. Split Vision
+    # can retain two distinct shapes yet replay three times per request.
+    if "wall_qwen35_opt" in extra:
+        expected_segments = (1, 1, 1) if extra["wall_qwen35_opt"] else (3, 3, 10)
+        for name, component, expected in zip(
+            ("vision", "base_prefill", "action"),
+            (vision, base_prefill, action), expected_segments,
+        ):
+            prior = {e["signature"]: e for e in (before.get(name) or {}).get("entries", [])}
+            launches = sum(
+                (e["replay_count"] - prior.get(e["signature"], {}).get("replay_count", 0))
+                * e["segment_count"]
+                for e in (after.get(name) or {}).get("entries", [])
+            )
+            component["physical_segments"] = launches
+            component["expected_physical_segments"] = expected
+            component["accepted"] &= launches == expected
     full_ready = bool(
         parity["accepted"]
         and action["accepted"]
@@ -1368,7 +1446,7 @@ def _ready_replay_admission(
             "Base Prefill did not replay a stable retained prefix bucket Graph"
         )
     if not action["accepted"]:
-        blockers.append("Action decoder did not prove ten stable replay calls")
+        blockers.append("Action did not prove the selected profile's stable replay/segment count")
     if not parity["accepted"]:
         blockers.append("warmup and measured action outputs are not exactly equal")
     return {
@@ -1535,8 +1613,12 @@ def main() -> int:
 
     from rpu_backend.api import WallQwen35Policy
 
+    opt = _configure_execution_runtime()
+    action_mode = "fp16_one_graph" if opt else "fp16_steps"
     if not args.check_config:
         _require_packed_vision_runtime()
+        _require_graph_budget_runtime()
+        _require_action_execution_runtime()
 
     # Exact checkpoint admission is intentionally completed before image decode
     # and before any irreversible model installation.
@@ -1638,14 +1720,35 @@ def main() -> int:
         "agent_pos_mask": MASK26.tolist(),
         "dof_mask": MASK26.tolist(),
         "controlled_evaluation": True,
+        "wall_qwen35_opt": opt,
+        "graph_plan": [1, 1, 1] if opt else [3, 3, 10],
+        "action_execution": {
+            "mode": action_mode,
+            "steps_per_graph": 10 if opt else 1,
+            "require_single_segment": True,
+            "time_ada_precompute": "cpu_fp32_then_fp16",
+        },
         "numeric_blocked_vision_opt_in": True,
         "vision_execution": {
-            "mode": "packed_spatial",
-            "images_per_graph": 3,
+            "mode": "packed_spatial" if opt else "per_image",
+            "images_per_graph": 3 if opt else 1,
             "attention_calls_per_layer": 3,
             "encoder_residual_reduce": "per_image_spans",
         },
         "cold_runtime_profile": {
+            "WALL_QWEN35_OPT": os.environ.get("WALL_QWEN35_OPT"),
+            "RPU_GRAPH_MAX_SEGMENT_ENTRIES": os.environ.get(
+                "RPU_GRAPH_MAX_SEGMENT_ENTRIES"
+            ),
+            "RPU_GRAPH_MAX_SEGMENT_COMMAND_MB": os.environ.get(
+                "RPU_GRAPH_MAX_SEGMENT_COMMAND_MB"
+            ),
+            "RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB": os.environ.get(
+                "RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB"
+            ),
+            "LKN_MAX_BATCH_ENTRIES": os.environ.get("LKN_MAX_BATCH_ENTRIES"),
+            "LKN_KD_BUF_MB": os.environ.get("LKN_KD_BUF_MB"),
+            "LKN_INSTR_BUF_MB": os.environ.get("LKN_INSTR_BUF_MB"),
             "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN": os.environ.get(
                 "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
             ),
@@ -1866,23 +1969,43 @@ def main() -> int:
             completed_requests = request_index + 1
             _validate_retained_graph_stats(
                 # Action fast replay is exact-prefix keyed. A changed prefix
-                # deliberately replaces the prior entry, so validate the ten
-                # calls represented by the current request rather than a
+                # deliberately replaces the prior entry, so validate the
+                # selected profile's calls in the current request rather than a
                 # cumulative count across evicted signatures.
-                "action", action_graph, calls=10
+                "action", action_graph,
+                calls=1 if opt else 10
             )
             _validate_retained_graph_stats(
-                "vision", vision_graph, calls=completed_requests
+                "vision", vision_graph, calls=completed_requests * (1 if opt else 3)
             )
             _validate_retained_graph_stats(
                 "base prefill", graph["base_prefill"], calls=completed_requests
             )
             print(
+                "[wall-qwen35-openloop] Action Graph: "
+                f"mode={action_mode}, entries={action_graph['size']}, "
+                f"segments={[entry['segment_count'] for entry in action_graph['entries']]}, "
+                f"replays={action_graph['replays']}, "
+                f"recaptures={action_graph['recaptures']}, "
+                f"invariant_ok={action_graph['invariant_ok']}",
+                flush=True,
+            )
+            print(
                 "[wall-qwen35-openloop] Vision Graph: "
                 f"entries={vision_graph['size']}, "
+                f"segments={[entry['segment_count'] for entry in vision_graph['entries']]}, "
                 f"replays={vision_graph['replays']}, "
                 f"recaptures={vision_graph['recaptures']}, "
                 f"invariant_ok={vision_graph['invariant_ok']}",
+                flush=True,
+            )
+            print(
+                "[wall-qwen35-openloop] Prefill Graph: "
+                f"entries={graph['base_prefill']['size']}, "
+                f"segments={[entry['segment_count'] for entry in graph['base_prefill']['entries']]}, "
+                f"replays={graph['base_prefill']['replays']}, "
+                f"recaptures={graph['base_prefill']['recaptures']}, "
+                f"invariant_ok={graph['base_prefill']['invariant_ok']}",
                 flush=True,
             )
             predictions_relative.append(relative)

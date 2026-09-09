@@ -185,8 +185,33 @@ before reduction. See
 
 ### Graph and replay
 
+Segment entry count is a host scheduling budget, not a token/chunk count.
+`RPU_GRAPH_MAX_SEGMENT_ENTRIES=32768` can remove entry-driven cuts for the
+controlled Wall prefill (about 24k nodes). It does not promise one segment:
+command/instruction footprints, queue-state changes and host callbacks can
+still split a Graph. Inspect actual segment counts and validate parity and
+replay before accepting an enlarged profile. `0` does not mean unlimited.
+Wall uses one cold switch, `WALL_QWEN35_OPT` (default `1`): enabled requests
+Vision1 + Prefill1 + Action1; `0` restores Vision3 + Prefill3 + Action10 on the
+recorded open-loop episode. Both modes use FP16 Action math with ACC32 GEMMs,
+not the historical FP32 host path. Independent per-stage options are removed.
+The switch owns and overrides all six Graph/SDK values: enabled
+32768 entries / 8 MiB command / 64 MiB instruction, SDK 65536 / 16 / 128;
+disabled 8192 / 4 / 32, SDK 65536 / 8 / 64. Start a fresh process to switch.
+Generic non-Wall defaults below are unchanged.
+Optimized Vision/Prefill and both Action modes use
+`GraphCache(require_single_segment=True)`: each invocation requires one
+physical segment under SDK-half bounded budgets, or fails before execution.
+The split Action invokes that one-step graph ten times. The larger Prefill
+budget changes segmentation, not arithmetic or SPM chunks; controlled evaluation
+still does not certify numerical/task-quality support.
+
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
+| `WALL_QWEN35_OPT` | `1`; `1/true/yes/on` or `0/false/no/off` (case-insensitive); empty/invalid fails | Wall policy binding / **MODEL** plus cold process budgets; fresh process | Unified Wall-only 1+1+1 versus recorded-episode 3+3+10 preset. Overrides all six Graph/SDK budget variables; FP16 Action math in both modes. |
+| `RPU_GRAPH_MAX_SEGMENT_ENTRIES` | `8192`; strict decimal integer `1..32768`; malformed/empty/zero fails | First native segment planning / **NATIVE**; fresh process after changes | Entry soft budget, clamped to half `LKN_MAX_BATCH_ENTRIES`. Other resource guards and DMA fences remain active. Larger batches require exact-profile board validation. |
+| `RPU_GRAPH_MAX_SEGMENT_COMMAND_MB` | `4`; strict decimal integer `1..8` | First native segment planning / **NATIVE** | Command soft budget in MiB, clamped to half `LKN_KD_BUF_MB`. The experimental Wall preset requests `8` with SDK capacity `16` MiB. A smaller SDK capacity can still force segmentation. |
+| `RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB` | `32`; strict decimal integer `1..64` | First native segment planning / **NATIVE** | Instruction soft budget in MiB, clamped to half `LKN_INSTR_BUF_MB`. The experimental Wall preset requests `64` with SDK capacity `128` MiB. Larger capacities can increase host-side batch memory; no operator math or SPM chunk topology changes. |
 | `RPU_DEEP_FAST_REPLAY` | Off; any non-empty value whose first character is not `0` enables | Fused-handle construction / **MODEL** | Skips audited setup work on full-body replay. A profile must prove every skipped input/layout remains valid. |
 | `RPU_FASTREPLAY_SKIP_SYNC` | Off; non-empty value not starting with `0` enables | Graph BUILD / **BUILD** | Skips a redundant mutable-parameter scan only for a fully skipped replay. Wrong use can replay stale parameters. |
 | `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN` | Off; exact `1`, `true`, `True`, or `on` enables | First native coexistence use / **NATIVE** | Retains a persistent SPM generation across profile-owned subsystem handoff. Wrong ownership can corrupt later execution. |

@@ -449,7 +449,7 @@ max_new_tokens = 1
 
 def test_runtime_configuration_covers_source_environment_readers() -> None:
     pattern = re.compile(
-        r'["\']((?:RPU|QWEN3|LKN|WALL_OSS|HF|HUGGINGFACE)_[A-Z0-9_]+)["\']'
+        r'["\']((?:RPU|QWEN3|LKN|WALL_OSS|WALL_QWEN35|HF|HUGGINGFACE)_[A-Z0-9_]+)["\']'
     )
     source_names = set()
     for base in (ROOT / "python" / "rpu_backend", ROOT / "src"):

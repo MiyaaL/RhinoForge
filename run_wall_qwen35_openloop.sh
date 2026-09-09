@@ -14,6 +14,7 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 MAX_REQUESTS="${MAX_REQUESTS:-${MAX_EVENTS:-0}}"
 NOISE_SEED="${NOISE_SEED:-${SEED:-3407}}"
 FLOW_NOISE="${FLOW_NOISE:-}"
+WALL_QWEN35_OPT="${WALL_QWEN35_OPT-1}"
 RUN_WITH_SUDO="${RUN_WITH_SUDO:-1}"
 TORCH_PROFILE="${TORCH_PROFILE:-0}"
 TORCH_PROFILE_OUTPUT="${TORCH_PROFILE_OUTPUT:-}"
@@ -41,11 +42,18 @@ events into 32-step chunks, never crosses an event boundary, samples the three
 camera frames at each chunk start, and compares decoded RPU predictions with
 the recorded master-arm absolute trajectory. It never commands a robot.
 
-Vision defaults to one Graph for all three images (shared dense operations,
-three isolated attention calls per layer, per-image residual reductions).
-No extra enable flag is needed. Rebuild/reinstall the matching Python/native
+WALL_QWEN35_OPT=1 (default): Vision 1 + Language/Prefill 1 + Action 1 Graph.
+WALL_QWEN35_OPT=0: Vision 3 + Language/Prefill 3 + Action 10 Graphs on this episode.
+Both arms use FP16 Action I/O/Euler with FP32 GEMM accumulation; time/Ada
+conditioning remains a one-time CPU FP32 precompute. Only Graph organization
+changes. Packed Vision retains three isolated attentions per layer.
+The switch owns all six Graph/SDK budget settings, overriding individual values:
+  enabled: 32768 / 8 / 64 MiB, SDK 65536 / 16 / 128 MiB;
+  disabled: 8192 / 4 / 32 MiB, SDK 65536 / 8 / 64 MiB.
+Start a fresh process to switch. Rebuild/reinstall the matching Python/native
 package after source changes: python -m pip install . --no-build-isolation
-The runner rejects an old package/native ABI before loading model weights.
+The runner rejects stale packages before weight loading. This remains a
+controlled evaluation, not a numerical/task-quality support certification.
 
 Options:
       --dataset-dir PATH       Recorded flat episode directory.
@@ -90,7 +98,7 @@ Options:
 Environment overrides:
   ENV_SH, DATASET_DIR, CHECKPOINT_PATH, OUTPUT_DIR, INSTRUCTION_SOURCE, ROBOT_ID,
   NORM_KEY, NUM_INFERENCE_STEPS, MAX_REQUESTS/MAX_EVENTS, NOISE_SEED/SEED,
-  FLOW_NOISE,
+  FLOW_NOISE, WALL_QWEN35_OPT (default 1; set 0 for 3+3+10),
   RUN_WITH_SUDO, TORCH_PROFILE, TORCH_PROFILE_OUTPUT, TORCH_PROFILE_DIR,
   TORCH_PROFILE_RECORD_SHAPES, TORCH_PROFILE_MEMORY, TORCH_PROFILE_WITH_STACK,
   HW_PERF, HW_PERF_OUTPUT, HW_PERF_MAX_DUMPS, LKN_RPU_FREQ_MHZ,
@@ -98,6 +106,7 @@ Environment overrides:
   RPU_KERNEL_LIB_PATH, RHINO_LAUNCH_LIB_DIR, RUN_ID.
 
 Examples:
+  WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1
   bash run_wall_qwen35_openloop.sh --check
   bash run_wall_qwen35_openloop.sh --max-requests 1
   bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
@@ -313,6 +322,25 @@ while (($#)); do
     esac
 done
 
+normalize_bool WALL_QWEN35_OPT WALL_QWEN35_OPT "$WALL_QWEN35_OPT"
+# One cold preset owns every Graph/SDK budget. Do not inherit stale per-stage
+# overrides from a previous experiment. Keep in sync with wall_qwen35/execution.py.
+SDK_MAX_BATCH_ENTRIES=65536
+if ((WALL_QWEN35_OPT)); then
+    GRAPH_MAX_SEGMENT_ENTRIES=32768
+    GRAPH_MAX_SEGMENT_COMMAND_MB=8
+    GRAPH_MAX_SEGMENT_INSTRUCTION_MB=64
+    SDK_KD_BUF_MB=16
+    SDK_INSTR_BUF_MB=128
+    GRAPH_PLAN='1+1+1 (Vision+Prefill+Action)'
+else
+    GRAPH_MAX_SEGMENT_ENTRIES=8192
+    GRAPH_MAX_SEGMENT_COMMAND_MB=4
+    GRAPH_MAX_SEGMENT_INSTRUCTION_MB=32
+    SDK_KD_BUF_MB=8
+    SDK_INSTR_BUF_MB=64
+    GRAPH_PLAN='3+3+10 (Vision+Prefill+Action)'
+fi
 [[ "$MAX_REQUESTS" =~ ^[0-9]+$ ]] \
     || fatal "--max-requests must be a non-negative integer: $MAX_REQUESTS"
 [[ "$NOISE_SEED" =~ ^[0-9]+$ ]] \
@@ -460,6 +488,9 @@ if ((hw_perf_enabled)); then
 fi
 
 printf '%s\n' '[wall-qwen35-openloop] configuration'
+printf '  %-22s %s\n' 'WALL_QWEN35_OPT:' "$WALL_QWEN35_OPT"
+printf '  %-22s %s\n' 'Graph plan:' "$GRAPH_PLAN"
+printf '  %-22s %s\n' 'Action precision:' 'FP16 I/O/Euler, ACC32 GEMM'
 printf '  %-22s %s\n' 'environment:' "$ENV_SH"
 printf '  %-22s %s\n' 'Python:' "$PYTHON_BIN"
 printf '  %-22s %s\n' 'checkpoint:' "$CHECKPOINT_PATH"
@@ -468,7 +499,15 @@ printf '  %-22s %s\n' 'instruction source:' "$INSTRUCTION_SOURCE"
 printf '  %-22s %s\n' 'robot id:' "$ROBOT_ID"
 printf '  %-22s %s\n' 'normalizer:' "$NORM_KEY"
 printf '  %-22s %s\n' 'inference steps:' "$NUM_INFERENCE_STEPS"
-printf '  %-22s %s\n' 'Vision mode:' '3 images -> 1 Graph (per-image attention/reduction)'
+printf '  %-22s %s\n' 'Graph segment entries:' "$GRAPH_MAX_SEGMENT_ENTRIES"
+printf '  %-22s %s / %s MiB\n' 'Graph command/instr:' "$GRAPH_MAX_SEGMENT_COMMAND_MB" "$GRAPH_MAX_SEGMENT_INSTRUCTION_MB"
+printf '  %-22s %s / %s MiB\n' 'SDK command/instr:' "$SDK_KD_BUF_MB" "$SDK_INSTR_BUF_MB"
+printf '  %-22s %s\n' 'SDK max entries:' "$SDK_MAX_BATCH_ENTRIES"
+if ((10#$GRAPH_MAX_SEGMENT_ENTRIES > 8192 \
+    || 10#$GRAPH_MAX_SEGMENT_COMMAND_MB > 4 \
+    || 10#$GRAPH_MAX_SEGMENT_INSTRUCTION_MB > 32)); then
+    printf '%s\n' '[wall-qwen35-openloop] WARNING: experimental Graph budget; numerical parity pending'
+fi
 printf '  %-22s %s\n' 'max requests:' "$([[ $MAX_REQUESTS == 0 ]] && printf all || printf '%s' "$MAX_REQUESTS")"
 if [[ -n "$FLOW_NOISE" ]]; then
     printf '  %-22s %s\n' 'noise seed base:' 'ignored (explicit flow noise)'
@@ -505,6 +544,7 @@ printf '  %-22s %s\n' 'mode:' "$([[ $check_only == 1 ]] && printf check || print
 printf '  %-22s %s\n' 'output:' "$([[ $check_only == 1 ]] && printf none || printf '%s' "$OUTPUT_DIR")"
 
 ENV_ARGS=(
+    "WALL_QWEN35_OPT=$WALL_QWEN35_OPT"
     "PATH=$CONDA_PREFIX/bin:$PATH"
     "LD_LIBRARY_PATH=$RUNTIME_LD_LIBRARY_PATH"
     "RPU_KERNEL_LIB_PATH=$RPU_KERNEL_LIB_PATH"
@@ -513,6 +553,12 @@ ENV_ARGS=(
     "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN=1"
     "RPU_QWEN35_WALL_FUSED_SILU_MUL=$WALL_FUSED_SILU_MUL"
     "RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE=$WALL_PREREDUCE_RESIDUAL_GATE"
+    "RPU_GRAPH_MAX_SEGMENT_ENTRIES=$GRAPH_MAX_SEGMENT_ENTRIES"
+    "RPU_GRAPH_MAX_SEGMENT_COMMAND_MB=$GRAPH_MAX_SEGMENT_COMMAND_MB"
+    "RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB=$GRAPH_MAX_SEGMENT_INSTRUCTION_MB"
+    "LKN_MAX_BATCH_ENTRIES=$SDK_MAX_BATCH_ENTRIES"
+    "LKN_KD_BUF_MB=$SDK_KD_BUF_MB"
+    "LKN_INSTR_BUF_MB=$SDK_INSTR_BUF_MB"
     "PYTHONUNBUFFERED=1"
     "TOKENIZERS_PARALLELISM=false"
     "TRANSFORMERS_OFFLINE=1"

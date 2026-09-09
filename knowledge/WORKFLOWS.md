@@ -23,6 +23,20 @@ release-matched operator asset is unavailable.
 
 ## Add or update knowledge
 
+When merging Graph segments, record the node, command and instruction census
+before changing budgets. Preserve stream fences and SDK headroom, and verify
+same-input parity plus stable replay in a fresh process. A single GraphCache
+entry is not proof of a single device submission; use the segment counters and
+the [capture concept](concepts/graphcache-capture.md).
+For a multi-step Action merge, separately validate same-dtype split/unrolled
+execution and any intentional FP32-to-FP16 downgrade. Use A/B/A with changed
+noise, padding and prefix contents to detect stale mutable inputs; keep public
+outputs independently owned. Wall uses only `WALL_QWEN35_OPT`: default `1`
+selects Vision1 + Prefill1 + Action1; `0` restores 3+3+10 on the recorded episode.
+Both arms use FP16 Action math. The switch owns all six cold Graph/SDK budgets;
+verify both physical submission counts and the loaded package ABI. Historical
+FP32 measurements remain precision anchors, not a selectable runtime profile.
+
 1. Confirm the statement in public source or documentation.
 2. Update the existing page that owns the fact; create a page only for a new,
    reusable concept.

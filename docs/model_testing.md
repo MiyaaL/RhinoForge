@@ -157,6 +157,37 @@ READY summary's numerical gate; one Vision Graph is not a whole-policy
 READY or quality certification. Graph details are in `segments.json`, and
 `meta.json` records the package/native identities and `vision_execution` mode.
 
+The unified cold switch is `WALL_QWEN35_OPT` (default `1`). No per-stage CLI
+flags are needed:
+
+```bash
+# Vision 1 + Language/Prefill 1 + Action 1
+bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+
+# Vision 3 + Language/Prefill 3 + Action 10 on this recorded episode
+WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+```
+
+Both modes use FP16 Action projections/Euler with ACC32 GEMMs and one-time CPU
+FP32 time/Ada precomputation. Disabling optimization changes Graph organization,
+not precision; it does not restore the historical FP32 host path. The former
+`--language-one-graph` and `--action-execution` options are removed.
+
+The switch overrides all six Graph/SDK budget environment values: enabled uses
+32768 entries / 8 MiB command / 64 MiB instruction with SDK capacities
+65536 / 16 MiB / 128 MiB; disabled uses 8192 / 4 / 32 with SDK 65536 / 8 / 64.
+Generic non-Wall defaults are unchanged. Use a fresh process to change modes.
+
+Count physical segments, not cache entries. Optimized Vision, Prefill and Action
+require one physical segment per Graph; the split Action reuses one single-step
+Graph ten times, and split Vision retains separate camera shapes. READY admission
+checks 3 versus 16 physical submissions as well as stable replay and same-input
+output parity. Cold priming/BUILD is excluded. Other input envelopes can produce
+different conservative Prefill segment counts; the `3+3+10` check is for this
+runner's recorded episode. Metadata records the switch, plan and effective budgets.
+Stale Python/native packages fail before loading. Compare outputs with the same
+`--flow-noise`; these controlled paths are not release-quality certifications.
+
 The encoder retains per-image AllReduce boundaries inside the single Graph:
 GEMMs are packed, each layer has three isolated attention calls, and its two
 residual reductions each use three image spans. Changing ring geometry by

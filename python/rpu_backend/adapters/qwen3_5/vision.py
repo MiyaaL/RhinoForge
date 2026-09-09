@@ -706,7 +706,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
     # conversion so malformed values leave a clean, retryable CPU model.
     graph_max_entries = _parse_vision_graph_max_entries()
     vision_graph_cache = rpu_backend.graph.GraphCache(
-        max_entries=graph_max_entries
+        max_entries=graph_max_entries, require_single_segment=packed_spatial
     )
     if not hasattr(vision_model, "_rpu_qwen3_5_original_forward"):
         model_vars = vars(vision_model)

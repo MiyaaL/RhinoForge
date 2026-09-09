@@ -14,6 +14,10 @@ namespace py = pybind11;
 namespace graph_pybind {
 
 void add_bindings(py::module_& m) {
+    // Runner capability guard: older extensions silently ignore the
+    // bounded segment-budget environment controls.
+    m.attr("graph_segment_budget_abi") = py::int_(1);
+    m.attr("graph_single_segment_abi") = py::int_(1);
     // GraphSignature admission-key fields.
     py::class_<GraphSignature>(m, "GraphSignature")
         .def(py::init<>())
@@ -125,7 +129,8 @@ void add_bindings(py::module_& m) {
     // GraphCache co-owns returned Graph objects with Python.
     py::class_<RpuGraphCache>(m, "GraphCache")
         .def(py::init<>())
-        .def(py::init<size_t>(), py::arg("max_entries"))
+        .def(py::init<size_t, bool>(), py::arg("max_entries"),
+             py::arg("require_single_segment") = false)
         .def("get_or_create",
              [](RpuGraphCache& self, const GraphSignature& sig) {
                  return self.lookup_shared(sig)

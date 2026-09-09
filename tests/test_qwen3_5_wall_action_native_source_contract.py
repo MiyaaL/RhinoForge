@@ -106,18 +106,21 @@ def test_wall_identity_attention_and_mlp_gate_before_residual_add():
     assert "wall_action_mode_ && !wall_prereduce_gate" in attention
 
 
-def test_wall_rejects_native_io_and_set_weights_clears_mode():
+def test_wall_fp16_io_is_exact_and_set_weights_clears_mode():
     io_setter = _section(
         "void Qwen3_5Model::set_action_io_weights(",
         "int64_t Qwen3_5Model::resolve_prefill_chunk_size(",
     )
-    assert "!wall_action_mode_" in io_setter
+    assert "action_dim == 26 && action_dim_pad == 64 && action_len == 32" in io_setter
 
     action_step = _section(
         "at::Tensor Qwen3_5Model::forward_action_step(",
         "// ── forward: stash GDN state",
     )
-    assert "!wall_action_mode_" in action_step
+    assert "Wall identity layers require zero prefix" in action_step
+    assert "euler_scale == c10::Half(0.0999f)" in action_step
+    assert "padding_velocity.sizes() == action.sizes()" in action_step
+    assert "wall_action_mode_ ? delta_t : -delta_t" in action_step
 
     setup = _section(
         "void Qwen3_5Model::set_weights(",

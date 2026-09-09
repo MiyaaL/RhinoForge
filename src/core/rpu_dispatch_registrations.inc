@@ -99,6 +99,7 @@ TORCH_LIBRARY(rpu, m) {
   m.def("qwen3_5_set_action_io_weights(int handle, Tensor input_w, Tensor input_b, Tensor output_w, Tensor output_b, int action_dim, int action_dim_pad, int action_len) -> ()");
   m.def("qwen3_5_action_forward(int handle, Tensor hidden_states, Tensor adaptive_mod, Tensor[] k_caches, Tensor[] v_caches, int[] prefix_lens) -> Tensor");
   m.def("qwen3_5_action_step_forward(int handle, Tensor action, Tensor action_keep_mask, Tensor(a!) action_out, float delta_t, Tensor adaptive_mod, Tensor[] k_caches, Tensor[] v_caches, int[] prefix_lens, int num_steps) -> Tensor");
+  m.def("qwen3_5_wall_action_loop(int handle, Tensor action, Tensor keep_mask, Tensor padding_velocity, Tensor(a!) action_out, float delta_t, Tensor adaptive_mod, Tensor[] k_caches, Tensor[] v_caches, int[] prefix_lens, int num_steps) -> Tensor(a!)");
   m.def("qwen3_5_resolve_prefill_chunk_size",
         TORCH_FN(rpu_qwen3_5_resolve_prefill_chunk_size));
   // Resolved chunk_size getter (int -> int, DEFAULT block only — no device dispatch, same as
@@ -745,6 +746,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   m.impl("qwen3_5_action_forward", TORCH_FN(rpu_qwen3_5_action_forward));
   m.impl("qwen3_5_set_action_io_weights", TORCH_FN(rpu_qwen3_5_set_action_io_weights));
   m.impl("qwen3_5_action_step_forward", TORCH_FN(rpu_qwen3_5_action_step_forward));
+  m.impl("qwen3_5_wall_action_loop", TORCH_FN(rpu_qwen3_5_wall_action_loop));
   m.impl("qwen3_5_set_prefill_rope", TORCH_FN(rpu_qwen3_5_set_prefill_rope));
   m.impl("causal_decoder_set_lm_head", TORCH_FN(rpu_causal_decoder_set_lm_head));
   m.impl("lm_head_logits_top1", TORCH_FN(rpu_lm_head_logits_top1));
@@ -909,6 +911,7 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("qwen3_5_action_forward", torch::CppFunction::makeFallthrough());
   m.impl("qwen3_5_set_action_io_weights", torch::CppFunction::makeFallthrough());
   m.impl("qwen3_5_action_step_forward", torch::CppFunction::makeFallthrough());
+  m.impl("qwen3_5_wall_action_loop", torch::CppFunction::makeFallthrough());
   m.impl("qwen3_5_set_prefill_rope", torch::CppFunction::makeFallthrough());
   m.impl("causal_decoder_set_lm_head", torch::CppFunction::makeFallthrough());
   m.impl("lm_head_logits_top1", torch::CppFunction::makeFallthrough());

@@ -200,7 +200,7 @@ RpuKernelGraph& RpuGraphCache::get_or_create(const GraphSignature& sig) {
                 "); manual evict() required");
 
     RpuGraphCacheEntry entry;
-    entry.graph = make_registered_rpu_kernel_graph();
+    entry.graph = make_registered_rpu_kernel_graph(require_single_segment_);
     entry.signature = sig;
     auto [ins_it, inserted] = entries_.emplace(sig, std::move(entry));
     if (inserted) {

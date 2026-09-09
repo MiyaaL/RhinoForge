@@ -152,6 +152,8 @@ class WallQwen35Policy:
             raise ValueError(
                 "WallQwen35Policy allow_numeric_blocked_vision must be bool"
             )
+        from rpu_backend.adapters.wall_qwen35.execution import resolve_wall_qwen35_opt
+        opt = resolve_wall_qwen35_opt()
 
         checkpoint_path = Path(checkpoint).expanduser().resolve()
         from rpu_backend.adapters.wall_qwen35.checkpoint import (
@@ -167,6 +169,7 @@ class WallQwen35Policy:
         instance._camera_names = _CAMERA_NAMES
         instance._max_seq_len = _MAX_SEQ_LEN
         instance._allow_numeric_blocked_vision = allow_numeric_blocked_vision
+        instance._wall_qwen35_opt = opt
         instance._runtime = None
         instance._install_started = False
         instance._closed = False
@@ -207,6 +210,10 @@ class WallQwen35Policy:
                 "allow_numeric_blocked_vision=True for controlled evaluation."
             )
 
+        from rpu_backend.adapters.wall_qwen35.execution import configure_wall_qwen35_execution
+        from rpu_backend.adapters.wall_qwen35.action import require_wall_fp16_loop_runtime
+        configure_wall_qwen35_execution(self._wall_qwen35_opt)
+        require_wall_fp16_loop_runtime()
         self._install_started = True
         from rpu_backend.adapters.wall_qwen35.runtime import WallQwen35Runtime
 
@@ -218,6 +225,7 @@ class WallQwen35Policy:
             camera_names=self._camera_names,
             max_seq_len=self._max_seq_len,
             allow_numeric_blocked_vision=True,
+            wall_qwen35_opt=self._wall_qwen35_opt,
         )
         self._runtime = runtime.to("rpu")
         return self

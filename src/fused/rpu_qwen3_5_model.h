@@ -130,10 +130,12 @@ public:
         std::vector<at::Tensor>& k_caches,
         std::vector<at::Tensor>& v_caches,
         at::IntArrayRef prefix_lens,
-        int64_t num_steps);
+        int64_t num_steps,
+        const at::Tensor& padding_velocity = at::Tensor());
     int64_t resolve_prefill_chunk_size(int64_t execution_len);
 
 protected:
+    int64_t subclass_layout_hash() const override;
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override;
     ModelStaticConfig       static_config() override;
     ModelDynamicConfig      dynamic_config(const ChunkPlan& plan) override;
@@ -253,6 +255,8 @@ private:
     at::Tensor                 action_hidden_stage_, action_velocity_stage_;
     at::Tensor                 action_input_ref_, action_keep_mask_ref_;
     at::Tensor                 action_output_ref_;
+    at::Tensor                 action_padding_velocity_ref_;
+    uint64_t                   action_padding_velocity_live_base_ = 0;
     uint64_t                   action_input_live_base_ = 0;
     uint64_t                   action_keep_mask_live_base_ = 0;
     uint64_t                   action_output_live_base_ = 0;

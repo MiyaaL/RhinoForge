@@ -1298,9 +1298,10 @@ RpuKernelGraph::LifetimeRetirementSentinel::~LifetimeRetirementSentinel() {
     mark_retained_physical_graph_evicted_noexcept(lifetime_id);
 }
 
-RpuKernelGraph::RpuKernelGraph()
+RpuKernelGraph::RpuKernelGraph(bool require_single_segment)
     : lifetime_retirement_(next_graph_lifetime_id()),
-      graph_lifetime_id_(lifetime_retirement_.lifetime_id) {}
+      graph_lifetime_id_(lifetime_retirement_.lifetime_id),
+      require_single_segment_(require_single_segment) {}
 
 RpuKernelGraph::~RpuKernelGraph() = default;
 
@@ -1450,7 +1451,10 @@ void append_segment_summary(std::ostringstream& out, const Segment& segment) {
     append_values(out, segment.core_ids);
     out << " broadcast=" << (segment.queue_state.broadcast_mode ? 1 : 0)
         << " flush_icache=" << (segment.queue_state.flush_icache ? 1 : 0)
-        << " replay_count=" << segment.replay_count;
+        << " replay_count=" << segment.replay_count
+        << " entries=" << segment.entry_count
+        << " command_bytes=" << segment.command_bytes
+        << " instruction_bytes=" << segment.instruction_bytes;
 }
 
 }  // namespace
@@ -1921,8 +1925,8 @@ RpuExecutionGraphInvalidationGuard::~RpuExecutionGraphInvalidationGuard() {
     }
 }
 
-std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph() {
-    auto graph = std::make_shared<RpuKernelGraph>();
+std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(bool require_single_segment) {
+    auto graph = std::make_shared<RpuKernelGraph>(require_single_segment);
     auto& registry = registered_graph_registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
     registry.graphs.emplace_back(graph);
@@ -2732,6 +2736,8 @@ void RpuKernelGraph::check_foreign_graph_execution_allowed(
         return;
     }
     const RpuKernelGraph* outer = active_stack_.back();
+    TORCH_CHECK(!outer->require_single_segment_, operation,
+                " is forbidden inside a single-segment Graph scope");
     TORCH_CHECK(
         !outer->has_semantic_dma_nodes_ &&
             !outer->has_semantic_spm_producer_yield_nodes_ &&
@@ -3017,6 +3023,8 @@ void RpuKernelGraph::end() {
 
     switch (state_) {
     case State::RECORDING:
+        TORCH_CHECK(!require_single_segment_ || !nodes_.empty(),
+                    "Single-segment Graph cannot be empty");
         if (nodes_.empty()) {
             // 空 capture（整个 scope 没提交任何 kernel）→ 直接落回 PASSTHROUGH
             pending_signature_.reset();

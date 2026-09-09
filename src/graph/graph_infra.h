@@ -558,7 +558,8 @@ struct RpuGraphCacheEntry {
 class RpuGraphCache {
 public:
     RpuGraphCache() = default;
-    explicit RpuGraphCache(size_t max_entries) : max_entries_(max_entries) {}
+    explicit RpuGraphCache(size_t max_entries, bool require_single_segment = false)
+        : max_entries_(max_entries), require_single_segment_(require_single_segment) {}
 
     RpuKernelGraph& get_or_create(const GraphSignature& sig);
     RpuKernelGraph* lookup(const GraphSignature& sig);
@@ -632,6 +633,7 @@ private:
     std::unordered_map<int64_t, std::map<uint64_t, std::vector<GraphSignature>>>
         by_gm_branch_;
     size_t max_entries_ = std::numeric_limits<size_t>::max();
+    const bool require_single_segment_ = false;
 };
 
 RpuGraphCache& default_graph_cache();

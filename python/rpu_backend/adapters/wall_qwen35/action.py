@@ -1,15 +1,17 @@
 """Exact-checkpoint Wall Qwen3.5 action decoder.
 
-The first Wall port intentionally keeps action I/O, time conditioning, AdaLN
-projection, output projection, and Euler integration in host FP32.  Only the
-24-layer decoder shell runs on RPU.  The shell is presented to the existing
+The FP16 loop moves action I/O and all ten Euler updates onto RPU, using FP16
+operands/results with ACC32 GEMMs. Time/Ada conditioning is precomputed once
+in host FP32 and uploaded in FP16. Both Graph arms use these same semantics;
+the host FP32 helpers below remain numerical references only. The shell uses the existing
 Qwen3.5 installer as all-full attention; Wall native mode then executes the six
 checkpoint attention layers and treats the remaining token mixers as identity
 branches while retaining every checkpoint MLP.
 
 Scale-4 has one owner at each physical boundary:
 
-* the raw host ``w1`` result is divided by four immediately before FP16 upload;
+* ``w1`` is divided by four exactly once, after GEMM (FP16 loop) or immediately
+  before upload (decoder-only reference helper);
 * AdaLN rows are packed as ``[1 + scale, shift, gate / 4]`` in FP32 and the
   complete row is cast once to FP16;
 * the native Wall mode uses ``rms_norm_eps / 16`` for adaptive RMSNorm.
@@ -20,6 +22,7 @@ No other input, output, or Euler helper applies scale-4.
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 import types
@@ -59,6 +62,7 @@ _FULL_LAYER_SET = frozenset(_FULL_LAYERS)
 _MODULATION_ROWS = 2 * ACTION_NUM_LAYERS + 1
 _MODULATION_WIDTH = 3 * ACTION_HIDDEN_SIZE
 _ACTION_INSTALL_LOCK = threading.Lock()
+_ACTION_PACKED_DIM = 64
 _NORMALIZER_RE = re.compile(
     r"^model\.action_processor\.normalizer_(action|propri)\."
     r"(min|delta)\.(.+)$"
@@ -700,14 +704,20 @@ def patch_wall_qwen35_action_for_rpu(
     expert: WallQwen35ActionModule,
     *,
     max_seq_len: int = ACTION_MAX_SEQ_LEN,
+    one_graph: bool = True,
 ) -> WallQwen35ActionModule:
     """Install the exact decoder shell and select native Wall action mode."""
 
     if not isinstance(expert, WallQwen35ActionModule):
         raise TypeError("Wall action patch requires WallQwen35ActionModule")
+    if type(one_graph) is not bool:
+        raise ValueError("one_graph must be bool")
+    require_wall_fp16_loop_runtime()
     if getattr(expert, "_wall_qwen35_action_ready", False):
         state = getattr(expert, "_rpu_qwen3_5", None)
         if state is not None and getattr(state, "action_graph_cache", None) is not None:
+            if state.action_one_graph != one_graph:
+                raise RuntimeError("Action execution cannot change after installation")
             return expert
         raise RuntimeError("Wall action ready marker has incomplete runtime state")
     if getattr(expert, "_wall_qwen35_install_started", False):
@@ -726,6 +736,7 @@ def patch_wall_qwen35_action_for_rpu(
         for parameter in expert.parameters()
     ):
         raise ValueError("Wall action shell parameters must be clean CPU FP16")
+    io_weights = _wall_fp16_io_weights(expert)
     if not _ACTION_INSTALL_LOCK.acquire(blocking=False):
         raise RuntimeError("another Wall action installation is in progress")
 
@@ -753,11 +764,27 @@ def patch_wall_qwen35_action_for_rpu(
         import rpu_backend as rpu_backend
 
         state = expert._rpu_qwen3_5
+        state.action_one_graph = one_graph
+        from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight
+
+        input_w, output_w = io_weights
+        state.action_io_keepalive = (
+            tp_col_swizzle_mc_weight(input_w, num_cores=1).contiguous().to("rpu"),
+            torch.zeros(ACTION_HIDDEN_SIZE, dtype=torch.float16).to("rpu"),
+            tp_col_swizzle_mc_weight(output_w, num_cores=1).contiguous().to("rpu"),
+            torch.zeros(_ACTION_PACKED_DIM, dtype=torch.float16).to("rpu"),
+        )
+        torch.ops.rpu.qwen3_5_set_action_io_weights(
+            handle, *state.action_io_keepalive,
+            ACTION_DIM, _ACTION_PACKED_DIM, ACTION_HORIZON,
+        )
         # Action fast replay bakes the real prefix into KV-insert and SDPA
         # registers. Keep one exact-prefix signature and rebuild on a prefix
         # change; hiding the real length behind the text execution bucket would
         # replay stale insertion positions and attention lengths.
-        state.action_graph_cache = rpu_backend.graph.GraphCache(max_entries=1)
+        state.action_graph_cache = rpu_backend.graph.GraphCache(
+            max_entries=1, require_single_segment=True
+        )
         state.action_cache = Qwen3_5Cache.from_config(
             expert.config,
             max_seq_len=int(max_seq_len),
@@ -775,6 +802,7 @@ def patch_wall_qwen35_action_for_rpu(
         state.action_prefix_len = None
         state.action_rope_cache = None
         state.action_modulation_cache = {}
+        state.action_loop_modulation = None
         state.action_graph_signature = None
         _drop_installed_shell_weights(expert)
         expert._wall_qwen35_action_ready = True
@@ -972,6 +1000,146 @@ def _adaptive_modulation(
     if len(state.action_modulation_cache) < ACTION_NUM_STEPS:
         state.action_modulation_cache[key] = modulation
     return modulation
+
+
+def require_wall_fp16_loop_runtime() -> None:
+    """Reject stale native packages before loading/transforming model weights."""
+    import rpu_backend
+
+    if (getattr(getattr(rpu_backend, "_cpp_ext", None), "graph_single_segment_abi", 0) != 1
+            or not hasattr(torch.ops.rpu, "qwen3_5_wall_action_loop")):
+        raise RuntimeError(
+            "FP16 Wall Action loop requires a rebuilt Python/native RhinoForge package "
+            "with qwen3_5_wall_action_loop and single-segment Graph support"
+        )
+    for name, default, minimum, maximum in (
+        ("LKN_MAX_BATCH_ENTRIES", 65536, 65536, 4194304),
+        ("LKN_KD_BUF_MB", 8, 8, 256),
+        ("LKN_INSTR_BUF_MB", 64, 64, 1024),
+    ):
+        value = os.environ.get(name, str(default))
+        if (not value.isascii() or not value.isdecimal()
+                or not minimum <= int(value) <= maximum):
+            raise RuntimeError(
+                f"Wall FP16 loop requires cold {name} in [{minimum},{maximum}]; "
+                "use run_wall_qwen35_openloop.sh or set it before starting Python"
+            )
+
+
+def _finite_half(value: torch.Tensor, name: str) -> torch.Tensor:
+    result = value.detach().to(device="cpu", dtype=torch.float16).contiguous()
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError(f"{name} is not finite after FP16 conversion")
+    return result
+
+
+def _wall_fp16_io_weights(expert) -> tuple[torch.Tensor, torch.Tensor]:
+    processor = _processor(expert)
+    wi = _cpu_fp32(processor.w1.weight, "Wall w1", (1024, 52))
+    wo = _cpu_fp32(processor.action_proj_back.weight, "Wall projection", (26, 1024))
+    if processor.w1.bias is not None or processor.action_proj_back.bias is not None:
+        raise ValueError("Wall FP16 I/O profile requires bias-free projections")
+    # Preserve the /4 as a separate post-GEMM FP16 operation, not a weight fold.
+    return (F.pad(_finite_half(wi, "Wall w1"), (0, 12)),
+            F.pad(_finite_half(wo, "Wall projection"), (0, 0, 0, 38)))
+
+
+def _pack_wall_fp16_loop_inputs(action, dof_mask, padding_velocity):
+    action, mask, padding_velocity = validate_wall_qwen35_euler_profile(
+        action, dof_mask, padding_velocity
+    )
+    action = _finite_half(action, "Wall action")
+    mask = mask.half()
+    padding = _finite_half(padding_velocity, "Wall padding velocity")
+    packed = F.pad(torch.cat((action, mask.expand_as(action)), dim=-1), (0, 12))
+    keep = F.pad(mask.reshape(26), (0, 38))
+    padding = F.pad(padding * (1 - mask), (0, 38))
+    return packed.contiguous(), keep.contiguous(), padding.contiguous()
+
+
+def _wall_fp16_times() -> tuple[torch.Tensor, float]:
+    times = torch.linspace(0.0, 1.0, 11, dtype=torch.float32) * 0.999
+    steps = (times[1:] - times[:-1]).half()
+    if not bool(steps.eq(steps[0]).all()) or float(steps[0]) <= 0:
+        raise RuntimeError("Wall FP16 Euler schedule is not a uniform positive dt")
+    return times, float(steps[0])
+
+
+def _wall_loop_modulation(expert):
+    state = expert._rpu_qwen3_5
+    if state.action_loop_modulation is None:
+        times, _ = _wall_fp16_times()
+        rows = [_adaptive_modulation_cpu(
+            expert, wall_qwen35_host_time_condition(expert, times[i:i + 1])
+        ) for i in range(ACTION_NUM_STEPS)]
+        state.action_loop_modulation = _finite_half(
+            torch.stack(rows), "Wall time/Ada modulation"
+        ).to("rpu")
+    return state.action_loop_modulation
+
+
+def run_wall_qwen35_action_loop(
+    expert, *, action, dof_mask, padding_velocity, position_ids, prefix_cache,
+    prefix_len: int,
+) -> torch.Tensor:
+    """Ten FP16 steps in one Graph or ten one-step calls; fresh CPU FP32 result.
+
+    Time/Ada projections are precomputed in CPU FP32 once and uploaded in FP16.
+    GEMMs use half inputs/weights, ACC32, and half outputs. Euler uses separate
+    half mask/add/multiply/add operations, with no host step boundary.
+    """
+    if not getattr(expert, "_wall_qwen35_action_ready", False) or expert.training:
+        raise RuntimeError("install an inference-only Wall action module first")
+    state = expert._rpu_qwen3_5
+    steps_per_graph = ACTION_NUM_STEPS if state.action_one_graph else 1
+    if (isinstance(prefix_len, bool) or not isinstance(prefix_len, Integral)
+            or not 1 <= prefix_len <= ACTION_MAX_PREFIX_LEN):
+        raise ValueError("Wall action prefix_len must be an integer in [1,384]")
+    positions = _canonical_action_positions(position_ids, prefix_len)
+    packed, keep, padding = _pack_wall_fp16_loop_inputs(action, dof_mask, padding_velocity)
+    import rpu_backend
+
+    signature = rpu_backend.graph.GraphSignature(
+        op_id="rpu_wall_qwen35_action_fp16_loop",
+        shapes=[1, 32, 64, int(prefix_len)],
+        dyn_dims=[steps_per_graph, 24, *_FULL_LAYERS], dtypes=[torch.float16],
+    )
+    cache = state.action_graph_cache
+    cold = cache.lookup(signature) is None
+    if cold:
+        if cache.is_frozen():
+            raise RuntimeError(f"Wall action GraphCache READY miss for exact real prefix {prefix_len}")
+        if cache.size():
+            cache.clear()
+    prefix_lens = _copy_physical_prefix(state, prefix_cache, int(prefix_len))
+    _ensure_action_rope(state, positions)
+    modulation = _wall_loop_modulation(expert)
+    packed, keep, padding = (t.to("rpu") for t in (packed, keep, padding))
+    _, dt = _wall_fp16_times()
+    for step in range(0, ACTION_NUM_STEPS, steps_per_graph):
+        # Keep the evolving x on RPU in both arms. The split arm refreshes the
+        # modulation DMA view on each replay, without recomputing host math.
+        step_modulation = modulation if state.action_one_graph else modulation[step].contiguous()
+        output = torch.empty_like(packed)
+
+        def forward():
+            return torch.ops.rpu.qwen3_5_wall_action_loop(
+                state.handle, packed, keep, padding, output, dt, step_modulation,
+                state.action_k_caches, state.action_v_caches, prefix_lens, steps_per_graph,
+            )
+
+        if cold and step == 0:
+            # Prime persistent buffers before BUILD. This is outside READY;
+            # replay/capture reloads the original packed x, not the prime result.
+            forward()
+        with cache.capture(signature):
+            forward()
+        packed = output
+    state.action_graph_signature = signature
+    result = output.to(device="cpu", dtype=torch.float32)[..., :26].contiguous().clone()
+    if not bool(torch.isfinite(result).all()):
+        raise RuntimeError("Wall FP16 loop returned non-finite actions")
+    return result
 
 
 def _canonical_action_positions(
@@ -1253,6 +1421,7 @@ __all__ = [
     "load_wall_qwen35_action_module",
     "patch_wall_qwen35_action_for_rpu",
     "run_wall_qwen35_action",
+    "run_wall_qwen35_action_loop",
     "validate_wall_qwen35_euler_profile",
     "wall_qwen35_host_action_input",
     "wall_qwen35_host_euler_step",

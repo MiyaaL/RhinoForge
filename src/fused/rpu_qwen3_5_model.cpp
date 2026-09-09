@@ -247,8 +247,10 @@ void Qwen3_5Model::set_action_io_weights(
     int64_t action_dim, int64_t action_dim_pad, int64_t action_len) {
     TORCH_CHECK(action_mode_,
                 "Qwen3.5 action I/O weights require action mode");
-    TORCH_CHECK(!wall_action_mode_,
-                "Qwen3.5 Wall action mode does not support native action I/O or Euler steps");
+    if (wall_action_mode_) {
+        TORCH_CHECK(action_dim == 26 && action_dim_pad == 64 && action_len == 32,
+                    "Wall FP16 action I/O requires dim=26, packed dim=64, horizon=32");
+    }
     TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                 "Qwen3.5 action I/O weights must be set before the first forward");
     TORCH_CHECK(action_dim > 0 && action_dim_pad >= action_dim
@@ -425,10 +427,8 @@ at::Tensor Qwen3_5Model::forward_action_step(
     std::vector<at::Tensor>& k_caches,
     std::vector<at::Tensor>& v_caches,
     at::IntArrayRef prefix_lens,
-    int64_t num_steps) {
-    TORCH_CHECK(!wall_action_mode_,
-                "Qwen3.5 Wall action mode exposes decoder-only forward; "
-                "native action I/O and Euler steps are unsupported");
+    int64_t num_steps,
+    const at::Tensor& padding_velocity) {
     TORCH_CHECK(action_mode_ && action_input_w_.defined(),
                 "Qwen3.5 action step requires action mode and I/O weights");
     TORCH_CHECK(num_steps == 1 || num_steps == 10,
@@ -463,10 +463,29 @@ at::Tensor Qwen3_5Model::forward_action_step(
                 "contiguous FP16 on RPU");
     TORCH_CHECK(action_out.data_ptr() != action.data_ptr(),
                 "Qwen3.5 action step requires distinct input/output buffers");
-    TORCH_CHECK(delta_t > 0.0,
+    TORCH_CHECK(std::isfinite(delta_t) && delta_t > 0.0,
                 "Qwen3.5 action Euler delta_t must be positive");
     const c10::Half euler_scale =
-        c10::Half(-static_cast<float>(delta_t));
+        c10::Half(static_cast<float>(wall_action_mode_ ? delta_t : -delta_t));
+    if (wall_action_mode_) {
+        TORCH_CHECK(action_dim_ == 26 && action_dim_pad_ == 64 && action_len_ == 32,
+                    "Wall FP16 loop requires packed [action26, mask26, zeros12]");
+        TORCH_CHECK(padding_velocity.defined()
+                    && padding_velocity.sizes() == action.sizes()
+                    && padding_velocity.device() == action.device()
+                    && padding_velocity.scalar_type() == at::kHalf
+                    && padding_velocity.is_contiguous(),
+                    "Wall padding velocity must be pre-masked contiguous FP16 [1,32,64]");
+        TORCH_CHECK(euler_scale == c10::Half(0.0999f),
+                    "Wall FP16 Euler requires the canonical positive FP16 dt");
+        action_padding_velocity_ref_ = padding_velocity;
+        action_padding_velocity_live_base_ =
+            ::rhino_lkn::RpuGetDevAddr(padding_velocity.data_ptr<c10::Half>());
+        rpu_ddr_flush_force(padding_velocity.data_ptr<c10::Half>());
+    } else {
+        TORCH_CHECK(!padding_velocity.defined(),
+                    "G0.5 action does not accept Wall padding velocity");
+    }
     if (!action_euler_scale_pinned_) {
         action_euler_scale_ = euler_scale;
         action_euler_scale_pinned_ = true;
@@ -502,17 +521,38 @@ at::Tensor Qwen3_5Model::forward_action_step(
 
     action_prefix_lens_.assign(prefix_lens.begin(), prefix_lens.end());
     int64_t max_prefix = 0;
+    int64_t wall_full_prefix = -1;
     for (int64_t i = 0; i < num_layers(); ++i) {
         const int64_t prefix = action_prefix_lens_[i];
         TORCH_CHECK(prefix >= 0,
                     "Qwen3.5 action step prefix_lens[", i,
                     "] must be non-negative");
+        if (wall_action_mode_ && !wall_action_full_mask_[i]) {
+            TORCH_CHECK(prefix == 0, "Wall identity layers require zero prefix");
+            continue;
+        }
         TORCH_CHECK(i < static_cast<int64_t>(k_caches.size())
                     && i < static_cast<int64_t>(v_caches.size())
                     && k_caches[i].defined() && k_caches[i].dim() == 7
                     && v_caches[i].defined() && v_caches[i].dim() == 7,
                     "Qwen3.5 action step K/V cache[", i,
                     "] must be defined 7D tensors");
+        if (wall_action_mode_) {
+            const auto& kc = k_caches[i];
+            const auto& vc = v_caches[i];
+            TORCH_CHECK(prefix >= 1 && prefix <= 384,
+                        "Wall action loop prefix must be in [1,384]");
+            if (wall_full_prefix < 0) wall_full_prefix = prefix;
+            TORCH_CHECK(prefix == wall_full_prefix,
+                        "Wall action full-layer prefixes must be equal");
+            TORCH_CHECK(kc.sizes() == vc.sizes() && kc.size(0) == 1
+                        && kc.size(2) == 1 && kc.size(3) == 16
+                        && kc.size(4) == 8 && kc.size(5) == 16 && kc.size(6) == 16
+                        && kc.device() == action.device() && vc.device() == action.device()
+                        && kc.scalar_type() == at::kHalf && vc.scalar_type() == at::kHalf
+                        && kc.is_contiguous() && vc.is_contiguous(),
+                        "Wall loop requires FP16 effective-KV8 cache topology");
+        }
         const int64_t capacity = k_caches[i].size(1) * 16;
         TORCH_CHECK(prefix + action_len_ <= capacity,
                     "Qwen3.5 action step cache capacity exceeded at layer ", i,
@@ -863,12 +903,23 @@ void Qwen3_5Model::emit_action_input_projection() {
             &action_input_live_base_, /*src_offset_bytes=*/0,
             action_len_ * action_dim_pad_, addr(0, "action_input"),
             /*num_cores=*/1);
+        if (wall_action_mode_) {
+            rpu_launch_ddr_broadcast_spm_dma_mutable(
+                &action_padding_velocity_live_base_, 0,
+                action_len_ * action_dim_pad_, addr(0, "action_padding_velocity"), 1);
+        }
     }
     launch_linear(
         addr(0, "action_input"), action_input_w_,
         addr(0, "action_hidden"), action_len_, hidden_size(),
         action_dim_pad_, /*partition=*/1, /*num_cores=*/1,
         addr(0, "action_input_bias"));
+    if (wall_action_mode_) {
+        // FP16 projection output, then the sole /4 residual-stream boundary.
+        rpu_launch_eltwise_binary_scalar_spm_kernel(
+            addr(0, "action_hidden"), c10::Half(0.25f), addr(0, "action_hidden"),
+            action_len_ * hidden_size(), ValuOpType::MUL, /*num_cores=*/1);
+    }
     rpu_launch_spm_copy_ddr_dma(
         addr(0, "action_hidden"),
         action_hidden_stage_.data_ptr<c10::Half>(),
@@ -895,14 +946,35 @@ void Qwen3_5Model::emit_action_output_projection() {
             action_velocity_stage_.data_ptr<c10::Half>(),
             action_len_ * action_dim_pad_);
     }
-    rpu_launch_eltwise_binary_spm_kernel(
-        addr(0, "action_input"), addr(0, "action_velocity"),
-        addr(0, "action_input"), action_len_ * action_dim_pad_,
-        ValuOpType::ADD, action_euler_scale_, /*num_cores=*/1);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
-        addr(0, "action_keep_mask"), addr(0, "action_input"),
-        addr(0, "action_input"), action_len_, action_dim_pad_,
-        c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false);
+    if (wall_action_mode_) {
+        // Each operation writes FP16. Inactive action dimensions follow the
+        // original padding velocity; packed mask/padding columns never update.
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            addr(0, "action_keep_mask"), addr(0, "action_velocity"),
+            addr(0, "action_velocity"), action_len_, action_dim_pad_,
+            c10::Half(1.0f), ValuOpType::MUL, false, /*num_cores=*/1);
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "action_velocity"), addr(0, "action_padding_velocity"),
+            addr(0, "action_velocity"), action_len_ * action_dim_pad_,
+            ValuOpType::ADD, c10::Half(1.0f), 1);
+        rpu_launch_eltwise_binary_scalar_spm_kernel(
+            addr(0, "action_velocity"), action_euler_scale_,
+            addr(0, "action_velocity"), action_len_ * action_dim_pad_,
+            ValuOpType::MUL, 1);
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "action_input"), addr(0, "action_velocity"),
+            addr(0, "action_input"), action_len_ * action_dim_pad_,
+            ValuOpType::ADD, c10::Half(1.0f), 1);
+    } else {
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "action_input"), addr(0, "action_velocity"),
+            addr(0, "action_input"), action_len_ * action_dim_pad_,
+            ValuOpType::ADD, action_euler_scale_, /*num_cores=*/1);
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            addr(0, "action_keep_mask"), addr(0, "action_input"),
+            addr(0, "action_input"), action_len_, action_dim_pad_,
+            c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false);
+    }
     if (final_step) {
         rpu_launch_spm_copy_ddr_dma_mutable(
             addr(0, "action_input"), &action_output_live_base_,
@@ -1643,7 +1715,12 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     if (action_input_w_.defined()) {
         decls.push_back({
             "action_input", A(cs * action_dim_pad_ * DWIDTH), 0, 9,
-            StorageClass::Temp, 0, nullptr});
+            wall_action_mode_ ? StorageClass::Persistent : StorageClass::Temp, 0, nullptr});
+        if (wall_action_mode_) {
+            decls.push_back({
+                "action_padding_velocity", A(cs * action_dim_pad_ * DWIDTH), 0, 9,
+                StorageClass::Persistent, 0, nullptr});
+        }
         decls.push_back({
             "action_hidden", A(cs * h * DWIDTH), 0, 0,
             StorageClass::Temp, 0, nullptr});
@@ -1836,6 +1913,13 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     return decls;
 }
 
+
+int64_t Qwen3_5Model::subclass_layout_hash() const {
+    // Action I/O changes declarations independently of the shared model shape.
+    return action_input_w_.defined()
+        ? (action_dim_pad_ << 16) ^ (action_len_ << 2) ^ int64_t(wall_action_mode_) ^ 2
+        : int64_t(wall_action_mode_);
+}
 
 ModelStaticConfig Qwen3_5Model::static_config() {
     ModelStaticConfig cfg;
@@ -2057,6 +2141,13 @@ void Qwen3_5Model::set_weights(
     action_loop_active_ = false;
     action_num_steps_ = 1;
     adaptive_mod_ref_ = at::Tensor();
+    action_padding_velocity_ref_ = at::Tensor();
+    action_padding_velocity_live_base_ = 0;
+    action_input_w_ = action_input_b_ = at::Tensor();
+    action_output_w_ = action_output_b_ = at::Tensor();
+    action_input_ref_ = action_keep_mask_ref_ = action_output_ref_ = at::Tensor();
+    action_hidden_stage_ = action_velocity_stage_ = at::Tensor();
+    action_euler_scale_pinned_ = false;
     action_prefix_lens_.clear();
     layer_weights_.assign(N, LayerWeights{});
     for (int64_t i = 0; i < N; ++i) {
@@ -2300,4 +2391,19 @@ at::Tensor rpu_qwen3_5_action_step_forward(
     return m->forward_action_step(
         action, action_keep_mask, action_out, delta_t,
         adaptive_mod, kc, vc, prefix_lens, num_steps);
+}
+
+at::Tensor rpu_qwen3_5_wall_action_loop(
+    int64_t handle, const at::Tensor& action,
+    const at::Tensor& keep_mask, const at::Tensor& padding_velocity,
+    at::Tensor action_out, double delta_t, const at::Tensor& adaptive_mod,
+    at::TensorList k_caches, at::TensorList v_caches,
+    at::IntArrayRef prefix_lens, int64_t num_steps) {
+    auto* m = Qwen3_5Registry::get(handle, "rpu_qwen3_5_wall_action_loop");
+    TORCH_CHECK(padding_velocity.defined(), "Wall Action requires padding velocity");
+    std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
+    std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
+    m->forward_action_step(action, keep_mask, action_out, delta_t,
+        adaptive_mod, kc, vc, prefix_lens, num_steps, padding_velocity);
+    return action_out;
 }

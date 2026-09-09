@@ -224,7 +224,8 @@ private:
 // constructor are registered. Child graphs are owned by their parent and are
 // released by parent.invalidate(); registering them separately would make a
 // process reset depend on parent/child destruction order.
-std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph();
+std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(
+    bool require_single_segment = false);
 void invalidate_registered_rpu_kernel_graphs();
 
 // Process-scoped hardware trace admission.  The SDK bakes the enable bit and
@@ -1023,6 +1024,10 @@ template <> struct NodeKindOf<BarrierNodeData> {
 // =============================================================================
 
 struct Segment {
+    // Pointer-free resource census from the shared segment planner.
+    size_t entry_count = 0;
+    size_t command_bytes = 0;
+    size_t instruction_bytes = 0;
     size_t segment_id = 0;                  // segments_ 中的顺序 id,用于 dump / replay 诊断
     size_t start_idx = 0;                   // nodes_ 中的起始下标（含）
     size_t end_idx = 0;                     // 结束下标（exclusive）；区间仅含 Kernel/Dma/Barrier
@@ -1152,7 +1157,7 @@ public:
         REPLAYING
     };
 
-    RpuKernelGraph();
+    explicit RpuKernelGraph(bool require_single_segment = false);
     ~RpuKernelGraph();
     RpuKernelGraph(const RpuKernelGraph&) = delete;
     RpuKernelGraph& operator=(const RpuKernelGraph&) = delete;
@@ -1802,6 +1807,7 @@ private:
     // 线性扫 nodes_，把连续且 queue_state 兼容的 Kernel/Dma/Barrier 合并为
     // segment；Kernel 的 core_ids 可不同，segment 取最大执行域。其它 data
     // node 作为 segment 边界。
+    const bool require_single_segment_ = false;
     void build_segments_from_nodes();
 
     // RECORDING 收尾：build_segments_from_nodes + 段间交错执行 data nodes +

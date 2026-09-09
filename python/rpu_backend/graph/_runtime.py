@@ -205,14 +205,21 @@ class GraphCache:
     _WARMING = "WARMING"
     _READY = "READY"
 
-    def __init__(self, max_entries=None):
+    def __init__(self, max_entries=None, *, require_single_segment=False):
+        if not isinstance(require_single_segment, bool):
+            raise TypeError("require_single_segment must be bool")
         self._phase = self._CONFIGURING
         if not _cpp_loaded:
+            if require_single_segment:
+                raise RuntimeError("single-segment GraphCache requires the C++ backend")
             self._impl = None
             return
         if max_entries is None:
             max_entries = self.DEFAULT_MAX_ENTRIES
-        self._impl = _cpp_ext.GraphCache(int(max_entries))
+        if require_single_segment:
+            self._impl = _cpp_ext.GraphCache(int(max_entries), True)
+        else:
+            self._impl = _cpp_ext.GraphCache(int(max_entries))
         _LIVE_GRAPH_CACHES.add(self)
 
     def capture(self, sig):

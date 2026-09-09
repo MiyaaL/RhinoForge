@@ -12,6 +12,11 @@ from rpu_backend.adapters.wall_qwen35 import checkpoint as wall_checkpoint
 from rpu_backend.api import WallQwen35ActionOutput, WallQwen35Policy
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cold_environment(monkeypatch):
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+
+
 def _bound_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -28,6 +33,10 @@ def _bound_policy(
     monkeypatch.setattr(
         wall_checkpoint, "preflight_wall_qwen35_checkpoint", fake_preflight
     )
+    from rpu_backend.adapters.wall_qwen35 import action, execution
+    monkeypatch.setenv("WALL_QWEN35_OPT", "1")
+    monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", lambda: None)
+    monkeypatch.setattr(execution, "configure_wall_qwen35_execution", lambda opt: None)
     policy = WallQwen35Policy.from_checkpoint(
         tmp_path,
         allow_numeric_blocked_vision=allow_vision,
@@ -158,6 +167,7 @@ def test_policy_install_is_idempotent_and_close_is_terminal(
         ),
         "max_seq_len": 780,
         "allow_numeric_blocked_vision": True,
+        "wall_qwen35_opt": True,
     }
 
     policy.close()
@@ -286,6 +296,7 @@ def _empty_runtime_for_install_test():
     runtime._closed = False
     runtime._installed = False
     runtime.allow_numeric_blocked_vision = True
+    runtime.wall_qwen35_opt = True
     runtime._owned_vision_env = False
     runtime._owned_coexist_persistent_env = False
     runtime.base_cache = None
@@ -387,6 +398,8 @@ def test_runtime_restores_owned_cold_environment_after_install_failure(
     from rpu_backend.adapters.qwen3_5 import vision as vision_adapter
 
     monkeypatch.setattr(vision_adapter, "_require_packed_spatial_vision_native", lambda: None)
+    from rpu_backend.adapters.wall_qwen35 import action
+    monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", lambda: None)
 
     coexist = "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN"
     vision = "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED"

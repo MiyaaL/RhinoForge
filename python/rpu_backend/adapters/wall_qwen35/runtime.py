@@ -1,9 +1,9 @@
 """End-to-end orchestration for the exact Wall Qwen3.5 checkpoint.
 
 The base Qwen3.5 vision/text path uses the normal RhinoForge adapter.  The
-action expert remains a separate Qwen3.5 native handle; its input projection,
-time conditioning, output projection, Euler integration, and normalization run
-in host FP32 for the intentionally simple first port.
+action expert remains a separate Qwen3.5 native handle. Its projections and
+Euler integration use FP16 on RPU in both Graph arms; time/Ada precomputation
+and normalization remain CPU FP32. WALL_QWEN35_OPT binds the cold graph plan.
 """
 
 from __future__ import annotations
@@ -161,6 +161,7 @@ class WallQwen35Runtime:
         camera_names: Sequence[str] = DEFAULT_CAMERAS,
         max_seq_len: int = MAX_SEQ_LENGTH,
         allow_numeric_blocked_vision: bool = False,
+        wall_qwen35_opt: bool | None = None,
         profile: Any | None = None,
     ):
         self.checkpoint = Path(checkpoint).expanduser().resolve()
@@ -179,6 +180,12 @@ class WallQwen35Runtime:
         if not isinstance(allow_numeric_blocked_vision, bool):
             raise ValueError("allow_numeric_blocked_vision must be bool")
         self.allow_numeric_blocked_vision = allow_numeric_blocked_vision
+        from .execution import resolve_wall_qwen35_opt
+        if wall_qwen35_opt is None:
+            wall_qwen35_opt = resolve_wall_qwen35_opt()
+        if type(wall_qwen35_opt) is not bool:
+            raise ValueError("wall_qwen35_opt must be bool")
+        self.wall_qwen35_opt = wall_qwen35_opt
         self._closed = False
         self._installed = False
         self._owned_vision_env = False
@@ -226,6 +233,8 @@ class WallQwen35Runtime:
             raise RuntimeError("another Wall Qwen3.5 installation is in progress")
         checkpoint_module, action_module = _wall_modules()
         try:
+            from .execution import configure_wall_qwen35_execution
+            configure_wall_qwen35_execution(self.wall_qwen35_opt)
             # Wall alternates three live FusedModelBase handles (vision, base
             # text, and action).  The native switch is sampled once, so bind it
             # before the first handle is installed.  Without it, each handle's
@@ -244,11 +253,12 @@ class WallQwen35Runtime:
             if os.environ.get(_VISION_OPT_IN) != "1":
                 os.environ[_VISION_OPT_IN] = "1"
                 self._owned_vision_env = True
-            # One retained Vision graph covers the complete image triple,
-            # including its ordered real patch lengths.
+            # Packed: one triple signature. Split: retain all camera shapes so
+            # the face/wrist alternation cannot evict a READY entry.
+            required_vision_entries = 1 if self.wall_qwen35_opt else 3
             vision_entries = os.environ.get(_VISION_GRAPH_MAX_ENTRIES)
             if vision_entries is None:
-                os.environ[_VISION_GRAPH_MAX_ENTRIES] = "1"
+                os.environ[_VISION_GRAPH_MAX_ENTRIES] = str(required_vision_entries)
                 self._owned_vision_graph_entries_env = True
             else:
                 from rpu_backend.adapters.qwen3_5.vision import (
@@ -256,20 +266,20 @@ class WallQwen35Runtime:
                 )
 
                 try:
-                    _parse_vision_graph_max_entries(
-                        vision_entries
-                    )
+                    if _parse_vision_graph_max_entries(vision_entries) < required_vision_entries:
+                        raise ValueError("Vision cache is too small for the selected arm")
                 except (TypeError, ValueError) as exc:
                     raise RuntimeError(
                         "Wall Qwen3.5 requires "
                         f"{_VISION_GRAPH_MAX_ENTRIES} to be a valid positive "
-                        "GraphCache capacity"
+                        f"GraphCache capacity >= {required_vision_entries}"
                     ) from exc
             from rpu_backend.adapters.qwen3_5.vision import (
                 _require_packed_spatial_vision_native,
             )
 
             _require_packed_spatial_vision_native()
+            action_module.require_wall_fp16_loop_runtime()
             self._processor = _load_processor(self.checkpoint, checkpoint_module)
             self.base_model = _load_base_model(
                 self.checkpoint, checkpoint_module, manifest=self._manifest
@@ -277,7 +287,7 @@ class WallQwen35Runtime:
             self.base_model.config._attn_implementation = "eager"
             _text_config(self.base_model.config)._attn_implementation = "eager"
             self.base_model.eval()
-            self.base_model.model.visual._wall_qwen35_packed_vision = True
+            self.base_model.model.visual._wall_qwen35_packed_vision = self.wall_qwen35_opt
             # This VLA uses the base decoder only to populate six physical K/V
             # prefixes for the action expert.  It never consumes language
             # logits, and its 256277-row tied head cannot satisfy the generic
@@ -306,7 +316,8 @@ class WallQwen35Runtime:
             # envelopes (1, 2..31, or 32+ valid rows). Capacity covers the
             # finite cross-product; entries remain allocated lazily.
             text_state.prefill_graph_cache = _rb.graph.GraphCache(
-                max_entries=WALL_PREFILL_GRAPH_MAX_ENTRIES
+                max_entries=WALL_PREFILL_GRAPH_MAX_ENTRIES,
+                require_single_segment=self.wall_qwen35_opt,
             )
             text_state.prefill_graph_sig = None
             text_state.prefill_bucket_sizes = WALL_PREFIX_BUCKETS
@@ -335,6 +346,7 @@ class WallQwen35Runtime:
             patched = patch_action(
                 self.action_expert,
                 max_seq_len=self.max_seq_len,
+                one_graph=self.wall_qwen35_opt,
             )
             if patched is not None:
                 self.action_expert = patched
@@ -422,22 +434,6 @@ class WallQwen35Runtime:
             # Text -> Action boundary even on failure; KV/GDN state is not Temp.
             torch.ops.rpu.spm_alloc_reset_temporary()
 
-    def _run_action_layer(self, *, action_embed, time_cond, prepared, prefix_cache):
-        _, action_module = _wall_modules()
-        run = _required(action_module, "run_wall_qwen35_action")
-        # The action helper owns the six-layer physical cache copy.  Supplying
-        # both the cache and exact prefix length keeps that ownership explicit.
-        with _profile_scope("wall_qwen35_action_decoder"):
-            return run(
-                self.action_expert,
-                action_embeds=action_embed,
-                time_cond=time_cond,
-                position_ids=prepared.action_position_ids,
-                prefix_cache=prefix_cache,
-                prefix_len=prepared.prefix_length,
-                dof_mask=prepared.dof_mask,
-            )
-
     def predict_action_chunk(
         self,
         *,
@@ -508,37 +504,15 @@ class WallQwen35Runtime:
             ((-self._action_min) / self._action_delta) * 2.0 - 1.0
         ).clamp(-1.0, 1.0).view(1, 1, STATE_DIM)
         padding_velocity = padding_action - noise_snapshot
-        times = torch.linspace(0.0, 1.0, 11, dtype=torch.float32) * 0.999
         with torch.inference_mode(), _profile_scope(
             "wall_qwen35_action_denoise_loop"
         ):
-            for index in range(10):
-                action_embed = action_module.wall_qwen35_host_action_input(
-                    self.action_expert, action, prepared.dof_mask
-                )
-                time_cond = action_module.wall_qwen35_host_time_condition(
-                    self.action_expert, times[index:index + 1]
-                )
-                hidden = self._run_action_layer(
-                    action_embed=action_embed,
-                    time_cond=time_cond,
-                    prepared=prepared,
-                    prefix_cache=prefix_cache,
-                )
-                velocity = action_module.wall_qwen35_host_velocity(
-                    self.action_expert, hidden
-                )
-                if tuple(velocity.shape) != (1, ACTION_HORIZON, STATE_DIM):
-                    raise RuntimeError(
-                        f"action velocity shape {tuple(velocity.shape)} is invalid"
-                    )
-                action = action_module.wall_qwen35_host_euler_step(
-                    action,
-                    velocity,
-                    prepared.dof_mask,
-                    padding_velocity,
-                    delta_t=float(times[index + 1] - times[index]),
-                )
+            action = action_module.run_wall_qwen35_action_loop(
+                self.action_expert, action=action, dof_mask=prepared.dof_mask,
+                padding_velocity=padding_velocity,
+                position_ids=prepared.action_position_ids,
+                prefix_cache=prefix_cache, prefix_len=prepared.prefix_length,
+            )
         result = (action + 1.0) * 0.5
         result = result * self._action_delta.view(1, 1, -1)
         result = result + self._action_min.view(1, 1, -1)
@@ -563,6 +537,10 @@ class WallQwen35Runtime:
             "extra": {
                 "noise_seed": resolved_noise_seed,
                 "noise_source": noise_source,
+                "wall_qwen35_opt": self.wall_qwen35_opt,
+                "action_execution": "fp16_one_graph" if self.wall_qwen35_opt else "fp16_steps",
+                "action_graph_calls": 1 if self.wall_qwen35_opt else 10,
+                "vision_graph_calls": 1 if self.wall_qwen35_opt else 3,
                 "prefix_bucket": plan_extra.pop("bucket_len", None),
                 "base_prefill": plan_extra,
             },

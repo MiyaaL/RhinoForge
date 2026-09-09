@@ -131,6 +131,31 @@ Vision 的 replay 增量精确为 1。它不代表 Text/Action 也合并进同�
 READY 数值或任务质量门禁通过。`segments.json` 记录 Graph 诊断，`meta.json` 记录
 `vision_execution` 与实际安装包、native 扩展和运行时资产 provenance。
 
+统一冷开关为 `WALL_QWEN35_OPT`，默认 `1`，无需逐阶段选项：
+
+```bash
+# Vision 1 + Language/Prefill 1 + Action 1
+bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+
+# 本录制数据集的 Vision 3 + Language/Prefill 3 + Action 10
+WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+```
+
+两种配置都使用 FP16 Action 投影/Euler、ACC32 GEMM 和一次性 CPU FP32 时间/Ada
+预计算。关闭优化只改变 Graph 组织方式，不恢复历史 FP32 host 路径。
+旧 `--language-one-graph`、`--action-execution` 选项已移除。
+
+开关统一覆盖六项 Graph/SDK 预算：开启为 32768 entries / 8 MiB command /
+64 MiB instruction，SDK 为 65536 / 16 / 128；关闭为 8192 / 4 / 32，
+SDK 为 65536 / 8 / 64。非 Wall 通用默认值不变；切换需新进程。
+
+须检查实际 segment 数，而非缓存条目数。开启时 Vision、Prefill、Action 各要求
+一段；关闭时 Action 复用单步图十次，Vision 保留各相机形状。READY 核验三次或
+十六次物理提交、稳定 replay 和同输入重复数值一致性，冷启动 priming/BUILD 不计入。
+其他输入长度可能产生不同的保守 Prefill 分段数，`3+3+10` 对应此 runner 的录制
+数据集。metadata 记录开关、图计划与实际预算；旧包在加载前拒绝。
+比较时使用相同 `--flow-noise`，这些受控配置不代表发布质量认证。
+
 packed dense 计算共享全部图像行；attention 仍按图隔离，encoder 的两处残差
 AllReduce 也按原图边界调用，以保留逐图执行的归约几何。通用和 temporal Vision
 路径不变。

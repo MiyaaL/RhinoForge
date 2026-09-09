@@ -148,6 +148,21 @@ API。初版范围固定为 FP16 batch 1、精确三个规范相机、初始多�
 native pad-zeroing 即使在 bucket 边界也会发出稳定的 fill 节点。Action fast replay
 仍按精确真实 prefix 长度建图，因为 KV 插入位置和 SDPA 寄存器会固化该值。
 这些只是 Wall profile 的内部优化，不扩展通用 Qwen3.5 API。
+统一冷环境开关 `WALL_QWEN35_OPT` 在 `from_checkpoint()` 时绑定：
+未设置或 `1` 为 Vision1 + Prefill1 + Action1；`0` 恢复逐图 Vision、
+逐步 Action（录制 open-loop 数据集为 3+3+10）。不再提供独立的
+`action_execution` 参数。两种配置均使用 FP16 投影/Euler、ACC32 GEMM；
+时间/Ada 在 CPU FP32 一次性计算后转 FP16 上传，归一化和输出保持 CPU FP32。
+历史 FP32 host profile 不再可选；该精度降级不代表数值/任务认证。
+开关覆盖六项 Graph/SDK 预算：开启 32768/8/64 MiB、SDK 65536/16/128 MiB；
+关闭 8192/4/32、SDK 65536/8/64。切换需新进程及新 policy，要求匹配的
+Python/native 包。优化 Vision/Prefill 及两种 Action 路径均要求每次调用一个
+物理 segment，无法满足时拒绝，不静默切段。
+
+`GraphCache(..., require_single_segment=True)` 是构造时固定的逐 cache 策略，使用
+SDK 容量的一半（最多 65536 entries / 32 MiB command / 256 MiB instruction），
+不扩大其他 Graph 的软预算。要求唯一 segment 覆盖全部节点；空图、提前同步/降级、
+嵌套执行、host 边界或资源切段均在提交前拒绝，SDK 硬限制仍保留。
 Wall 将三张单帧图像合并为一次 retained Vision Graph 调用；每图为偶数 patch 网格，
 不超过 14x14，合计最多 588 patches。dense 运算共享 packed 行，每层 attention
 仍按真实图长隔离调用三次。encoder 的两处残差 AllReduce 也按原图边界分别执行，
@@ -226,6 +241,11 @@ with cache.capture(sig):
 聚合 counter。它们解释生命周期，不是数值或支持证据。`Graph.dump_replay_plan()` 返回
 pointer-free node/segment 摘要，`Graph.dump_tree()` 按 segment 分组；均不包含 launch
 argument word、设备程序或原始 address。
+segment 摘要中的 `entries`、`command_bytes`、`instruction_bytes` 来自共享 planner，
+表示预留的 batch 资源，而非实测传输量或执行时间。一个缓存 Graph 可以包含多个
+物理提交 segment，二者应分别检查。
+低层 native module 提供 `graph_segment_budget_abi=1`，受控 runner 据此拒绝
+会忽略预算控制项的旧扩展。
 
 `Graph` 是低层 capture object；`get_default_graph_cache()` 返回 thread-local cache。
 新 adapter 通常使用显式 per-model `GraphCache`，便于 ownership 与 teardown。

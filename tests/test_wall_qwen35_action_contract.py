@@ -43,6 +43,7 @@ def test_action_helper_signatures_are_exact_and_have_no_kwargs_escape_hatch() ->
     assert _parameter_contract(wall_action.patch_wall_qwen35_action_for_rpu) == [
         ("expert", positional),
         ("max_seq_len", keyword),
+        ("one_graph", keyword),
     ]
     assert _parameter_contract(wall_action.run_wall_qwen35_action) == [
         ("expert", positional),
@@ -93,7 +94,7 @@ def test_action_fast_replay_signature_keeps_exact_real_prefix() -> None:
     install = inspect.getsource(wall_action.patch_wall_qwen35_action_for_rpu)
     decoder = inspect.getsource(wall_action.run_wall_qwen35_action)
 
-    assert "GraphCache(max_entries=1)" in install
+    assert 'max_entries=1, require_single_segment=True' in install
     assert "ACTION_HIDDEN_SIZE, prefix_len" in decoder
     assert "_select_prefill_bucket" not in decoder
     assert "state.action_graph_cache.clear()" in decoder

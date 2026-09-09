@@ -174,6 +174,22 @@ stable fill-node envelope even for an exact bucket boundary. Action fast replay
 remains keyed by the exact real prefix length because its KV insertion and SDPA
 registers bake in that value. These optimizations are internal to the Wall
 profile and do not broaden the generic Qwen3.5 execution API.
+The single cold environment switch `WALL_QWEN35_OPT` is sampled by
+`from_checkpoint()`: unset/`1` enables Vision1 + Prefill1 + Action1;
+`0` restores per-image Vision and per-step Action (3+3+10 on the recorded
+open-loop episode). There is no separate `action_execution` argument.
+Both modes use half I/O weights, half GEMM outputs with ACC32, and half positive
+Euler updates. Time/Ada stays a one-time CPU FP32 precompute uploaded in FP16;
+normalization and public outputs remain CPU FP32. The historical FP32 host
+profile is no longer selectable. This is an intentional precision downgrade,
+not a numerical/task-quality certification.
+The profile owns the six cold Graph/SDK budgets: enabled 32768/8/64 MiB with SDK
+65536/16/128 MiB, disabled 8192/4/32 with SDK 65536/8/64. Individual overrides
+are replaced; recreate the policy in a fresh process to switch. A matching
+Python/native build is required. Optimized Vision/Prefill and both Action arms
+require one physical segment per Graph invocation, failing rather than silently
+splitting.
+
 Wall packs its three single-frame images into one retained Vision Graph call;
 each even patch grid is bounded by 14x14 (588 total patches maximum). Dense
 operations share the packed rows, while each layer still calls the existing
@@ -256,6 +272,12 @@ with cache.capture(sig):
 `cache_invariant_ok`. A frozen cache is lookup-only and rejects an online
 BUILD. Most applications should let the model adapter own its graph cache;
 manual graph construction is primarily a porting interface.
+`GraphCache(..., require_single_segment=True)` is an immutable opt-in requiring
+one physical segment covering all recorded nodes. It uses half the SDK entry,
+command and instruction capacities (capped at 65536 / 32 MiB / 256 MiB), instead
+of global soft budgets, without affecting other caches. Empty captures, partial
+sync/downgrades, nested execution, host-node boundaries and resource-driven
+splits are rejected before submission. It does not remove SDK hard limits.
 
 User-level diagnostics remain public. On a `GraphCache` instance,
 `debug_bucket_counts()`, `debug_branch_counts()`, `dump_signature_tree()`, and
@@ -266,6 +288,11 @@ lifecycle diagnosis, but their output is not numerical or support evidence.
 `Graph.dump_replay_plan()` returns a pointer-free linear node/segment summary;
 `Graph.dump_tree()` presents the same execution structure grouped by segment.
 Neither includes launch argument words, device instructions, or raw addresses.
+Each segment summary also reports `entries`, `command_bytes`, and
+`instruction_bytes` from the public launch-footprint query. These are reserved
+batch resources, not tensor traffic or device execution time.
+The low-level native module exposes `graph_segment_budget_abi=1` so controlled
+runners can reject older extensions that would ignore the budget controls.
 
 `Graph` is the lower-level capture object and `get_default_graph_cache()`
 returns a thread-local cache. New adapters should normally use a dedicated

@@ -255,3 +255,253 @@ certification: uncertified
   one exact request, then collect one lookup-only replay trace. After that,
   exercise the base-Prefill topology boundaries and a different Action prefix
   only after returning the caches to WARMING.
+
+## 9. Local Language segment-budget diagnostic (2026-09-08)
+
+This is a local, uncertified scheduling experiment, not a READY or release
+promotion. It uses the existing checkpoint/profile, FP16 decoder boundary and
+FP32 host Action projections/Euler updates. No model operator, accumulation
+mode, cast boundary or 128/128/64 SPM chunk topology was changed.
+
+The exact Language bucket `[320,2048]` contains 24,367 nodes (10,281 kernels,
+14,086 data nodes). The single-segment public footprint is 4,344,736 command
+bytes and 42,184,704 instruction bytes.
+
+| Arm | Soft entries / command MiB / instruction MiB | SDK capacities | Actual segments |
+|---|---|---|---|
+| Conservative baseline | 8192 / 4 / 32 | 65536 / 8 / 64 | 3 |
+| Entry-only override | 32768 / 4 / 32 | 65536 / 8 / 64 | 2; first segment reaches exactly 32 MiB instruction |
+| Full experimental preset | 32768 / 8 / 64 | 65536 / 16 / 128 | 1 |
+
+The full preset completed all 16 requests (prefix 299--313): one retained
+Language entry, one BUILD and 15 REPLAYs, zero recaptures, and true cache
+invariants. These are normal retained-cache observations, not a frozen READY
+admission. Eight requests had bit-exact KV/recurrent/conv states against the
+baseline; eight did not. Maximum Language-state absolute difference was
+0.42333984375; maximum returned-action absolute difference was
+0.005868434906005859. All compared values were finite. Noise, frame indices,
+and ground truth were exact. A separate three-segment repeat also differed in
+one of its first three Language boundaries (max absolute 0.29443359375), while
+the other two were exact. Thus baseline instability exists, but this does not
+establish that the one-segment candidate is correct or equivalent. The first
+request's earliest differing captured state was layer 20 for the full preset
+and layer 5 for the entry-only arm; these are layer-boundary observations,
+not identification of the first incorrect kernel.
+
+The entry-only arm was interrupted on its second request by an incomplete
+activation-file write when the temporary filesystem filled. Its first request
+proves two segments and a Language-boundary difference; it is not a completed
+16-request result. Complete baseline activations were retained privately in
+memory-backed temporary storage; subsequent comparisons wrote statistics only.
+No activations, device traces or operator assets are checked into the repository.
+
+Reproducibility anchors for the full diagnostic:
+
+- Source base: `c4e01dff40e40007b8178c96d051a410d9bd0ec4` plus the local budget
+  controls/resource census; no commit or release selection was made.
+- Tested native SHA-256:
+  `3c7596bbe71809350ebb99db1fb1e13d60bdca1d77526221199ad6cf589a50c1`.
+- r4 operator asset SHA-256:
+  `538f49e256814d104c98aa8df4b6d3af3d89b2d636a1fe22b0731df3ce39ac99`.
+- Rhino Launch library SHA-256:
+  `10910756d373171c74ce80ecfe590324c9e2db32788a6367034a310b771772a6`.
+- Private local receipt directory: `/tmp/wall-fp32-capability-QsSK8J`;
+  `full-comparison.json`, `full-one-segment/meta.json`,
+  `full-one-segment/segments.json`, and `repeat-three-segments`.
+
+The subsequent native capability-marker rebuild only adds the runner's old-ABI
+rejection; full-model results above belong to the explicitly hashed executable,
+not to another rebuild. The final native hash
+`491cb17e9f6124154465b0af0d8a1bb99dfa8068fef36a479b1b2e9224fa0964`
+passed actual capability-marker loading, packed-Vision ABI checks and a bit-exact
+FP16 host/device/host roundtrip; its full-model gate was not rerun. The related
+board-free suite passed 150 tests. The wrapper keeps conservative defaults and exposes
+`--language-one-graph` only as an experimental preset after a matching rebuild.
+No timing/speedup, FP32-anchor, maximum-envelope or task-quality gate is claimed.
+At the time of that diagnostic, Action remained ten Euler-step decoder replays: preserving its FP32 host
+boundaries requires an independently validated device implementation before
+it can become one physical batch.
+
+## 10. FP16 Action single-Graph extension (2026-09-09)
+
+Historical evidence below predates the unified switch in section 11. Its old
+CLI commands identify the measured revision, not current selectable options.
+
+The user explicitly replaced the FP32-boundary requirement with FP16 Action.
+The accepted implementation assessment is a **Runtime extension**: reuse the
+existing Qwen3.5 FMB ten-body loop, release ACC32/FP16 GEMMs, scalar/broadcast
+half arithmetic and mutable DMA. No new device kernel or operator asset is
+introduced. Independent read-only review checked the Wall-specific positive
+Euler formula, six attention/eighteen identity topology, SPM lifetimes, input
+refresh and strict physical-segment admission. This is not release certification.
+
+The exact envelope remains checkpoint `0_200000`, batch 1, horizon 32, width 26,
+real prefix 1..384. Pack `[action26, mask26, zeros12]` into width 64. Pad `w1` to
+1024x64 and output projection to 64x1024; inputs/weights/results are half, GEMM
+accumulation remains ACC32. Divide the half input-projection result by4 as a
+separate operation. Each Euler step computes half `velocity*mask + padding`,
+then a separate half multiply by `0.09991455078125` and half add to action.
+Padding velocity is the original CPU FP32 value cast to half and pre-masked;
+packed mask columns never update. Ten CPU FP32 time/Ada rows are prepared once
+and uploaded in half. Normalization and returned CPU tensors remain FP32.
+
+`fp16_one_graph` is the wrapper/Policy default; `fp32_host` retains the old
+projection/Euler reference. New ABI and cold SDK capacities (at least 65536 /
+8 MiB command / 64 MiB instruction) are checked before full model loading.
+Action alone uses immutable `require_single_segment`: SDK-half bounded
+budgets, no partial sync/downgrade/nested submission, one segment covering all
+nodes or failure before execution. Language still needs `--language-one-graph`
+to request its larger soft budgets. The three-submission claim applies only
+after warmup; persistent priming and BUILD are not included.
+
+Final board-free checks: all 274 repository tests passed, including independent FP16
+packing/rounding, overflow rejection, legacy profile, lifecycle guards and
+budget tests. Local board results follow. Broader input-envelope numerical
+coverage and task-quality/release gates remain pending; do not infer a speedup
+or release acceptance from these local diagnostics.
+
+Initial local board evidence (not a release/quality certificate):
+
+- Native SHA256 `f4dc2a1e29a5ea8791fc36069d2b84391e1d16986edcb066789b80edb77d6f35`;
+  Torch `2.10.0+cpu`, Rhino Launch `1.0.0`, unchanged r4 operator asset
+  SHA256 `538f49e256814d104c98aa8df4b6d3af3d89b2d636a1fe22b0731df3ce39ac99`.
+- FP16 host/device/host roundtrip is bit-exact; strict empty-Graph capture is
+  rejected. The independent Action probe uses checkpoint weights, synthetic
+  physical prefixes, and A/B/A seeds 3407/3408/3407, changing source K/V for B.
+- Prefix 308 ten-step Graph: 17520 nodes = 4360 kernels + 13160 data nodes;
+  one segment, 2110400 command bytes, 18104320 instruction bytes. These fit
+  within half the default SDK capacities, so the provisional 32/256 MiB SDK
+  requirement was removed from Python/wrapper; native arithmetic is unchanged.
+- A/B/A: one BUILD, two REPLAY, zero recaptures, invariant true, A repeat
+  bit-exact, B changes the output. The same FP16 operators executed in ten
+  separate calls produce bit-exact final actions for all three inputs
+  (`max_abs=0`). That split reference has one BUILD and 29 REPLAY.
+- The first probe computed/saved correct results but failed its own teardown
+  because a diagnostic Graph lookup still co-owned the cache entry. Releasing
+  that local reference fixes teardown without changing inference. Corrected
+  probe SHA256 `54b5d4080e6a8924f40fab932825d29881c9f4c7cbffe42d040e0772e4d1836c`;
+  split-reference process exits cleanly. This is not a candidate-runtime fix.
+- Independent CPU half-boundary reference (same RPU decoder): A/B/A repeats
+  are exact and the process exits cleanly at SDK 8/64 MiB. Compared with the
+  device-loop output, max absolute normalized-action errors are 0.0029296875 /
+  0.00244140625 / 0.0029296875 (means 0.000271476 / 0.000386605 / 0.000271476).
+  This reference is not bit-exact. It changes CPU/RPU projection and Euler
+  boundaries; the device split/unrolled comparison above remains exact, so
+  these numbers must not be labeled graph-merging error or quality acceptance.
+- Raw diagnostic artifacts are sensitive temporary files under
+  `/dev/shm/rhinoforge-wall-fp16-aaONUI`; no activation data is checked in.
+- Maximum-prefix 384 probe also has 17520 nodes in one segment at default SDK
+  8/64 MiB, with one BUILD/two REPLAY, zero recaptures, invariant true, exact A
+  repeat and clean teardown.
+- Real first episode request (prefix 308), using the wrapper with
+  `--language-one-graph --max-requests 1 --torch-profile`: Vision, Language and
+  Action each have one segment, one REPLAY, zero recaptures and a true invariant.
+  The exported trace contains exactly three `rpu_graph::segment_launch`, three
+  `rpu_graph::execute_replay` and three `rpu_graph::replay_segment_loop` events.
+  Frozen READY admission is **accepted**; both normalized and physical outputs
+  are bit-exact between warmup and measured repeat. Process teardown is clean.
+- The verified wheel is installed in the wrapper's `hx` Python environment;
+  installed native/Action Python hashes match the isolated tested package.
+  A recoverable old-package archive is `installed-before.tgz` in the temporary
+  diagnostic directory. No operator asset or dependency was changed.
+- Installed-environment FP32 host baseline, same real request, Language preset
+  and noise SHA256 `9bff273106fba94a31a550264c18e7186dbea33d73c93286a1c65ddecbaaa0d0`:
+  the trace has 12 physical segment launches (1 Vision + 1 Language + 10 Action),
+  versus 3 for FP16. All cache invariants/lifecycle checks pass and teardown is
+  clean. The old FP32 arm is **not** repeat-bit-exact: warm/measured differences
+  are 0.002384424 physical and 0.002546400 normalized; its READY numerical gate
+  remains unaccepted.
+- FP16 versus the FP32 measured output: physical max/mean absolute differences
+  0.002058029 / 0.000199179; normalized max/mean 0.003824115 / 0.000272003 across
+  all 26 dimensions. For the 20 active dimensions, normalized max/mean are
+  0.000897913 / 0.000178360; the largest all-dimension differences are in padding.
+  Because the FP32 baseline itself drifts, this comparison cannot isolate all
+  errors as dtype effects. One-request recorded-trajectory abs14 L1 is
+  0.039540580 (FP16) versus 0.039562110 (FP32); this is not a task-quality gate.
+  Profiled request times are not unprofiled performance evidence.
+- Reproduce the three-Graph path with
+  `bash run_wall_qwen35_openloop.sh --language-one-graph`; append
+  `--max-requests 1 --torch-profile` to reproduce the READY trace check.
+  Append `--action-execution fp32_host` only for the old precision baseline.
+
+## 11. Unified Wall execution switch (2026-09-09)
+
+This supersedes the selectable options in sections 9 and 10; their measurements
+remain historical evidence. `WALL_QWEN35_OPT` is the only public Graph-mode
+switch. Unset/`1` selects Vision1 + Prefill1 + Action1. `0` restores per-image
+Vision, conservative Prefill segments and ten single-step Action invocations
+(3+3+10 for this recorded episode). Both arms use the same FP16 Action operators,
+ACC32 GEMMs, positive half Euler step and FP32 time/Ada precomputation. There is
+no selectable FP32 host mode and no independent Language CLI option.
+
+Outcome: Adapter-only orchestration of the existing packed/per-image Vision and
+native one-/ten-step FP16 Action paths; no new operator or asset. The cold
+preset owns all six Graph/SDK budget variables, overriding stale individual
+values: enabled 32768/8/64 with SDK 65536/16/128; disabled 8192/4/32 with SDK
+65536/8/64 (memory values in MiB). Policy binding snapshots the switch; recreate
+in a fresh process to change it. Native SDK limits and stream fences remain.
+Optimized Vision/Prefill and both Action arms enforce single-segment capture.
+The split arm retains up to three Vision shapes and one exact-prefix Action
+signature, refreshing step modulation and evolving action through mutable DMA.
+Public outputs retain independent CPU FP32 storage.
+
+The runner rejects stale installed switch/FP16/native ABIs before weight loading
+and records the switch, budgets and graph plan. READY admission checks physical
+submission counts (3 versus 16), in addition to stable signatures, zero recapture,
+invariants and repeated-output parity. Cold priming/BUILD is excluded. Validation
+results for this revision are recorded below; no release or speedup claim is made.
+
+Validation: `bash -n`, `git diff --check`, and all 295 board-free tests passed.
+New tests cover both shell/Python presets, removal of the independent flags,
+stale-package rejection, exact physical submission admission and FP16 step
+modulation/input refresh with independent A/B/A outputs. The RPU FP16 roundtrip
+passed and both end-to-end processes shut down cleanly.
+
+Both public-runner diagnostics used the real first request (prefix 308, grids
+8x14 / 10x14 / 10x14), one unrecorded warmup and one frozen-cache measured repeat,
+under the exclusive board lease. Common FP32 noise value SHA-256:
+`9bff273106fba94a31a550264c18e7186dbea33d73c93286a1c65ddecbaaa0d0`.
+
+| Gate | OPT=1 (default) | OPT=0 |
+|---|---|---|
+| Physical Vision / Prefill / Action submissions | 1 / 1 / 1 | 3 / 3 / 10 |
+| Independent trace `segment_launch` count | 3 | 16 |
+| Final retained cache sizes, V / P / A | 1 / 1 / 1 | 2 / 1 / 1 |
+| Final replay counts, V / P / A | 1 / 1 / 1 | 4 / 1 / 19 |
+| Recaptures / invariants | 0 / all true | 0 / all true |
+| Warmup/repeat physical action max-abs | 0, bit-exact | 0.003958910704 |
+| Warmup/repeat normalized action max-abs | 0, bit-exact | 0.00146484375 |
+| Full READY admission | accepted | numerical repeatability failed |
+
+The OPT=0 graph/lifecycle gates passed, but it is **not** numerically READY.
+All compared outputs were finite. Across the two measured modes, returned
+physical-action max/mean absolute difference was 0.003958910704 / 0.000108192602.
+The split run itself drifts, so this does not establish a graph-merge error or
+same-dtype equivalence. Earlier conservative-path drift is separately documented
+in sections 9 and 10; this run did not locate its first divergent operator.
+No thresholds were relaxed. FP32-anchor, representative task and broader
+end-to-end envelope gates remain pending; profiled time is not a speedup claim.
+
+Reproduction (fresh processes):
+
+```bash
+bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile
+WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1 --torch-profile \
+  --flow-noise /path/to/first-run/flow_noise.npy
+```
+
+Local private artifacts: `/dev/shm/rhinoforge-wall-fp16-aaONUI/e2e-opt-on` and
+`e2e-opt-off` (ephemeral; tensor/trace artifacts are not committed). Trace hashes:
+`77cb4c97b0656b67c2a1143dd87683de3ff79132df7a1ebed397284ac9a67fca` (on),
+`3738ebd91ad3522b38cf4e85c17f90e58cecf0500dad2051a055029c8def76f0` (off).
+Native hash remains section 10's
+`f4dc2a1e29a5ea8791fc36069d2b84391e1d16986edcb066789b80edb77d6f35`;
+Launch and the r4 operator/manifest hashes are unchanged. Wrapper/runner hashes:
+`9c5f1c21fcc82db6b1fc73c3b2461e633f9fd24ad25fcfdc4785493e55d5be9f` /
+`4cda7b195d64a90185c914683887081d63915e2f09f788c73918943311b1d16f`.
+The final wheel hash is
+`91a8cd8eab69e1a2d16ec792d72d4db2942ffaf60f11dfa2dba033f3107d8406`;
+it differs from the OPT=1 diagnostic wheel only in the runtime's module
+docstring, and was used for OPT=0. The prior installed package is backed up as
+`installed-before-opt.tgz` in the same private directory (SHA-256
+`88be2e95060826c07ed6e228078359487ac9c94c344762cb35737508ea77b5ac`).

@@ -1627,8 +1627,12 @@ void rpu_launch_eltwise_binary_scalar_spm_kernel(
     c10::Half scalar_val,              // Scalar value
     uint32_t output_spm_addr,          // SPM output address (core 0 base)
     int64_t num_elements,              // Total elements per core
-    ValuOpType op_type)
+    ValuOpType op_type, int num_cores)
 {
+  TORCH_CHECK(num_cores >= 1 && num_cores <= NUM_CORES_BINARY,
+              "scalar spm: num_cores must be in [1,8]");
+  std::vector<uint8_t> core_list;
+  for (int i = 0; i < num_cores; ++i) core_list.push_back(i);
   size_t dwidth = sizeof(c10::Half);
   size_t n = num_elements;
   size_t normal_blk_n = 100 * 256;
@@ -1671,10 +1675,10 @@ void rpu_launch_eltwise_binary_scalar_spm_kernel(
   kernel->reset_regs();
   setup_regs(kernel);
 
-  auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+  auto* wq = GET_QUEUE(num_cores);
   wq->set_broadcast_mode(true);
   wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1},
-                    {0, 1, 2, 3, 4, 5, 6, 7});
+                    core_list);
 }
 
 // ==================== Nx1_NxC SPM Kernel ====================
@@ -1882,8 +1886,12 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     int64_t c,                         // C dimension
     c10::Half alpha_f,
     ValuOpType op_type,
-    bool is_bopa)
+    bool is_bopa, int num_cores)
 {
+  TORCH_CHECK(num_cores >= 1 && num_cores <= NUM_CORES_BINARY,
+              "1xC_NxC spm: num_cores must be in [1,8]");
+  std::vector<uint8_t> core_list;
+  for (int i = 0; i < num_cores; ++i) core_list.push_back(i);
   // ---- V2 tile-based path (C not v16-aligned, or C>1024, or N>8192) ----
   // 1:1 port of ConvertEltwiseBinary_1xC_NxC_V2. Reg layout follows the runtime:
   // reg0-1 = n (u32), reg2-3 = c (u32), reg10-11 = blk_stride (u32),
@@ -1949,10 +1957,10 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     kernel->set_regs(65, (uint16_t)1);
     kernel->set_regs(66, (uint16_t)1);
 
-    auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+    auto* wq = GET_QUEUE(num_cores);
     wq->set_broadcast_mode(true);
     wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1},
-                      {0, 1, 2, 3, 4, 5, 6, 7});
+                      core_list);
     return;
   }
 
@@ -2053,10 +2061,10 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
   kernel->reset_regs();
   setup_regs(kernel);
 
-  auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+  auto* wq = GET_QUEUE(num_cores);
   wq->set_broadcast_mode(true);
   wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1},
-                    {0, 1, 2, 3, 4, 5, 6, 7});
+                    core_list);
 }
 
 // ==================== Bx1xC_BxNxC middle-broadcast SPM Kernel ====================

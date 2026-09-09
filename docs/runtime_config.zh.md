@@ -167,8 +167,28 @@ producer 在 reduction 前清理 inactive shard。见
 
 ### Graph 与 replay
 
+segment 节点预算不是 token 或 chunk 数。`RPU_GRAPH_MAX_SEGMENT_ENTRIES=32768`
+可以解除受控 Wall Prefill（约 2.44 万节点）由节点数量触发的切段；命令/指令
+占用、queue 状态变化和 host callback 仍可能切段。必须核对实际 segment 数、
+数值一致性和 replay 后才能接受更大的执行配置。`0` 不表示无限制。
+Wall 统一冷开关为 `WALL_QWEN35_OPT`，默认 `1`：开启 Vision1 + Prefill1 +
+Action1，`0` 恢复录制 open-loop 数据集的 Vision3 + Prefill3 + Action10。
+两者均为 FP16 Action 运算、ACC32 GEMM，不恢复历史 FP32 host 路径；
+不再提供逐阶段选项。
+开关覆盖六项 Graph/SDK 预算：开启为 32768 entries / 8 MiB command /
+64 MiB instruction，SDK 65536 / 16 / 128；关闭为 8192 / 4 / 32，
+SDK 65536 / 8 / 64。切换需要新进程，非 Wall 通用默认值不变。
+优化 Vision/Prefill 和两种 Action 均采用
+`GraphCache(require_single_segment=True)`，每次调用在 SDK 一半的预算内要求
+一个物理 segment，否则执行前报错；关闭时 Action 单步图调用十次。
+增大 Prefill 预算不改变运算精度或 SPM 分块，受控验证仍不代表发布质量认证。
+
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
+| `WALL_QWEN35_OPT` | `1`；`1/true/yes/on` 或 `0/false/no/off`，不区分大小写；空/非法报错 | Wall policy 绑定 / **MODEL** 及进程冷预算；切换需新进程 | Wall 专用统一 1+1+1 与录制数据集 3+3+10 preset；覆盖六项 Graph/SDK 预算，两者均为 FP16 Action。 |
+| `RPU_GRAPH_MAX_SEGMENT_ENTRIES` | `8192`；严格十进制整数 `1..32768`；非法/空/零报错 | 首次原生 segment 规划 / **NATIVE**；修改后使用新进程 | 节点软预算，限制在 `LKN_MAX_BATCH_ENTRIES` 的一半以内；保留其他资源检查和 DMA fence。更大的 batch 需精确配置实板验证。 |
+| `RPU_GRAPH_MAX_SEGMENT_COMMAND_MB` | `4`；严格十进制整数 `1..8` | 首次原生 segment 规划 / **NATIVE** | command 软预算，单位 MiB，限制在 `LKN_KD_BUF_MB` 的一半以内。Wall 实验 preset 请求 `8` 及 SDK 容量 `16` MiB；更小的 SDK 容量仍可能触发切段。 |
+| `RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB` | `32`；严格十进制整数 `1..64` | 首次原生 segment 规划 / **NATIVE** | instruction 软预算，单位 MiB，限制在 `LKN_INSTR_BUF_MB` 的一半以内。Wall 实验 preset 请求 `64` 及 SDK 容量 `128` MiB；更大的容量可能增加 host batch 内存，不改变算子数学或 SPM 分块拓扑。 |
 | `RPU_DEEP_FAST_REPLAY` | 关闭；首字符不是 `0` 的任意非空值会启用 | Fused handle 构造 / **MODEL** | full-body replay 时跳过已审计的 setup 工作。配置必须证明每个被跳过的 input/layout 仍有效。 |
 | `RPU_FASTREPLAY_SKIP_SYNC` | 关闭；不以 `0` 开头的非空值会启用 | Graph BUILD / **BUILD** | 仅在完全跳过的 replay 中省略冗余 mutable-parameter scan。错误使用可能 replay 过期参数。 |
 | `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN` | 关闭；精确 `1`、`true`、`True` 或 `on` 会启用 | 首次原生 coexistence 使用 / **NATIVE** | 在配置负责的 subsystem handoff 之间保留 persistent SPM generation。归属错误可能破坏后续执行。 |

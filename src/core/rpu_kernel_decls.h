@@ -1036,7 +1036,7 @@ void rpu_launch_eltwise_binary_scalar_spm_kernel(
     c10::Half scalar_val,
     uint32_t output_spm_addr,
     int64_t num_elements,
-    ValuOpType op_type);
+    ValuOpType op_type, int num_cores = 8);
 
 void rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
     uint32_t a_spm_addr,
@@ -1056,7 +1056,7 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     int64_t n, int64_t c,
     c10::Half alpha_f,
     ValuOpType op_type,
-    bool is_bopa);
+    bool is_bopa, int num_cores = 8);
 
 // Bx1xC_BxNxC middle-axis broadcast (a=[B,1,C] op b=[B,N,C]). The broadcast
 // shape Nx1_NxC/1xC_NxC can't express (a "1" in a non-leading, non-last axis).
@@ -1268,6 +1268,12 @@ void rpu_qwen3_5_set_action_io_weights(
     int64_t action_dim,
     int64_t action_dim_pad,
     int64_t action_len);
+at::Tensor rpu_qwen3_5_wall_action_loop(
+    int64_t handle, const at::Tensor& action,
+    const at::Tensor& keep_mask, const at::Tensor& padding_velocity,
+    at::Tensor action_out, double delta_t, const at::Tensor& adaptive_mod,
+    at::TensorList k_caches, at::TensorList v_caches,
+    at::IntArrayRef prefix_lens, int64_t num_steps);
 int64_t rpu_qwen3_5_resolve_prefill_chunk_size(
     int64_t handle, int64_t execution_len);
 at::Tensor rpu_qwen3_5_forward(

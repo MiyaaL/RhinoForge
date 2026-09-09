@@ -36,6 +36,66 @@ def _profile_args(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_action_runtime_rejects_old_adapter_before_loading(openloop_namespace, monkeypatch):
+    from rpu_backend.adapters.wall_qwen35 import action
+    monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", None)
+    with pytest.raises(RuntimeError, match="rebuild and reinstall"):
+        openloop_namespace["_require_action_execution_runtime"]()
+
+
+def test_action_runtime_always_checks_fp16_abi(openloop_namespace, monkeypatch):
+    from rpu_backend.adapters.wall_qwen35 import action
+    calls = []
+    monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", lambda: calls.append(1))
+    guard = openloop_namespace["_require_action_execution_runtime"]
+    guard()
+    assert calls == [1]
+
+
+def test_unified_switch_rejects_stale_package(openloop_namespace, monkeypatch):
+    from rpu_backend.adapters.wall_qwen35 import execution
+    monkeypatch.delattr(execution, "WALL_QWEN35_OPT_ABI")
+    with pytest.raises(RuntimeError, match="rebuild and reinstall.*WALL_QWEN35_OPT"):
+        openloop_namespace["_configure_execution_runtime"]()
+
+
+@pytest.mark.parametrize("opt", [True, False])
+def test_ready_requires_physical_three_or_sixteen_submissions(openloop_namespace, opt):
+    torch = openloop_namespace["torch"]
+    def retained(count, segments, signatures):
+        entries = [{"signature": sig, "kernel_count": 4,
+                    "segment_count": segments, "replay_count": count[i],
+                    "non_replayable_reason": ""} for i, sig in enumerate(signatures)]
+        return {"size": len(entries), "max_entries": 3, "phase": "READY",
+                "replays": sum(count), "recaptures": 0,
+                "invariant_ok": True, "entries": entries}
+    before = {
+        "vision": retained([0] if opt else [0, 1], 1, ["triple"] if opt else ["face", "wrist"]),
+        "base_prefill": retained([0], 1 if opt else 3, ["bucket320"]),
+        "action": retained([0] if opt else [9], 1, ["prefix308"]),
+    }
+    after = {
+        "vision": retained([1] if opt else [1, 3], 1, ["triple"] if opt else ["face", "wrist"]),
+        "base_prefill": retained([1], 1 if opt else 3, ["bucket320"]),
+        "action": retained([1] if opt else [19], 1, ["prefix308"]),
+    }
+    warm = SimpleNamespace(actions=torch.zeros(1, 32, 26), actions_norm=torch.zeros(1, 32, 26),
+                           prefix_length=308)
+    measured = SimpleNamespace(actions=warm.actions.clone(), actions_norm=warm.actions_norm.clone(),
+                               prefix_length=308, extra={
+                                   "wall_qwen35_opt": opt,
+                                   "action_execution": "fp16_one_graph" if opt else "fp16_steps",
+                                   "action_graph_calls": 1 if opt else 10,
+                                   "vision_graph_calls": 1 if opt else 3,
+                               })
+    classify = openloop_namespace["_ready_replay_admission"]
+    result = classify(before, after, warm, measured)
+    assert result["full_ready"]
+    assert sum(c["physical_segments"] for c in result["components"].values()) == (3 if opt else 16)
+    after["base_prefill"]["entries"][0]["segment_count"] += 1
+    assert not classify(before, after, warm, measured)["full_ready"]
+
+
 def test_flow_noise_schedule_round_trips_common_artifact(
     openloop_namespace,
     tmp_path: Path,
@@ -574,6 +634,18 @@ def test_ready_replay_admission_accepts_retained_prefix_bucket(
         "retained prefix bucket Graph"
     )
 
+    # New FP16 profile unrolls ten steps into a single call and physical batch.
+    measured_output.extra = {"action_execution": "fp16_one_graph", "action_graph_calls": 1}
+    before["action"] = retained(0)
+    after["action"] = retained(1)
+    fp16_admission = classify(before, after, warm_output, measured_output)
+    assert fp16_admission["full_ready"]
+    assert fp16_admission["components"]["action"]["expected_replays"] == 1
+    after["action"]["entries"][0]["segment_count"] = 2
+    split_admission = classify(before, after, warm_output, measured_output)
+    assert not split_admission["components"]["action"]["accepted"]
+    after["action"]["entries"][0]["segment_count"] = 1
+
     configuring_before = {
         name: retained(
             int(stats["replays"]),
@@ -818,8 +890,10 @@ def test_wrapper_exposes_and_forwards_profile_options() -> None:
     assert "--torch-profile-memory" in result.stdout
     assert "--torch-profile-with-stack" in result.stdout
     assert "READY-probe output directory" in result.stdout
-    assert "Vision defaults to one Graph" in result.stdout
-    assert "No extra enable flag is needed" in result.stdout
+    assert "WALL_QWEN35_OPT=1 (default)" in result.stdout
+    assert "WALL_QWEN35_OPT=0" in result.stdout
+    assert "--language-one-graph" not in result.stdout
+    assert "--action-execution" not in result.stdout
 
     source = WRAPPER.read_text(encoding="utf-8")
     assert '--torch-profile-output "$TORCH_PROFILE_OUTPUT"' in source
@@ -861,6 +935,35 @@ def test_runner_validates_native_and_reports_loaded_adapter(
     monkeypatch.setattr(vision, "_require_packed_spatial_vision_native", stale_native)
     with pytest.raises(RuntimeError, match="native ABI mismatch"):
         openloop_namespace["_require_packed_vision_runtime"]()
+
+
+def test_experimental_graph_budget_requires_new_native(openloop_namespace, monkeypatch):
+    import rpu_backend
+
+    for name in ("RPU_GRAPH_MAX_SEGMENT_ENTRIES", "RPU_GRAPH_MAX_SEGMENT_COMMAND_MB",
+                 "RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(rpu_backend, "_cpp_ext", SimpleNamespace(), raising=False)
+    require = openloop_namespace["_require_graph_budget_runtime"]
+    require()  # The unchanged conservative path still works with an old build.
+    monkeypatch.setenv("RPU_GRAPH_MAX_SEGMENT_ENTRIES", "32768")
+    with pytest.raises(RuntimeError, match="rebuild and reinstall"):
+        require()
+    monkeypatch.setattr(rpu_backend, "_cpp_ext", SimpleNamespace(graph_segment_budget_abi=1))
+    require()
+    source = inspect.getsource(openloop_namespace["main"])
+    assert source.index("_require_graph_budget_runtime()") < source.index(
+        "WallQwen35Policy.from_checkpoint("
+    )
+
+
+@pytest.mark.parametrize("value", ["", "0", "+8192", "8192x", "32769"])
+def test_runner_rejects_bad_graph_budget_before_loading(
+    openloop_namespace, monkeypatch, value,
+):
+    monkeypatch.setenv("RPU_GRAPH_MAX_SEGMENT_ENTRIES", value)
+    with pytest.raises(ValueError, match="RPU_GRAPH_MAX_SEGMENT_ENTRIES"):
+        openloop_namespace["_require_graph_budget_runtime"]()
 
 
 def test_wrapper_rejects_profile_in_check_mode_before_environment_setup() -> None:

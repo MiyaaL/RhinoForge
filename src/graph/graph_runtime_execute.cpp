@@ -5,6 +5,7 @@
 // execution, and execute_graph_* loops.
 #include "graph/graph_runtime.h"
 #include "graph/graph_runtime_internal.h"
+#include "graph/graph_segment_budget.h"
 #include "rpu_copy_safety.h"
 #include "rpu_profile.h"        // debug-level log_at(N) gate
 
@@ -533,6 +534,8 @@ void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
         // 两者都空时才是 raw-kernel 降级(调用者既没走 GET_KERNEL(id) 也
         // 没走 active().get_kernel_reset(name))。
         if (!pending_kernel_id_.has_value() && !pending_kernel_name_.has_value()) {
+            TORCH_CHECK(!require_single_segment_,
+                        "Single-segment Graph forbids raw-kernel downgrade");
             TORCH_CHECK(
                 composite_fmb_invocation_.phase ==
                     CompositeFmbInvocationState::Phase::None,
@@ -684,6 +687,8 @@ void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
 void RpuKernelGraph::sync_point() {
     check_foreign_graph_execution_allowed(
         "RpuKernelGraph: foreign Graph sync_point");
+    TORCH_CHECK(!require_single_segment_ || state_ != State::RECORDING || nodes_.empty(),
+                "Single-segment Graph forbids partial execution at sync_point");
     TORCH_CHECK(
         composite_fmb_invocation_.phase ==
             CompositeFmbInvocationState::Phase::None,
@@ -1026,18 +1031,37 @@ static size_t segment_env_limit(const char* name,
     return std::min(static_cast<size_t>(parsed), max_mb) << 20;
 }
 
-static SegmentResourceBudget segment_resource_budget() {
+static SegmentResourceBudget segment_resource_budget(bool require_single_segment) {
     constexpr size_t kMiB = 1u << 20;
+    // Cold bounded overrides. Generic defaults remain 8192 / 4 MiB / 32 MiB.
+    // Larger controlled profiles must also enlarge SDK capacities to retain
+    // at least 2x headroom; none of these knobs removes SDK hard guards.
+    static const size_t requested_entries =
+        rpu_graph_detail::parse_segment_entry_budget(
+            std::getenv("RPU_GRAPH_MAX_SEGMENT_ENTRIES"));
+    static const size_t requested_kd_mb = rpu_graph_detail::parse_segment_limit(
+        std::getenv("RPU_GRAPH_MAX_SEGMENT_COMMAND_MB"),
+        "RPU_GRAPH_MAX_SEGMENT_COMMAND_MB", 4, 8);
+    static const size_t requested_instr_mb = rpu_graph_detail::parse_segment_limit(
+        std::getenv("RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB"),
+        "RPU_GRAPH_MAX_SEGMENT_INSTRUCTION_MB", 32, 64);
     const size_t sdk_entries = segment_env_limit(
         "LKN_MAX_BATCH_ENTRIES", 65536, 1u << 22, false);
     const size_t sdk_kd = segment_env_limit(
         "LKN_KD_BUF_MB", 8 * kMiB, 256 * kMiB, true);
     const size_t sdk_instr = segment_env_limit(
         "LKN_INSTR_BUF_MB", 64 * kMiB, 1024 * kMiB, true);
+    if (require_single_segment) {
+        // Opt-in immutable per-cache policy: use half the SDK capacities, with
+        // bounded maxima, without widening any other Graph's soft budget.
+        return {std::min<size_t>(65536, sdk_entries / 2),
+                std::min<size_t>(32 * kMiB, sdk_kd / 2),
+                std::min<size_t>(256 * kMiB, sdk_instr / 2)};
+    }
     return {
-        std::max<size_t>(1, std::min<size_t>(8192, sdk_entries / 2)),
-        std::max<size_t>(16, std::min<size_t>(4 * kMiB, sdk_kd / 2)),
-        std::max<size_t>(4096, std::min<size_t>(32 * kMiB, sdk_instr / 2)),
+        rpu_graph_detail::effective_segment_entry_budget(requested_entries, sdk_entries),
+        std::max<size_t>(16, std::min<size_t>(requested_kd_mb * kMiB, sdk_kd / 2)),
+        std::max<size_t>(4096, std::min<size_t>(requested_instr_mb * kMiB, sdk_instr / 2)),
     };
 }
 
@@ -1098,6 +1122,8 @@ static bool segment_would_exceed(const SegmentResourceUse& current,
 
 void RpuKernelGraph::build_segments_from_nodes() {
     segments_.clear();
+    TORCH_CHECK(!require_single_segment_ || !nodes_.empty(),
+                "Single-segment Graph cannot be empty");
     if (nodes_.empty()) return;
 
     const std::string graph_label =
@@ -1115,7 +1141,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
     //      边界贪心切段，避免大图虽 build_batch rc=0 却在硬件静默错算。
     constexpr size_t kNoOpenSeg = std::numeric_limits<size_t>::max();
     const SegmentResourceBudget resource_budget =
-        segment_resource_budget();
+        segment_resource_budget(require_single_segment_);
     size_t seg_start = kNoOpenSeg;
     uint8_t seg_max_num_cores = 0;
     std::vector<uint8_t> seg_isolated_core_ids;  // 非空 = SPLIT_KERNELS 命中的 solo 段
@@ -1178,6 +1204,9 @@ void RpuKernelGraph::build_segments_from_nodes() {
             for (uint8_t k = 0; k < n; ++k) seg.core_ids[k] = k;
         }
         seg.queue_state = seg_queue_state;
+        seg.entry_count = seg_resources.entries;
+        seg.command_bytes = seg_resources.kd_bytes;
+        seg.instruction_bytes = seg_resources.instr_bytes;
         segments_.push_back(std::move(seg));
         seg_start = kNoOpenSeg;
         seg_max_num_cores = 0;
@@ -1254,7 +1283,18 @@ void RpuKernelGraph::build_segments_from_nodes() {
         }
     }
     close_segment(nodes_.size());
-
+    if (require_single_segment_) {
+        TORCH_CHECK(segments_.size() == 1 && segments_[0].start_idx == 0
+                    && segments_[0].end_idx == nodes_.size(),
+                    "Graph requires one physical segment covering all nodes: ", graph_label,
+                    "; got ", segments_.size(), " segments for ", nodes_.size(),
+                    " nodes. Check SDK LKN_* capacities, queue states and host nodes.");
+        const auto& seg = segments_[0];
+        TORCH_CHECK(seg.entry_count <= resource_budget.entries
+                    && seg.command_bytes <= resource_budget.kd_bytes
+                    && seg.instruction_bytes <= resource_budget.instr_bytes,
+                    "Single-segment Graph exceeds its SDK-half safety budget: ", graph_label);
+    }
 }
 
 // =============================================================================
