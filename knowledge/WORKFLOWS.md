@@ -43,10 +43,26 @@ one compressed trace per request with shapes/stacks enabled and memory events
 disabled. The first trace includes lazy setup/BUILD; do not infer frozen READY
 or steady-state latency from it. Keep historical READY-probe commands bound to
 their measured revision when updating the [testing guide](../docs/model_testing.md).
+For local asset migration, copy the exact checkpoint inference files and the
+complete recorded episode, plus any explicit common-noise artifact. The local
+wrapper defaults to `/mnt/nvme/miyaa/work/{ckpt,dataset,prof}`. Preserve hashed
+checkpoint configs, check symlink and Python/library resolution, and run the
+full host `--check` with the remote mount hidden in a private mount namespace.
+Record copy hashes and any execution smoke check separately from model-quality
+or release-lifecycle evidence.
 Wall's three Graph labels use the common `rpu_wall_qwen35_` prefix with
 `vision`, `prefill` and `action` suffixes in both OPT modes. Labels are assigned
 before capture; generic Qwen3.5 naming and historical trace artifacts remain
 unchanged. Keep precision/step mode in execution metadata, not stage labels.
+Cold Wall Vision labels belong to policy metadata (`_wall_qwen35_*`), not the
+reserved `_rpu_*` hardware-attribute namespace. Test the real recursive
+pre/post-install validators at the Wall-to-Qwen adapter boundary in both OPT
+modes; forward-only doubles do not catch installation-time name violations.
+Hardware filename timestamps use the process-local session start (`TZ` or
+system timezone), not the per-dump write time; older native builds used UTC.
+Keep dump ordering and JSON event time bases unchanged. Cover UTC, positive,
+fractional and negative offsets with the compiled native formatter test, and
+rebuild/reinstall the extension before verifying new files on the board.
 
 1. Confirm the statement in public source or documentation.
 2. Update the existing page that owns the fact; create a page only for a new,

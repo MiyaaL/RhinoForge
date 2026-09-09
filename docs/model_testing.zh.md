@@ -111,6 +111,15 @@ bash run_wall_qwen35_openloop.sh --max-events 1 \
 bash run_wall_qwen35_openloop.sh
 ```
 
+本机脚本默认读取 `/mnt/nvme/miyaa/work/ckpt/0_200000` 中的推理 checkpoint，
+以及 `/mnt/nvme/miyaa/work/dataset` 下的录制 episode；默认输出写入
+`/mnt/nvme/miyaa/work/prof` 下的新目录，无需 `/mnt/miyaa` 远端挂载。
+迁移时需复制权重、配置、tokenizer/preprocessor、归一化参数和完整 episode
+（轨迹、指令、三路视频）；推理不需要 optimizer 或训练恢复状态。
+checkpoint 配置必须保持字节不变，准入会校验哈希；`config.yml` 中记录的训练路径
+不由该 runner 加载。Python 环境和已安装的 RPU 运行时资产继续使用本机版本。
+显式 CLI 参数和环境变量仍可覆盖默认路径。
+
 三图合并的 Vision 路径默认开启，不需要额外 flag。脚本使用所选 Python 环境中
 **已安装**的 `rpu_backend`；仅修改源码不会更新该安装包。从当前源码重建并安装后运行：
 
@@ -201,6 +210,9 @@ Graph BUILD 会记录；后续请求签名变化时也可能 BUILD。trace 仅�
 文件名包含时间戳、PID、BUILD/REPLAY/oneshot 阶段和 segment 序号。
 在 Perfetto 中主要查看 `*_replay_segN.json`，并检查推理区域对应的全部 segment。
 r4 Release runtime 会按设计脱敏这些 trace。
+文件名时间戳使用进程本地时区的会话开始时间，同一会话共享，并非各文件的写入时间。
+旧 native 构建使用 UTC（比 Asia/Shanghai 慢 8 小时）；重新编译安装后才会使用本地
+时间命名。已有文件名和 JSON 内部事件计时保持不变。
 
 Wall 两种 OPT 模式的 Graph 名称统一为 `rpu_wall_qwen35_vision`、
 `rpu_wall_qwen35_prefill`、`rpu_wall_qwen35_action`，同时用于硬件文件名、

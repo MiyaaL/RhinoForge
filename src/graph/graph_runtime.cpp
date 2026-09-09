@@ -878,11 +878,13 @@ std::string make_hw_perf_session_prefix(uint64_t generation) {
     const auto now = system_clock::now();
     const auto micros = duration_cast<microseconds>(now.time_since_epoch());
     const std::time_t wall = system_clock::to_time_t(now);
-    std::tm utc{};
-    gmtime_r(&wall, &utc);
+    // Match the process-local clock used by runner directories and Torch
+    // profiles. This is a session label, not the device event time base.
+    std::tm local{};
+    localtime_r(&wall, &local);
 
     std::ostringstream oss;
-    oss << "rpu_hwperf_" << std::put_time(&utc, "%Y%m%d_%H%M%S")
+    oss << "rpu_hwperf_" << std::put_time(&local, "%Y%m%d_%H%M%S")
         << "_" << std::setfill('0') << std::setw(6)
         << (micros.count() % 1'000'000)
         << "_pid" << static_cast<unsigned long>(::getpid())

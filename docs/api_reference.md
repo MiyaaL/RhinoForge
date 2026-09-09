@@ -415,6 +415,12 @@ Graph, and use replay files for steady-state structure. r4 Release traces retain
 kernel/DMA timing and scheduling metadata but intentionally omit readable
 kernel names, operation types, and raw addresses. They are sensitive
 application diagnostics, not full cache/stall/utilization PMU profiles.
+The filename timestamp is the collection session start in the process's local
+timezone (`TZ` or the system timezone), shared by all files in that session;
+the dump index orders individual files. Earlier builds used UTC. This naming
+change does not shift timestamps or durations inside the trace JSON. Rebuild
+and reinstall the native extension for the change to take effect; existing
+files are not renamed.
 
 CPU/RPU boundary flushing is enabled by default and should not be disabled in
 normal inference. Chunk size is a per-handle `rpu_execution` setting, not a

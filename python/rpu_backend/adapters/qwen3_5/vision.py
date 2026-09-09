@@ -1185,7 +1185,7 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
                 ):
                     self._rpu_vision_graph_cache.evict(self._rpu_vision_graph_sig)
                 self._rpu_vision_graph_sig = rpu_backend.graph.GraphSignature(
-                    op_id=getattr(self, "_rpu_vision_graph_op_id", "qwen3_5_vision"),
+                    op_id=getattr(self, "_wall_qwen35_vision_graph_op_id", "qwen3_5_vision"),
                     shapes=[
                         n_i, self._rpu_vision_hidden_size,
                         *[int(dim) for dim in embed_i.shape],

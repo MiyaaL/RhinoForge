@@ -134,7 +134,7 @@ def test_graph_labels_are_policy_owned_in_both_vision_modes(
     tower, calls, graph = packed_runtime
     tower._rpu_vision_packed_spatial = packed
     if wall_label:
-        tower._rpu_vision_graph_op_id = "rpu_wall_qwen35_vision"
+        tower._wall_qwen35_vision_graph_op_id = "rpu_wall_qwen35_vision"
     grid = torch.tensor([[1, 8, 14], [1, 10, 14], [1, 10, 14]])
     pixels = torch.zeros((392, 4), dtype=torch.float16)
     for _ in range(2):
@@ -149,7 +149,7 @@ def test_graph_labels_are_policy_owned_in_both_vision_modes(
 def test_wall_sets_graph_labels_before_adapter_installation():
     source = (Path(__file__).resolve().parents[1]
               / "python/rpu_backend/adapters/wall_qwen35/runtime.py").read_text()
-    label = 'self.base_model.model.visual._rpu_vision_graph_op_id = "rpu_wall_qwen35_vision"'
+    label = 'self.base_model.model.visual._wall_qwen35_vision_graph_op_id = "rpu_wall_qwen35_vision"'
     assert source.index(label) < source.index("self._base_adapter.to_rpu(")
     assert 'text_state.prefill_graph_op_id = "rpu_wall_qwen35_prefill"' in source
 

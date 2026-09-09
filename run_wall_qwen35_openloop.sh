@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ENV_SH="${ENV_SH:-/home/hx/miyaa/work/env.sh}"
-DATASET_DIR="${DATASET_DIR:-/mnt/miyaa/work/dataset/20260122-day-put_spoon_to_bowl@MASTER_SLAVE_MODE@2026_01_22_18_19_18}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/miyaa/work/ckpt/0_200000}"
+DATASET_DIR="${DATASET_DIR:-/mnt/nvme/miyaa/work/dataset/20260122-day-put_spoon_to_bowl@MASTER_SLAVE_MODE@2026_01_22_18_19_18}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/nvme/miyaa/work/ckpt/0_200000}"
 RPU_KERNEL_LIB_PATH="${RPU_KERNEL_LIB_PATH:-/home/hx/.local/share/rhinoforge/runtime/runtime-v1.0.0-r4/rhinoOpLib_rhinoforge_v1.0.0.ref}"
 RHINO_LAUNCH_LIB_DIR="${RHINO_LAUNCH_LIB_DIR:-/home/hx/.local/opt/rhino-launch-kernel-v1.0.0-linux-aarch64/lib}"
 INSTRUCTION_SOURCE="${INSTRUCTION_SOURCE:-distribute}"
@@ -23,7 +23,7 @@ LKN_RPU_FREQ_MHZ="${LKN_RPU_FREQ_MHZ:-800}"
 WALL_FUSED_SILU_MUL="${RPU_QWEN35_WALL_FUSED_SILU_MUL:-0}"
 WALL_PREREDUCE_RESIDUAL_GATE="${RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE:-0}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
-OUTPUT_DIR="${OUTPUT_DIR:-/tmp/wall_qwen35_openloop_${RUN_ID}}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/nvme/miyaa/work/prof/wall_qwen35_openloop_${RUN_ID}}"
 
 usage() {
     cat <<'EOF'
@@ -52,7 +52,8 @@ controlled evaluation, not a numerical/task-quality support certification.
 Options:
       --dataset-dir PATH       Recorded flat episode directory.
       --checkpoint PATH        Exact Wall Qwen3.5 checkpoint directory.
-      --output-dir PATH        Fresh output directory (default: /tmp/...RUN_ID).
+      --output-dir PATH        Fresh output directory (default:
+                               /mnt/nvme/miyaa/work/prof/wall_qwen35_openloop_RUN_ID).
       --instruction-source KEY Event captions in instruction.json
                                (default: distribute).
       --robot-id ID            Dataset-V2 embodiment ID (default: 10070).
@@ -93,14 +94,14 @@ Examples:
   bash run_wall_qwen35_openloop.sh --check
   bash run_wall_qwen35_openloop.sh --max-requests 1
   bash run_wall_qwen35_openloop.sh --max-requests 1 \
-    --torch-profile-dir /tmp/wall_qwen35_torch_profile
+    --torch-profile-dir /mnt/nvme/miyaa/work/prof/wall_qwen35_torch_profile
   bash run_wall_qwen35_openloop.sh --max-requests 1 \
-    --hw-perf-dir /home/hx/miyaa/work/prof/wall_qwen35_hwperf
+    --hw-perf-dir /mnt/nvme/miyaa/work/prof/wall_qwen35_hwperf
   bash run_wall_qwen35_openloop.sh --max-events 1 \
-    --torch-profile-dir /tmp/wall_qwen35-openloop-profile
+    --torch-profile-dir /mnt/nvme/miyaa/work/prof/wall_qwen35-openloop-profile
   bash run_wall_qwen35_openloop.sh \
-    --flow-noise /mnt/miyaa/work/prof/harrix_qwen35_bf16_flow_noise_20260901.npy \
-    --output-dir /tmp/wall_qwen35_accuracy_report_repro
+    --flow-noise /mnt/nvme/miyaa/work/prof/harrix_qwen35_bf16_flow_noise_20260901.npy \
+    --output-dir /mnt/nvme/miyaa/work/prof/wall_qwen35_accuracy_report_repro
   bash run_wall_qwen35_openloop.sh
 EOF
 }

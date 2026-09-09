@@ -290,7 +290,9 @@ class WallQwen35Runtime:
             self.base_model.model.visual._wall_qwen35_packed_vision = self.wall_qwen35_opt
             # Cold, policy-owned label for both packed and per-image Graphs.
             # Keep generic Qwen3.5 naming unchanged outside the Wall runtime.
-            self.base_model.model.visual._rpu_vision_graph_op_id = "rpu_wall_qwen35_vision"
+            # Do not use _rpu_*: preinstall reserves that namespace for public
+            # hardware settings and rejects pre-existing internal runtime state.
+            self.base_model.model.visual._wall_qwen35_vision_graph_op_id = "rpu_wall_qwen35_vision"
             # This VLA uses the base decoder only to populate six physical K/V
             # prefixes for the action expert.  It never consumes language
             # logits, and its 256277-row tied head cannot satisfy the generic

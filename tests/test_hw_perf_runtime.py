@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
 from types import SimpleNamespace
 import sys
 
@@ -91,3 +96,52 @@ def test_hw_perf_disable_canonicalizes_unused_arguments(hw_perf_module) -> None:
     module.set_hw_perf_trace(False, "ignored", -1)
 
     assert extension.calls == [(False, "", 0)]
+
+
+@pytest.fixture(scope="module")
+def hw_perf_prefix_probe(tmp_path_factory):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("C++17 compiler is required for the native timestamp probe")
+    # Compile the production formatter itself, without importing Torch or
+    # initializing an RPU. Keep clock sampling and formatting unmodified.
+    source = (ROOT / "src/graph/graph_runtime.cpp").read_text()
+    start = source.index("std::string make_hw_perf_session_prefix(")
+    end = source.index("\nstd::string sanitize_hw_perf_graph_label(", start)
+    tmp = tmp_path_factory.mktemp("hw-perf-prefix")
+    probe = tmp / "probe.cpp"
+    probe.write_text(
+        "#include <chrono>\n#include <ctime>\n#include <cstdint>\n"
+        "#include <sstream>\n#include <iomanip>\n#include <iostream>\n"
+        "#include <unistd.h>\n" + source[start:end] +
+        '\nint main() { std::cout << make_hw_perf_session_prefix(7) << "\\n"'
+        ' << ::getpid() << "\\n"; }\n'
+    )
+    binary = tmp / "probe"
+    subprocess.run(
+        [compiler, "-std=c++17", str(probe), "-o", str(binary)],
+        capture_output=True, text=True, check=True,
+    )
+    return binary
+
+
+@pytest.mark.parametrize("tz,offset_minutes", [
+    ("UTC0", 0), ("CST-8", 480), ("NPT-5:45", 345), ("WEST12", -720),
+])
+def test_native_hw_perf_prefix_uses_process_local_time(
+    hw_perf_prefix_probe, tz, offset_minutes,
+):
+    before = datetime.now(timezone.utc)
+    result = subprocess.run(
+        [str(hw_perf_prefix_probe)], env={**os.environ, "TZ": tz},
+        capture_output=True, text=True, check=True,
+    )
+    after = datetime.now(timezone.utc)
+    prefix, pid = result.stdout.splitlines()
+    match = re.fullmatch(r"rpu_hwperf_(\d{8}_\d{6}_\d{6})_pid(\d+)_g7", prefix)
+    assert match is not None
+    assert match[2] == pid
+    local = datetime.strptime(match[1], "%Y%m%d_%H%M%S_%f").replace(
+        tzinfo=timezone(timedelta(minutes=offset_minutes)),
+    )
+    assert before <= local <= after

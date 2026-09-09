@@ -439,6 +439,88 @@ def test_runtime_rejects_old_vision_native_before_loading(monkeypatch):
     assert runtime._closed
 
 
+@pytest.mark.parametrize("opt", [True, False])
+def test_runtime_graph_labels_pass_real_install_attribute_validation(monkeypatch, opt):
+    import rpu_backend
+    from rpu_backend.adapters.qwen3_5 import vision
+    from rpu_backend.adapters.wall_qwen35 import action, execution
+    from rpu_backend.adapters.wall_qwen35 import runtime as wall_runtime
+    from rpu_backend.runtime import RPUConfigError
+    from rpu_backend.runtime.hw_attrs import (
+        install_hw_attr_validator,
+        validate_postinstall,
+        validate_preinstall,
+    )
+
+    for key in (
+        "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN",
+        "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+        "QWEN3_5_VISION_GRAPH_MAX_ENTRIES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(execution, "configure_wall_qwen35_execution", lambda opt: None)
+    monkeypatch.setattr(vision, "_require_packed_spatial_vision_native", lambda: None)
+    monkeypatch.setattr(action, "require_wall_fp16_loop_runtime", lambda: None)
+    monkeypatch.setattr(
+        rpu_backend.graph, "GraphCache",
+        lambda **kw: SimpleNamespace(**kw, clear=lambda: None),
+    )
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace())
+    model.model = torch.nn.Module()
+    model.model.visual = torch.nn.Module()
+    model.model.language_model = torch.nn.Module()
+    monkeypatch.setattr(wall_runtime, "_load_processor", lambda *a, **kw: object())
+    monkeypatch.setattr(wall_runtime, "_load_base_model", lambda *a, **kw: model)
+    installs = []
+
+    class Adapter:
+        def __init__(self, base):
+            self.model = base
+
+        def to_rpu(self, **kwargs):
+            # Exercise the real recursive pre/post-install checks and validator
+            # stamp at the actual Wall -> Qwen adapter boundary. Only device
+            # weight installation is doubled; SimpleNamespace-only towers in
+            # forward tests cannot catch a cold attribute namespace violation.
+            validate_preinstall(self.model)
+            self.model.model.language_model._rpu_qwen3_5 = SimpleNamespace()
+            validate_postinstall(self.model)
+            install_hw_attr_validator(self.model)
+            installs.append(kwargs)
+
+    monkeypatch.setattr(wall_runtime, "Qwen3_5Adapter", Adapter)
+    monkeypatch.setattr(wall_runtime.Qwen3_5Cache, "from_config", lambda *a, **kw: object())
+    expert = SimpleNamespace(_rpu_qwen3_5=SimpleNamespace())
+    monkeypatch.setattr(action, "load_wall_qwen35_action_module", lambda *a, **kw: expert)
+    monkeypatch.setattr(action, "patch_wall_qwen35_action_for_rpu", lambda obj, **kw: obj)
+    runtime = _empty_runtime_for_install_test()
+    runtime.wall_qwen35_opt = opt
+    runtime.checkpoint = Path("/synthetic")
+    runtime._manifest = object()
+    runtime.max_seq_len = 512
+    runtime._action_min = runtime._action_delta = torch.zeros(26)
+    try:
+        assert runtime.install() is runtime
+        assert runtime.install() is runtime
+        assert len(installs) == 1
+        tower = model.model.visual
+        assert tower._wall_qwen35_packed_vision is opt
+        assert tower._wall_qwen35_vision_graph_op_id == "rpu_wall_qwen35_vision"
+        assert not hasattr(tower, "_rpu_vision_graph_op_id")
+        validate_postinstall(model)
+        # The fix must not relax unknown/stale hardware-attribute rejection.
+        with pytest.raises(RPUConfigError, match="Unknown hardware attribute"):
+            tower._rpu_vision_graph_op_id = "stale"
+        stale = torch.nn.Module()
+        stale._rpu_vision_graph_op_id = "stale"
+        with pytest.raises(RPUConfigError, match="BEFORE"):
+            validate_preinstall(stale)
+    finally:
+        runtime.close()
+
+
 class _PredictRuntime:
     def __init__(self) -> None:
         self.calls: list[dict] = []

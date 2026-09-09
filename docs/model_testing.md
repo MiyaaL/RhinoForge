@@ -133,6 +133,18 @@ bash run_wall_qwen35_openloop.sh \
   --flow-noise /path/to/common_flow_noise.npy
 ```
 
+The local wrapper defaults to the inference checkpoint at
+`/mnt/nvme/miyaa/work/ckpt/0_200000`, the recorded episode under
+`/mnt/nvme/miyaa/work/dataset`, and a fresh output directory under
+`/mnt/nvme/miyaa/work/prof`. These defaults do not require the `/mnt/miyaa`
+remote mount. Copy the checkpoint weights, configs, tokenizer/preprocessor,
+normalizers, and complete episode (trajectory, captions, and three videos).
+Training optimizer and resume state are not inference dependencies. Keep
+checkpoint configs byte-identical: admission checks their hashes; training
+paths recorded inside `config.yml` are not loaded by this runner. The existing
+local Python environment and installed RPU runtime assets are still used.
+Explicit CLI arguments and environment overrides retain precedence.
+
 The wrapper defaults to **one Vision Graph for the three images**; no opt-in
 switch beyond the wrapper's existing controlled-evaluation mode is needed.
 It uses the installed `rpu_backend`, not the source-tree Python package. After
@@ -222,9 +234,9 @@ full run with the captured Harrix BF16 CUDA noise:
 
 ```bash
 bash run_wall_qwen35_openloop.sh \
-  --flow-noise /mnt/miyaa/work/prof/harrix_qwen35_bf16_flow_noise_20260901.npy \
-  --output-dir /tmp/wall_qwen35_accuracy_report_repro
-sha256sum /tmp/wall_qwen35_accuracy_report_repro/{flow_noise,pred_concat}.npy
+  --flow-noise /mnt/nvme/miyaa/work/prof/harrix_qwen35_bf16_flow_noise_20260901.npy \
+  --output-dir /mnt/nvme/miyaa/work/prof/wall_qwen35_accuracy_report_repro
+sha256sum /mnt/nvme/miyaa/work/prof/wall_qwen35_accuracy_report_repro/{flow_noise,pred_concat}.npy
 ```
 
 The expected hashes are `6b01140934037843ef2364a5da5dd864bf0ee7f27df3820ed1ff370bf866f5d3`
@@ -265,6 +277,10 @@ segment JSON files with `--hw-perf-max-dumps` (default 32). Filenames include a
 timestamp, PID, BUILD/REPLAY/oneshot phase, and segment index. Use the
 `*_replay_segN.json` files in Perfetto and inspect every segment belonging to
 the inference region. r4 Release traces are intentionally redacted.
+The timestamp is the session start in the process's local timezone, shared by
+all dumps; it is not each file's write time. Earlier native builds used UTC
+(eight hours behind Asia/Shanghai). Rebuild/reinstall the native extension to
+use local names. Existing filenames and JSON event timing remain unchanged.
 
 Wall's Graph labels are consistently `rpu_wall_qwen35_vision`,
 `rpu_wall_qwen35_prefill` and `rpu_wall_qwen35_action` in both OPT modes. They

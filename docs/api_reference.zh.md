@@ -339,6 +339,10 @@ issue；API 不暴露 raw Graph register/resource/plan payload。
 稳态结构主要查看 replay 文件。r4 Release trace 保留 kernel/DMA timing 与调度元数据，
 但会移除可读 kernel 名、op type 和原始地址。它是敏感应用诊断产物，不是完整的
 cache/stall/utilization PMU profiler。
+文件名时间戳是采集会话开始时的进程本地时间（`TZ` 或系统时区），同一会话的全部文件
+共享该时间戳，单个文件由 dump 序号排序。旧版使用 UTC。此命名调整不会平移 JSON
+内部的事件时间戳或持续时间；需要重新编译并安装 native extension 才会生效，已有文件
+不会自动重命名。
 
 CPU/RPU boundary flush 默认打开，正常推理不要关闭。Chunk size 属于 per-handle
 `rpu_execution`，不是进程全局 `torch.rpu` setter。内部 `torch.ops.rpu.*` 是 adapter
