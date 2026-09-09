@@ -54,13 +54,16 @@ Wall's three Graph labels use the common `rpu_wall_qwen35_` prefix with
 `vision`, `prefill` and `action` suffixes in both OPT modes. Labels are assigned
 before capture; generic Qwen3.5 naming and historical trace artifacts remain
 unchanged. Keep precision/step mode in execution metadata, not stage labels.
-Optimized Wall Prefill uses one outer chunk per64..384-row prefix bucket, not
+Optimized Wall Prefill uses one outer chunk per 64..384-row prefix bucket, not
 just one Graph segment. Its native cold override must retain kernel/SPM guards;
-the internal GDN64-row recurrence is unchanged. Validate maximum384-row SPM
+the internal GDN 64-row recurrence is unchanged. Validate maximum 384-row SPM
 with Vision/Action co-resident, consumed KV/recurrent/conv state parity and
 cross-bucket A/B/A before citing speedups. Generic and split-mode envelopes stay
-at128. Compare profiler-off warm Prefill and end-to-end timing separately from
+at 128. Compare profiler-off warm Prefill and end-to-end timing separately from
 BUILD/install, because one chunk also selects SPM-resident inter-layer I/O.
+Keep the [Prefill validation receipt](../docs/wall_qwen35_prefill_chunk_validation.md)
+bound to its repaired reference; repeat tests must vary the first BUILD length
+as well as later inputs when investigating a history-sensitive discrepancy.
 
 For GDN padding fills, keep the grid equal to `ceil(actual_elements/2048)`;
 extra blocks in the release fill asset can corrupt adjacent live Q/K rows.

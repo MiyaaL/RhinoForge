@@ -192,14 +192,17 @@ it does not promote the model's Source-only status.
 Optimized Prefill also uses the whole prefix bucket as one outer compute chunk:
 the recorded episode uses 320 rows instead of `128 + 128 + 64`. This is distinct
 from Graph segmentation. Gated DeltaNet keeps its internal 64-row recurrence.
-For chunks above128, mutually exclusive Full Attention/GDN scratch lifetimes
+For chunks above 128, mutually exclusive Full Attention/GDN scratch lifetimes
 are separated; persistent buffers and the hard co-resident SPM limit are unchanged.
 One outer chunk lets the existing planner keep inter-layer hidden states in SPM.
 The Wall-only cold override fails on insufficient memory rather than silently
-splitting; generic Qwen3.5 and `WALL_QWEN35_OPT=0` keep their128-row ceiling.
+splitting; generic Qwen3.5 and `WALL_QWEN35_OPT=0` keep their 128-row ceiling.
 Check the Prefill signature's chunk dimension against the bucket, finite consumed
 KV/state outputs, and cross-bucket A/B/A replay when validating this path. Different
 FP16 GEMM/SDPA/reduction geometry is not a bitwise-equivalence guarantee.
+See the [whole-bucket Prefill validation receipt](wall_qwen35_prefill_chunk_validation.md)
+for the repaired-baseline comparison, bounded timings and unresolved numerical
+gates; finite outputs and faster execution do not promote this profile.
 
 Both modes use FP16 Action projections/Euler with ACC32 GEMMs and one-time CPU
 FP32 time/Ada precomputation. Disabling optimization changes Graph organization,

@@ -187,7 +187,8 @@ before reduction. See
 
 Segment entry count is a host scheduling budget, not a token/chunk count.
 `RPU_GRAPH_MAX_SEGMENT_ENTRIES=32768` can remove entry-driven cuts for the
-controlled Wall prefill (about 24k nodes). It does not promise one segment:
+controlled Wall prefill (historically about 24k nodes with 128-row chunks).
+It does not promise one segment:
 command/instruction footprints, queue-state changes and host callbacks can
 still split a Graph. Inspect actual segment counts and validate parity and
 replay before accepting an enlarged profile. `0` does not mean unlimited.
@@ -207,7 +208,7 @@ alone changes segmentation, not SPM chunks. Separately, optimized Wall Prefill
 binds a cold whole-bucket override (64..384 rows), retaining GDN's internal
 64-row recurrence. It uses disjoint Full Attention/GDN scratch lifetimes above
 128 rows and rejects an SPM overflow without falling back to multiple chunks.
-Generic Qwen3.5 and the split Wall preset retain the128-row admission ceiling.
+Generic Qwen3.5 and the split Wall preset retain the 128-row admission ceiling.
 This can change FP16 rounding; controlled evaluation still does not certify
 numerical/task-quality support.
 
