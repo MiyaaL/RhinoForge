@@ -121,6 +121,14 @@ For the pinned put-spoon-to-bowl episode, the repository-root wrapper mirrors
 the Harrix data, prompt, segmentation, and action-decoding contract and never
 sends a robot command:
 
+Its video decoder uses OpenCV; the `vla` extra declares
+`opencv-python-headless>=4.11,<5` (no GUI dependency). Wall does not require
+the CUDA FLA or causal-conv1d packages. Its HF metadata construction suppresses
+only their unused installation hint. Both processor loaders use and verify
+Transformers 5.5's default torchvision backend, equivalent to the former
+`use_fast=True`. They do not forward `backend` through `AutoProcessor`, because
+that version also forwards it to a read-only video-processor property.
+
 ```bash
 bash run_wall_qwen35_openloop.sh --check --no-sudo
 bash run_wall_qwen35_openloop.sh --max-events 1
@@ -158,7 +166,7 @@ bash run_wall_qwen35_openloop.sh --max-requests 1
 ```
 
 Real execution rejects an old packed-Vision Python/native ABI before checkpoint
-loading and prints the loaded adapter path. `Vision Graph: entries=1` confirms
+loading; successful validation is silent. `Vision Graph: entries=1` confirms
 the retained cache for the usual image triple. A fresh `--max-requests 1
 --torch-profile-dir DIR` run records that request including setup/BUILD; it
 does not insert a warmup/repeat or certify whole-policy READY/parity.

@@ -53,6 +53,14 @@ The runner requires Wall execution ABI 2: ABI 1 installations can still use the
 old Prefill preset. Verify the wrapper's actual Python/native installation,
 not only the source checkout, after rebuilding.
 
+For Wall startup diagnostics, retain the installed-Python/native guards while
+keeping successful validation silent. Verify the default torchvision processor
+backend without forwarding `backend` to Transformers 5.5's video processor;
+filter only the unused HF CUDA-kernel installation hint during Wall
+meta construction, not all Transformers warnings or its fallback functions.
+OpenCV video decoding is declared through the headless package in the `vla`
+extra. Reinstall Python changes before testing the installed-package wrapper.
+
 For the Wall open-loop runner, profiling uses only `--torch-profile-dir DIR`
 and `--hw-perf-dir DIR` (with the existing hardware dump bound). Torch records
 one compressed trace per request with shapes/stacks enabled and memory events

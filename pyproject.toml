@@ -41,6 +41,7 @@ vla = [
     "diffusers==0.38.0",
     "lerobot==0.6.1",
     "omegaconf>=2.3,<3",
+    "opencv-python-headless>=4.11,<5",
     "pillow>=11",
     "pyyaml>=6",
     "scipy>=1.15,<2",

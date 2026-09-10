@@ -123,11 +123,7 @@ def _load_base_model(checkpoint: Path, checkpoint_module, *, manifest):
 
 
 def _load_processor(checkpoint: Path, checkpoint_module):
-    from transformers import AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(
-        checkpoint, local_files_only=True, use_fast=True,
-    )
+    processor = checkpoint_module._load_wall_qwen35_hf_processor(checkpoint)
     tokenizer = processor.tokenizer
     extender = _required(checkpoint_module, "extend_wall_qwen35_tokenizer")
     extender(tokenizer, target_vocab=CHECKPOINT_VOCAB_SIZE)

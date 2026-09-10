@@ -1075,7 +1075,7 @@ def test_runner_rejects_old_installed_vision_before_checkpoint_load(
     assert "if not args.check_config:\n        _require_packed_vision_runtime()" in source
 
 
-def test_runner_validates_native_and_reports_loaded_adapter(
+def test_runner_validates_native_without_success_noise(
     openloop_namespace, monkeypatch, capsys,
 ) -> None:
     from rpu_backend.adapters.qwen3_5 import vision
@@ -1084,7 +1084,7 @@ def test_runner_validates_native_and_reports_loaded_adapter(
     monkeypatch.setattr(vision, "_require_packed_spatial_vision_native", lambda: calls.append(1))
     openloop_namespace["_require_packed_vision_runtime"]()
     assert calls == [1]
-    assert str(Path(vision.__file__).resolve()) in capsys.readouterr().out
+    assert capsys.readouterr().out == ""
 
     def stale_native():
         raise RuntimeError("native ABI mismatch")

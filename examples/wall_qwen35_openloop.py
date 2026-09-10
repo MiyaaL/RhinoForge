@@ -163,11 +163,6 @@ def _require_packed_vision_runtime() -> None:
             "python -m pip install . --no-build-isolation"
         )
     require_native()
-    print(
-        "[wall-qwen35-openloop] packed Vision runtime OK: "
-        f"{Path(vision.__file__).resolve()}",
-        flush=True,
-    )
 
 
 def _require_graph_budget_runtime() -> None:
@@ -923,7 +918,7 @@ def _host_prefix_preflight(
 ) -> list[dict[str, Any]]:
     """Validate all real images/prompts before irreversible RPU installation."""
 
-    from transformers import AutoConfig, AutoProcessor
+    from transformers import AutoConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
@@ -932,6 +927,8 @@ def _host_prefix_preflight(
         _canonical_action_positions,
     )
     from rpu_backend.adapters.wall_qwen35.checkpoint import (
+        _build_wall_qwen35_meta_model,
+        _load_wall_qwen35_hf_processor,
         extend_wall_qwen35_tokenizer,
     )
     from rpu_backend.adapters.wall_qwen35.preprocessing import (
@@ -944,9 +941,7 @@ def _host_prefix_preflight(
         map_location="cpu",
         weights_only=True,
     )
-    processor = AutoProcessor.from_pretrained(
-        checkpoint, local_files_only=True, use_fast=True
-    )
+    processor = _load_wall_qwen35_hf_processor(checkpoint)
     extend_wall_qwen35_tokenizer(processor.tokenizer, target_vocab=256277)
     processor.tokenizer.padding_side = "right"
     config = AutoConfig.from_pretrained(checkpoint, local_files_only=True)
@@ -956,8 +951,7 @@ def _host_prefix_preflight(
     # allocating checkpoint weights.  Action positions are therefore admitted
     # before the irreversible streamed RPU installation, not inferred from the
     # larger physical KV-cache extent.
-    with torch.device("meta"):
-        position_model = Qwen3_5ForConditionalGeneration(config)
+    position_model = _build_wall_qwen35_meta_model(config, Qwen3_5ForConditionalGeneration)
     results: list[dict[str, Any]] = []
     try:
         for request_index, segment in enumerate(parsed["segments"]):

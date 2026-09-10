@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import stat
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -564,6 +566,53 @@ def _prepare_hf_config(config):
     return config
 
 
+def _load_wall_qwen35_hf_processor(checkpoint):
+    from transformers import AutoProcessor
+
+    # Transformers 5.5 defaults this checkpoint to torchvision. Do not forward
+    # `backend` through AutoProcessor: its video processor exposes a read-only
+    # backend property. Check the selection to retain the old use_fast=True math
+    # instead of silently accepting PIL when torchvision is unavailable.
+    processor = AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
+    if getattr(processor.image_processor, "backend", None) != "torchvision":
+        raise RuntimeError(
+            "Wall Qwen3.5 requires the torchvision image backend; "
+            "install RhinoForge's matching vision dependencies"
+        )
+    return processor
+
+
+def _build_wall_qwen35_meta_model(config, model_class):
+    """Construct HF metadata without advertising its unused CUDA kernels.
+
+    Wall uses HF's module structure and position helpers, then installs RPU
+    forwards. The FLA/causal-conv1d installation hint from Transformers 5.5 is
+    irrelevant here. Filter only that exact warning during this thread's
+    construction; leave every other diagnostic and the HF implementation alone.
+    """
+    logger = logging.getLogger("transformers.models.qwen3_5.modeling_qwen3_5")
+    owner_thread = threading.get_ident()
+    unused_cuda_warning = (
+        "The fast path is not available because one of the required library is not installed. Falling back to "
+        "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
+        " https://github.com/Dao-AILab/causal-conv1d"
+    )
+
+    def keep_diagnostic(record):
+        return not (
+            record.thread == owner_thread
+            and record.levelno == logging.WARNING
+            and record.getMessage() == unused_cuda_warning
+        )
+
+    logger.addFilter(keep_diagnostic)
+    try:
+        with torch.device("meta"):
+            return model_class(config)
+    finally:
+        logger.removeFilter(keep_diagnostic)
+
+
 def stream_load_wall_qwen35_base_model(
     model_or_none,
     checkpoint: str | Path,
@@ -598,8 +647,7 @@ def stream_load_wall_qwen35_base_model(
 
         model_class = Qwen3_5ForConditionalGeneration
     if model_or_none is None:
-        with torch.device("meta"):
-            model = model_class(config)
+        model = _build_wall_qwen35_meta_model(config, model_class)
     else:
         model = model_or_none
         if getattr(model, "_wall_qwen35_load_started", False):
