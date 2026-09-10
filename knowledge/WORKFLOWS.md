@@ -67,6 +67,14 @@ one compressed trace per request with shapes/stacks enabled and memory events
 disabled. The first trace includes lazy setup/BUILD; do not infer frozen READY
 or steady-state latency from it. Keep historical READY-probe commands bound to
 their measured revision when updating the [testing guide](../docs/model_testing.md).
+For Wall host-preparation changes, compare every prepared tensor against the
+reference processor (including FP32 pixel values, consumed FP16 values, and M-RoPE), preserve PIL's
+single-stage resampling, and wait for image workers on failures and teardown.
+Retain full cache clearing for the first prefix and after prefix failures.
+Cache restart without DDR clearing is restricted to subsequent complete position-zero
+multi-token prefill; prove stale-state independence and stable Graph replay
+against the clearing path. Keep general cache reset semantics intact and time
+request entry through the model forward, not only the named image/text range.
 For local asset migration, copy the exact checkpoint inference files and the
 complete recorded episode, plus any explicit common-noise artifact. The local
 wrapper defaults to `/mnt/nvme/miyaa/work/{ckpt,dataset,prof}`. Preserve hashed

@@ -14,6 +14,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -32,27 +33,30 @@ _PROFILE_MASK = (1.0,) * 20 + (0.0,) * 6
 
 def _finite_vector(value: Any, *, name: str, binary: bool = False) -> torch.Tensor:
     try:
-        tensor = torch.as_tensor(value, dtype=torch.float32)
+        tensor = (value if isinstance(value, torch.Tensor) and value.dtype == torch.float32
+                  else torch.as_tensor(value, dtype=torch.float32))
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ValueError(f"WallQwen35Policy {name} must be tensor-like") from exc
     if tensor.device.type != "cpu":
         raise ValueError(f"WallQwen35Policy {name} must be on CPU")
-    tensor = tensor.reshape(-1).contiguous()
+    tensor = tensor if tensor.ndim == 1 and tensor.is_contiguous() else tensor.reshape(-1).contiguous()
     if tensor.numel() != _ACTION_DIM:
         raise ValueError(
             f"WallQwen35Policy {name} must contain {_ACTION_DIM} values, "
             f"got {tensor.numel()}"
         )
-    if not bool(torch.isfinite(tensor).all()):
+    array = (tensor.detach().resolve_neg().numpy() if tensor.requires_grad or tensor.is_neg() else tensor.numpy())
+    if not bool(np.isfinite(array).all()):
         raise ValueError(f"WallQwen35Policy {name} must contain only finite values")
-    if binary and not bool(((tensor == 0) | (tensor == 1)).all()):
+    if binary and not bool(((array == 0) | (array == 1)).all()):
         raise ValueError(f"WallQwen35Policy {name} must contain only 0 or 1")
     return tensor
 
 
 def _finite_initial_noise(value: Any) -> torch.Tensor:
     try:
-        tensor = torch.as_tensor(value, dtype=torch.float32)
+        tensor = (value if isinstance(value, torch.Tensor) and value.dtype == torch.float32
+                  else torch.as_tensor(value, dtype=torch.float32))
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ValueError(
             "WallQwen35Policy initial_noise must be tensor-like"
@@ -66,11 +70,13 @@ def _finite_initial_noise(value: Any) -> torch.Tensor:
             "WallQwen35Policy initial_noise must have shape [32,26] or "
             f"[1,32,26], got {tuple(tensor.shape)}"
         )
-    if not bool(torch.isfinite(tensor).all()):
+    array = (tensor.detach().resolve_neg().numpy() if tensor.requires_grad or tensor.is_neg() else tensor.numpy())
+    if not bool(np.isfinite(array).all()):
         raise ValueError(
             "WallQwen35Policy initial_noise must contain only finite values"
         )
-    return tensor.contiguous().clone()
+    return (tensor.contiguous().clone() if tensor.requires_grad else
+            torch.from_numpy(np.array(array, copy=True, order="C")))
 
 
 def _camera_mapping(images: Mapping[str, Any]) -> dict[str, Any]:
@@ -247,22 +253,21 @@ class WallQwen35Policy:
             )
         ordered_images = _camera_mapping(images)
         state = _finite_vector(proprioception, name="proprioception")
-        expected_mask = torch.tensor(_PROFILE_MASK, dtype=torch.float32)
         state_mask = (
-            expected_mask.clone()
+            torch.from_numpy(np.asarray(_PROFILE_MASK, dtype=np.float32))
             if agent_pos_mask is None
             else _finite_vector(agent_pos_mask, name="agent_pos_mask", binary=True)
         )
         action_mask = (
-            expected_mask.clone()
+            torch.from_numpy(np.asarray(_PROFILE_MASK, dtype=np.float32))
             if dof_mask is None
             else _finite_vector(dof_mask, name="dof_mask", binary=True)
         )
-        if not torch.equal(state_mask, expected_mask):
+        if not np.array_equal(state_mask.numpy(force=True), _PROFILE_MASK):
             raise ValueError(
                 "WallQwen35Policy agent_pos_mask must be [1]*20 + [0]*6"
             )
-        if not torch.equal(action_mask, expected_mask):
+        if not np.array_equal(action_mask.numpy(force=True), _PROFILE_MASK):
             raise ValueError("WallQwen35Policy dof_mask must be [1]*20 + [0]*6")
         if noise_seed is not None and (
             isinstance(noise_seed, bool) or not isinstance(noise_seed, Integral)

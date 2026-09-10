@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from .preprocessing import (
     WALL_PREFIX_BUCKETS,
     WallQwen35PreparedInput,
     prepare_wall_qwen35_input,
+    _configure_atomic_action_suffix,
 )
 
 
@@ -138,6 +140,7 @@ def _load_processor(checkpoint: Path, checkpoint_module):
             f"Wall special-token IDs {actual_ids} do not match {expected_ids}"
         )
     tokenizer.padding_side = "right"
+    _configure_atomic_action_suffix(processor)
     return processor
 
 
@@ -210,6 +213,7 @@ class WallQwen35Runtime:
         self.action_expert = None
         self._manifest = profile
         self._processor = None
+        self._image_executor = None
 
         checkpoint_module, _ = _wall_modules()
         if self._manifest is None:
@@ -374,6 +378,22 @@ class WallQwen35Runtime:
                 raise RuntimeError(
                     "Wall Qwen3.5 action install did not publish runtime state"
                 )
+            worker_count = 6
+            self._image_executor = ThreadPoolExecutor(
+                max_workers=worker_count, thread_name_prefix="wall-image"
+            )
+            # Start worker resources during installation, without reading any
+            # request images or preparing/caching an observation.
+            ready = threading.Barrier(worker_count + 1, timeout=10.0)
+            try:
+                started = [self._image_executor.submit(ready.wait)
+                           for _ in range(worker_count)]
+                ready.wait()
+                for future in started:
+                    future.result()
+            except BaseException:
+                ready.abort()
+                raise
             self._installed = True
             return self
         except BaseException:
@@ -403,6 +423,8 @@ class WallQwen35Runtime:
                 dof_mask=dof_mask,
                 camera_names=self.camera_names,
                 max_seq_length=self.max_seq_len,
+                image_executor=self._image_executor,
+                pixel_dtype=torch.float16,
             )
 
     def _build_prefix(self, prepared: WallQwen35PreparedInput):
@@ -414,7 +436,19 @@ class WallQwen35Runtime:
         # and retained Graphs survive, and no Graph is made non-replayable.
         torch.ops.rpu.spm_alloc_reset_temporary()
         try:
-            self.base_cache.reset()
+            # This path always submits a complete multi-token prefix at zero.
+            # Native build_gdn initializes recurrent/conv SPM on its first
+            # prefill chunk; full attention inserts current KV before reading.
+            # DDR clearing here only repeats that work and flushes unused rows.
+            # Keep the general Qwen3_5Cache.reset() clearing contract unchanged.
+            if not 1 < prepared.prefix_length <= min(
+                max(WALL_PREFIX_BUCKETS), self.base_cache.max_seq_len
+            ):
+                raise ValueError("Wall cache restart requires a complete multi-token prefix")
+            if not getattr(self, "_prefix_cache_initialized", False):
+                self.base_cache.reset()
+            self.base_cache.position = 0
+            self.base_cache._seen_tokens = 0
             # Qwen3.5 vision STEP0 accepts host folded patches and performs the
             # explicit CPU/RPU handoff itself. Keep this pointer off RPU before
             # entering the lazy vision installer/captured graph.
@@ -447,7 +481,11 @@ class WallQwen35Runtime:
                     "base prefix cache position drift: "
                     f"{self.base_cache.position} != {prepared.prefix_length}"
                 )
+            self._prefix_cache_initialized = True
             return self.base_cache
+        except BaseException:
+            self._prefix_cache_initialized = False
+            raise
         finally:
             # Vision already closes its own boundary before Text. Close the
             # Text -> Action boundary even on failure; KV/GDN state is not Temp.
@@ -569,6 +607,10 @@ class WallQwen35Runtime:
     def close(self):
         if self._closed:
             return
+        image_executor = getattr(self, "_image_executor", None)
+        if image_executor is not None:
+            image_executor.shutdown(wait=True, cancel_futures=True)
+            self._image_executor = None
         base_model = self.base_model
 
         # Vision is installed lazily by the first prefix forward.  Retire it

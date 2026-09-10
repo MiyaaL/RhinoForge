@@ -281,6 +281,40 @@ requests' events. The reference `generate_flow_action_batch` range and the
 `wall_qwen35_action_denoise_loop`, and `wall_qwen35_action_decoder` stage ranges
 remain visible.
 
+Wall host preparation should be measured from request entry until the base
+model forward, including image preparation, cache restart, and the CPU FP16
+pixel handoff. The runtime owns a bounded six-worker pool. Single-stage PIL BICUBIC
+resizing overlaps text/M-RoPE preparation; eligible large RGB images use two
+output bands with full-source filter halos and exact binary vertical sample
+coordinates; integer-scale wrist images use two merge-aligned bands. Other dimensions retain the whole-image resize. The admitted
+batch-one image M-RoPE path also avoids generic per-group Torch dispatch while
+preserving HF rope_deltas; custom position methods retain their reference path.
+Cold admission of the atomic action suffix permits one tokenizer call, with
+all 32 suffix IDs checked on every request; other tokenizer configurations
+retain both reference calls. Batch-one IDs are materialized directly as int64.
+Runtime pixel packing emits the same FP16 values previously obtained by the
+FP32-to-FP16 handoff, using a fixed per-byte conversion table; standalone input
+preparation still defaults to FP32. Resizing and packing run in the same worker job; eligible bands end on complete
+32-pixel merge rows and write disjoint slices of one fresh Torch-owned output
+in the reference order, without intermediate patch buffers or concatenation.
+Only immutable byte conversions, grid-position templates and the fixed
+system/camera token scaffold are precomputed. Atomic special-token, NFC and
+identity-postprocessor guards admit the scaffold split; dynamic instructions
+and state are always encoded live with the original Rust batch encoder.
+No observation, dynamic instruction/state or output is cached. The exact admitted Torchvision
+configuration uses equivalent FP32 normalization and patch packing. Every
+request waits for its image work; images, tokens and outputs are not cached.
+Other processor configurations retain their reference image implementation.
+
+The first Wall prefix retains full in-place cache clearing, including after
+a failed prefix. Subsequent complete-prefix calls restart metadata without clearing
+DDR: native position-zero multi-token prefill initializes GDN/conv state in
+SPM and inserts current KV before attention. General Qwen3_5Cache.reset()
+still clears all cache tensors in place. Validate this optimization against
+the clearing path with changed inputs, long/short prefixes, poisoned stale
+cache contents, and retained Graph replay. Profiler traces remain diagnostic;
+report the full host boundary and end-to-end timing with profiling disabled.
+
 There is no automatic unprofiled warmup or identical-repeat READY probe.
 Explicit `policy.to("rpu")` installation is outside the Torch trace, but lazy
 first-request setup and Graph BUILD are included. Later requests may BUILD

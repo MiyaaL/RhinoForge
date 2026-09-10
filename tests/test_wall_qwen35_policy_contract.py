@@ -304,6 +304,8 @@ def _empty_runtime_for_install_test():
     runtime.base_model = None
     runtime._base_adapter = None
     runtime._processor = None
+    runtime._image_executor = None
+    runtime.camera_names = ("face_view", "left_wrist_view", "right_wrist_view")
     return runtime
 
 
@@ -332,7 +334,8 @@ def test_prefix_handoff_retires_previous_component_temps_outside_capture(
         cache.position = 0
         events.append("reset_cache")
 
-    cache = SimpleNamespace(position=0, persistent=persistent, reset=reset_cache)
+    cache = SimpleNamespace(position=123, _seen_tokens=123, max_seq_len=780,
+                            persistent=persistent, reset=reset_cache)
     prepared = SimpleNamespace(
         pixel_values=torch.zeros((392, 4)), prefix_input_ids=object(),
         prefix_attention_mask=object(), prefix_position_ids=object(),
@@ -343,6 +346,7 @@ def test_prefix_handoff_retires_previous_component_temps_outside_capture(
     def forward(**kwargs):
         assert arena["temporary"] + 4817408 <= 7598080
         assert kwargs["past_key_values"] is cache
+        assert cache.position == cache._seen_tokens == 0
         assert kwargs["pixel_values"].device.type == "cpu"
         assert kwargs["pixel_values"].dtype == torch.float16
         arena["capturing"] = True
@@ -370,9 +374,10 @@ def test_prefix_handoff_retires_previous_component_temps_outside_capture(
             assert arena["temporary"] == 0  # Text -> Action handoff
             assert cache.persistent is persistent
     assert arena["temporary"] == 0
-    assert events == ["reset_temp", "reset_cache", "prefix", "reset_temp"] * (
-        1 if failure else 3
+    assert events == ["reset_temp", "reset_cache", "prefix", "reset_temp"] + (
+        [] if failure else ["reset_temp", "prefix", "reset_temp"] * 2
     )
+    assert runtime._prefix_cache_initialized is (failure is None)
 
 
 def test_runtime_rejects_conflicting_cold_multi_handle_setting(
