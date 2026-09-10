@@ -121,7 +121,8 @@ and silently create an unvalidated combination.
 
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
-| `RPU_KERNEL_LIB_PATH` | Combined operator asset beside the extension; existing file path with an adjacent `.kernels` manifest | First asset access / **IMPORT** | Process-wide asset selection. A missing, incompatible, or untrusted asset or manifest prevents safe execution. |
+| `RPU_KERNEL_LIB_PATH` | Combined reference operator asset beside the extension; existing file path with an adjacent `.kernels` manifest | First asset access / **IMPORT** | Process-wide reference selection. A missing or incompatible asset/manifest fails initialization. |
+| `RPU_SOURCE_OPS` | Unset/empty uses reference; comma-separated `gelu`, `layernorm`, `rmsnorm` explicitly enables source wrappers | First native use / **NATIVE** | Requires an optional build linked with `rpu_ops` (`rpu_ops_DIR`). GELU/LayerNorm admit eligible single-core SPM calls and otherwise retain reference. `rmsnorm` is a diagnostic-only eight-core SPM candidate requiring the RMSNorm-capable SDK; unsupported shapes/aliases fail rather than silently mixing the reference into its stability test. Configuration is immutable. Numerical stability and performance gates are pending; this opt-in does not extend model support. |
 | `RPU_MODEL_CACHE` | `~/.cache/rhinoforge/models`; directory path | Package bootstrap for HF defaults / **IMPORT**, alias resolution / **CALL** | Root for RhinoForge model aliases. An explicit value also supplies HF cache defaults; a post-import change affects later aliases but does not reliably reconfigure already imported HF components. |
 | `RPU_LOG_LEVEL` | `3`; decimal integer `0..5`; invalid values warn and fall back to `3` | Native-extension load / **IMPORT** | Process logging: `0` silent through `5` trace. High levels add output and may expose paths or request metadata. |
 | `RPU_WARMUP` | `0`; integer, invalid becomes `0`, negative clamps to `0` | Adapter construction / **MODEL** | Warmup forward count for adapters that support it. Adds startup work and can consume diagnostic budgets. |
@@ -208,6 +209,10 @@ binds a cold whole-bucket override (64..384 rows), retaining GDN's internal
 64-row recurrence. It uses disjoint Full Attention/GDN scratch lifetimes above
 128 rows and rejects an SPM overflow without falling back to multiple chunks.
 Generic Qwen3.5 and the split Wall preset retain the128-row admission ceiling.
+The source open-loop runner requires Wall execution ABI 2 and rejects older
+installed adapters before weight loading. Rebuild and reinstall with the
+wrapper's Python after updating the framework; running a newer shell script
+alone does not update the installed backend.
 This can change FP16 rounding; controlled evaluation still does not certify
 numerical/task-quality support.
 

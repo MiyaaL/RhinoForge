@@ -146,11 +146,51 @@ RhinoForge links the external Launch library and reads the one combined asset
 selected by `RPU_KERNEL_LIB_PATH`; it does not copy either into the Python
 package. Keep the operator asset opaque and unchanged. Do not split it, inspect
 its contents, generate a replacement manifest, or configure additional
-operator-library paths.
+reference-asset paths.
 
 Continue with [Getting started](getting_started.md#4-install-rhinoforge-in-a-fresh-environment)
 for the regular source install, validation, exact Qwen3-0.6B download, TOML
 checks, and inference.
+
+## Local development with an approved `rpu_ops` checkout
+
+An approved `rpu_ops` repository may already contain the complete release asset,
+its unchanged `.kernels` sidecar, and the matching public Launch SDK under
+`runtime/`. Read that repository's `runtime/DISTRIBUTION_TERMS.txt` and verify
+the approved runtime-set identity before use. These restricted files stay in
+`rpu_ops`; RhinoForge neither copies them nor inspects the opaque asset.
+
+For that layout, configure the native build with
+`-DRHINO_LAUNCH_DIR=/path/to/rpu_ops/runtime/launch`. This explicit mode validates
+`../RELEASE.txt` (`launch_version=1.0.0`), the public headers, and
+`lib/librhino_launch.so`, then uses only that directory. It does not search a
+different SDK if a file is missing. Without this option, CMake keeps the
+existing exact `rhino_launch` 1.0.0 package lookup.
+
+The Wall open-loop wrapper defaults `RPU_OPS_ROOT` to the sibling `../rpu_ops`
+checkout, uses `runtime/rhinoOpLib_rhinoforge_v1.0.0.ref` there, and prepends
+`runtime/launch/lib` to the process's library search path. It checks the REF,
+sidecar and Launch shared library before starting Python and prints the selected
+paths. Explicit caller `RPU_OPS_ROOT`, `RPU_KERNEL_LIB_PATH` and
+`RHINO_LAUNCH_LIB_DIR` take precedence over `ENV_SH`; values from `ENV_SH` take
+precedence over repository defaults. Missing files fail instead of selecting a
+historical external installation.
+
+For source kernels, build the optional host SDK from that same operator
+repository and pass its exported `rpu_ops_DIR` to the RhinoForge native build;
+`python -m rpu_ops --cmake-dir` reports the installed SDK's CMake directory.
+Rebuild the matching framework native extension in an isolated environment
+after native changes. `RPU_SOURCE_OPS` is an explicit, process-cold selection,
+not an automatic promotion of every source kernel. The wrapper forwards a
+nonempty selection and `PYTHONPATH` explicitly through sudo, without `sudo -E`.
+`PYTHONPATH` must identify a matching Python/native package, not merely a source
+tree with an unrelated installed extension. Operators without an admitted
+source replacement continue to use the complete repository REF.
+
+This closes the framework/operator repository dependency boundary; the board
+driver/system libraries and Python dependencies are still required, and source
+kernel compilation additionally needs the authorized RPU compiler. It does not
+change model support status or imply numerical/performance admission.
 
 ## Updating or revoking a delivery
 

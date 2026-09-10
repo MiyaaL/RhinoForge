@@ -2,6 +2,7 @@
 #include "rhino_launch_program.h"
 #include "rhino_launch_queue.h"
 #include "rpu_ops.h"
+#include "rpu_source_ops.h"
 #include "rpu_spm_allocator.h"
 #include <ATen/ATen.h>
 #include <ATen/ops/rms_norm.h>
@@ -145,6 +146,24 @@ void rpu_launch_rmsnorm_spm_kernel(
     int64_t C,                         // Number of columns (hidden_size or head_dim)
     double eps)
 {
+#if defined(RPU_HAS_SOURCE_OPS) && defined(RPU_OPS_HAS_RMSNORM)
+  if (rpu_source_ops::configuration().rmsnorm) {
+    const auto plan = rpu_source_ops::rmsnorm_plan(true, input_spm_addr,
+        output_spm_addr, weight_spm_addr, M, C, eps);
+    TORCH_CHECK(plan, "source RMSNorm profile rejected: M=", M, ", C=", C,
+                "; require aligned local/core-0 SPM, rows divisible by 16 up to 768, "
+                "C in {128,256,1024,2048}, positive FP16 epsilon and valid aliases");
+    auto* kernel = GET_KERNEL(std::string(rpu_ops::abi::name(plan->entry)));
+    TORCH_CHECK(kernel != nullptr, "source RMSNorm program unavailable");
+    TORCH_CHECK(rpu_ops::abi::apply(*kernel, *plan) == 0,
+                "source RMSNorm parameter binding failed");
+    auto* queue = GET_QUEUE(UNIFIED_NUM_CORES);
+    queue->set_broadcast_mode(true);
+    queue->enqueu_kernel(*kernel, {plan->grid[0], plan->grid[1], plan->grid[2]},
+                        {0, 1, 2, 3, 4, 5, 6, 7});
+    return;
+  }
+#endif
   size_t dwidth = sizeof(c10::Half);
 
   c10::Half c_reciprocal = static_cast<c10::Half>(1.0f / C);

@@ -2,6 +2,7 @@
 #include "rhino_launch_program.h" // for Program_t
 #include "rhino_launch_queue.h"
 #include "rpu_ops.h"
+#include "rpu_source_ops.h"
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
 #include <cmath> // std::sqrt for the layer_norm high-range ABI (reg20 = sqrt(LC))
@@ -161,6 +162,18 @@ void rpu_launch_layernorm_spm_kernel(
     uint32_t skip_spm_addr,            // Skip input SPM address (only if has_skip)
     int num_cores)                     // Number of cores
 {
+#ifdef RPU_HAS_SOURCE_OPS
+  const auto source_plan = rpu_source_ops::layernorm_plan(rpu_source_ops::configuration().layernorm,
+      input_spm_addr, output_spm_addr, gamma_spm_addr, beta_spm_addr, M, C, eps, has_skip, num_cores);
+  if (source_plan) {
+    auto* kernel = GET_KERNEL(std::string(rpu_ops::abi::name(source_plan->entry)));
+    TORCH_CHECK(kernel != nullptr, "source LayerNorm program unavailable");
+    TORCH_CHECK(rpu_ops::abi::apply(*kernel, *source_plan) == 0, "source LayerNorm parameter binding failed");
+    auto* queue = GET_QUEUE(1);
+    queue->enqueu_kernel(*kernel, {source_plan->grid[0], source_plan->grid[1], source_plan->grid[2]}, {0});
+    return;
+  }
+#endif
   size_t dwidth = sizeof(c10::Half);
   size_t input_n_byte_step = C * dwidth;
 

@@ -132,10 +132,42 @@ test -r "$RPU_KERNEL_LIB_PATH.kernels"
 
 RhinoForge 链接外部 Launch 库，并读取 `RPU_KERNEL_LIB_PATH` 选择的唯一合并资产；
 不会把两者复制进 Python 包。保持算子资产 opaque 且内容不变。不要拆分资产、检查其
-内容、自行生成替代 manifest 或配置其他算子库路径。
+内容、自行生成替代 manifest 或配置其他 reference 资产路径。
 
 普通源码安装、验证、精确 Qwen3-0.6B 下载、TOML 检查和推理步骤见
 [快速开始](getting_started.zh.md#4-在全新环境中安装-rhinoforge)。
+
+## 使用获批 `rpu_ops` checkout 进行本地开发
+
+获批 `rpu_ops` 仓库可以在 `runtime/` 内提供完整 release REF、未修改的相邻
+`.kernels` 文件，以及匹配的 Launch 公开 SDK。使用前阅读该仓库的
+`runtime/DISTRIBUTION_TERMS.txt`，并确认获批 runtime set 的身份。这些受限文件留在
+`rpu_ops` 内；RhinoForge 不复制它们，也不检查 opaque 资产内容。
+
+对这种目录布局，原生构建可指定
+`-DRHINO_LAUNCH_DIR=/path/to/rpu_ops/runtime/launch`。该显式模式检查相邻
+`../RELEASE.txt` 中的 `launch_version=1.0.0`、公开头文件和
+`lib/librhino_launch.so`，只使用指定目录；缺失文件时不会搜索其他 SDK。未指定该选项
+时，CMake 保留精确匹配 `rhino_launch` 1.0.0 的原 package 查找方式。
+
+Wall open-loop 脚本的 `RPU_OPS_ROOT` 默认指向脚本相邻的 `../rpu_ops` checkout，
+REF 使用其中的 `runtime/rhinoOpLib_rhinoforge_v1.0.0.ref`，动态库搜索优先使用
+`runtime/launch/lib`。脚本在启动 Python 前检查 REF、sidecar 和 Launch 动态库，
+并打印实际路径。调用者显式设置的 `RPU_OPS_ROOT`、`RPU_KERNEL_LIB_PATH`、
+`RHINO_LAUNCH_LIB_DIR` 优先于 `ENV_SH`；`ENV_SH` 中的设置优先于仓库默认值。
+缺失文件直接报错，不会改用历史外部安装。
+
+使用源码算子时，从同一个算子仓构建可选 host SDK，再通过其导出的 `rpu_ops_DIR`
+构建 RhinoForge 原生扩展；`python -m rpu_ops --cmake-dir` 可查询已安装 SDK 的
+CMake 目录。原生代码变化后，应在隔离环境重建匹配的框架扩展。
+`RPU_SOURCE_OPS` 是显式、进程启动时固定的选择，不会自动启用所有源码算子。
+脚本在 sudo 下显式传递非空的该选择和 `PYTHONPATH`，不使用 `sudo -E`。
+`PYTHONPATH` 必须指向 Python/native 匹配的包，不能只切 Python 源码而沿用无关的
+已安装扩展。尚无通过准入的源码实现时，继续使用仓库中的完整 REF。
+
+这里收口的是框架和算子仓依赖；板卡驱动/系统库以及 Python 依赖仍然必需，源码
+kernel 编译还需要获授权的 RPU 编译器。这不改变模型支持状态，也不代表数值或性能
+验证已经通过。
 
 ## 更新或撤销交付
 

@@ -5,8 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ENV_SH="${ENV_SH:-/home/hx/miyaa/work/env.sh}"
 DATASET_DIR="${DATASET_DIR:-/mnt/nvme/miyaa/work/dataset/20260122-day-put_spoon_to_bowl@MASTER_SLAVE_MODE@2026_01_22_18_19_18}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/nvme/miyaa/work/ckpt/0_200000}"
-RPU_KERNEL_LIB_PATH="${RPU_KERNEL_LIB_PATH:-/home/hx/.local/share/rhinoforge/runtime/runtime-v1.0.0-r4/rhinoOpLib_rhinoforge_v1.0.0.ref}"
-RHINO_LAUNCH_LIB_DIR="${RHINO_LAUNCH_LIB_DIR:-/home/hx/.local/opt/rhino-launch-kernel-v1.0.0-linux-aarch64/lib}"
+# Preserve explicit caller choices even if ENV_SH supplies different defaults.
+# Resolve the repository runtime only after sourcing the environment below.
+WALL_INPUT_RPU_OPS_ROOT="${RPU_OPS_ROOT:-}"
+WALL_INPUT_KERNEL_LIB_PATH="${RPU_KERNEL_LIB_PATH:-}"
+WALL_INPUT_LAUNCH_LIB_DIR="${RHINO_LAUNCH_LIB_DIR:-}"
 INSTRUCTION_SOURCE="${INSTRUCTION_SOURCE:-distribute}"
 ROBOT_ID="${ROBOT_ID:-10070}"
 NORM_KEY="${NORM_KEY:-x2_normal}"
@@ -89,7 +92,12 @@ Environment overrides:
   RUN_WITH_SUDO, TORCH_PROFILE_DIR, HW_PERF_DIR, HW_PERF_MAX_DUMPS,
   LKN_RPU_FREQ_MHZ,
   RPU_QWEN35_WALL_FUSED_SILU_MUL, RPU_QWEN35_WALL_PREREDUCE_RESIDUAL_GATE,
-  RPU_KERNEL_LIB_PATH, RHINO_LAUNCH_LIB_DIR, RUN_ID.
+  RPU_OPS_ROOT (default: ../rpu_ops beside this script),
+  RPU_KERNEL_LIB_PATH (default: RPU_OPS_ROOT/runtime/rhinoOpLib_rhinoforge_v1.0.0.ref),
+  RHINO_LAUNCH_LIB_DIR (default: RPU_OPS_ROOT/runtime/launch/lib),
+  RPU_SOURCE_OPS, PYTHONPATH, RUN_ID.
+Runtime path precedence: explicit caller override, ENV_SH, repository default.
+The REF sidecar and Launch shared library must exist; no legacy path fallback.
 
 Examples:
   WALL_QWEN35_OPT=0 bash run_wall_qwen35_openloop.sh --max-requests 1
@@ -330,6 +338,9 @@ fi
 # shellcheck disable=SC1090
 source "$ENV_SH"
 [[ -n "${CONDA_PREFIX:-}" ]] || fatal "ENV_SH did not set CONDA_PREFIX"
+RPU_OPS_ROOT="${WALL_INPUT_RPU_OPS_ROOT:-${RPU_OPS_ROOT:-$SCRIPT_DIR/../rpu_ops}}"
+RPU_KERNEL_LIB_PATH="${WALL_INPUT_KERNEL_LIB_PATH:-${RPU_KERNEL_LIB_PATH:-$RPU_OPS_ROOT/runtime/rhinoOpLib_rhinoforge_v1.0.0.ref}}"
+RHINO_LAUNCH_LIB_DIR="${WALL_INPUT_LAUNCH_LIB_DIR:-${RHINO_LAUNCH_LIB_DIR:-$RPU_OPS_ROOT/runtime/launch/lib}}"
 # ENV_SH is allowed to provide the local evaluation defaults.  Resolve the
 # cold candidate selectors after sourcing it, then normalize before preflight
 # so the explicit /usr/bin/env below (including sudo) cannot drop the arm.
@@ -343,10 +354,17 @@ PYTHON_BIN="${PYTHON_BIN:-$CONDA_PREFIX/bin/python}"
 [[ -x "$PYTHON_BIN" ]] || fatal "python is not executable: $PYTHON_BIN"
 [[ -d "$DATASET_DIR" ]] || fatal "dataset directory is missing: $DATASET_DIR"
 [[ -d "$CHECKPOINT_PATH" ]] || fatal "checkpoint directory is missing: $CHECKPOINT_PATH"
-[[ -f "$RPU_KERNEL_LIB_PATH" ]] \
+[[ -f "$RPU_KERNEL_LIB_PATH" && -r "$RPU_KERNEL_LIB_PATH" ]] \
     || fatal "operator reference is missing: $RPU_KERNEL_LIB_PATH"
-[[ -d "$RHINO_LAUNCH_LIB_DIR" ]] \
-    || fatal "Rhino Launch library directory is missing: $RHINO_LAUNCH_LIB_DIR"
+[[ -f "$RPU_KERNEL_LIB_PATH.kernels" && -r "$RPU_KERNEL_LIB_PATH.kernels" ]] \
+    || fatal "operator reference manifest is missing: $RPU_KERNEL_LIB_PATH.kernels"
+[[ -f "$RHINO_LAUNCH_LIB_DIR/librhino_launch.so" && -r "$RHINO_LAUNCH_LIB_DIR/librhino_launch.so" ]] \
+    || fatal "Rhino Launch shared library is missing: $RHINO_LAUNCH_LIB_DIR/librhino_launch.so"
+if [[ -d "$RPU_OPS_ROOT" ]]; then
+    RPU_OPS_ROOT="$(cd -- "$RPU_OPS_ROOT" && pwd -P)"
+fi
+RPU_KERNEL_LIB_PATH="$(cd -- "$(dirname -- "$RPU_KERNEL_LIB_PATH")" && pwd -P)/$(basename -- "$RPU_KERNEL_LIB_PATH")"
+RHINO_LAUNCH_LIB_DIR="$(cd -- "$RHINO_LAUNCH_LIB_DIR" && pwd -P)"
 
 DATASET_DIR="$(cd -- "$DATASET_DIR" && pwd -P)"
 CHECKPOINT_PATH="$(cd -- "$CHECKPOINT_PATH" && pwd -P)"
@@ -373,7 +391,7 @@ if ((hw_perf_enabled)); then
 fi
 
 TORCH_LIB_DIR="$($PYTHON_BIN -c 'from pathlib import Path; import torch; print(Path(torch.__file__).resolve().parent / "lib")')"
-RUNTIME_LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$TORCH_LIB_DIR:$RHINO_LAUNCH_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+RUNTIME_LD_LIBRARY_PATH="$RHINO_LAUNCH_LIB_DIR:$CONDA_PREFIX/lib:$TORCH_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PYTHON_ARGS=(
     "$SCRIPT_DIR/examples/wall_qwen35_openloop.py"
     --dataset-dir "$DATASET_DIR"
@@ -412,6 +430,10 @@ printf '  %-22s %s\n' 'Graph plan:' "$GRAPH_PLAN"
 printf '  %-22s %s\n' 'Action precision:' 'FP16 I/O/Euler, ACC32 GEMM'
 printf '  %-22s %s\n' 'environment:' "$ENV_SH"
 printf '  %-22s %s\n' 'Python:' "$PYTHON_BIN"
+printf '  %-22s %s\n' 'rpu_ops root:' "$RPU_OPS_ROOT"
+printf '  %-22s %s\n' 'operator reference:' "$RPU_KERNEL_LIB_PATH"
+printf '  %-22s %s\n' 'Rhino Launch:' "$RHINO_LAUNCH_LIB_DIR/librhino_launch.so"
+printf '  %-22s %s\n' 'source operators:' "${RPU_SOURCE_OPS:-reference only}"
 printf '  %-22s %s\n' 'checkpoint:' "$CHECKPOINT_PATH"
 printf '  %-22s %s\n' 'dataset:' "$DATASET_DIR"
 printf '  %-22s %s\n' 'instruction source:' "$INSTRUCTION_SOURCE"
@@ -456,6 +478,7 @@ printf '  %-22s %s\n' 'output:' "$([[ $check_only == 1 ]] && printf none || prin
 
 ENV_ARGS=(
     "WALL_QWEN35_OPT=$WALL_QWEN35_OPT"
+    "RPU_OPS_ROOT=$RPU_OPS_ROOT"
     "PATH=$CONDA_PREFIX/bin:$PATH"
     "LD_LIBRARY_PATH=$RUNTIME_LD_LIBRARY_PATH"
     "RPU_KERNEL_LIB_PATH=$RPU_KERNEL_LIB_PATH"
@@ -476,6 +499,12 @@ ENV_ARGS=(
     "MPLBACKEND=Agg"
     "MPLCONFIGDIR=/tmp/rhinoforge-matplotlib"
 )
+if [[ -n "${RPU_SOURCE_OPS:-}" ]]; then
+    ENV_ARGS+=("RPU_SOURCE_OPS=$RPU_SOURCE_OPS")
+fi
+if [[ -n "${PYTHONPATH:-}" ]]; then
+    ENV_ARGS+=("PYTHONPATH=$PYTHONPATH")
+fi
 
 if [[ $use_sudo == 1 ]]; then
     COMMAND=(sudo /usr/bin/env "${ENV_ARGS[@]}" "$PYTHON_BIN" "${PYTHON_ARGS[@]}")

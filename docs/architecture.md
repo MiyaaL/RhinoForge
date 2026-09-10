@@ -32,6 +32,22 @@ interpret device instructions. Kernel availability comes from the adjacent
 versioned `.kernels` release manifest, which contains the asset byte size and
 kernel names only.
 
+An optional `rpu_ops` SDK supplies source implementations through a host shared
+library, alongside the complete reference asset. Builds locate it with
+`rpu_ops_DIR`; `RPU_SOURCE_OPS` selects the first single-core SPM GELU and
+LayerNorm wrappers explicitly. The default remains reference. Shape, aliasing,
+address and core-count guards run before selection; unsupported calls retain
+their existing reference ABI. The separate `rmsnorm` selector is a diagnostic
+eight-core candidate: it requires a capable SDK and rejects unsupported calls,
+so a stability test cannot silently mix implementations. Its numerical and
+performance gates must pass before any default change. Source Programs have distinct cache names and
+use the normal named-kernel Graph capture/replay path. The process owns one
+immutable selection, so changing it requires a fresh process. See
+[runtime configuration](runtime_config.md).
+LayerNorm currently excludes fused skip and requires the source library's
+documented finite input range. This experimental operator selection does not
+extend the model support profile.
+
 ## Runtime layers
 
 ### Python API and adapters

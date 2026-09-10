@@ -21,7 +21,7 @@ execute_process(
 )
 set(CMAKE_PREFIX_PATH ${TORCH_CMAKE_PREFIX} ${CMAKE_PREFIX_PATH})
 find_package(Torch REQUIRED)
-find_package(rhino_launch 1.0.0 EXACT CONFIG REQUIRED)
+include(cmake/RhinoLaunch.cmake)
 
 # Add torch lib directory so linker can find libtorch_python.so
 execute_process(

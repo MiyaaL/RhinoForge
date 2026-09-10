@@ -11,6 +11,14 @@ restricted library and combined operator asset remain outside the source tree.
   shared library, and CMake package files from the same runtime set as the
   combined operator asset.
   [Build dependency](../../CMakeLists.txt)
+- An approved `rpu_ops/runtime/launch` tree can instead be selected explicitly
+  with `RHINO_LAUNCH_DIR`. Its adjacent release metadata must declare Launch
+  1.0.0, and all public headers and the shared library must exist. This mode
+  never falls through to another SDK. The Wall wrapper defaults REF and Launch
+  to the sibling `rpu_ops/runtime`, preserves explicit caller overrides over
+  `ENV_SH`, checks the sidecar/library, and gives the chosen Launch loader
+  priority. [Local repository mode](../../docs/runtime_assets.md#local-development-with-an-approved-rpu_ops-checkout),
+  [CMake admission](../../cmake/RhinoLaunch.cmake).
 - The shared library is discovered by the board environment's normal loader;
   RhinoForge does not vendor or copy it into the Python package.
   [Launch installation](../../docs/runtime_assets.md#4-install-without-root)
@@ -23,6 +31,22 @@ restricted library and combined operator asset remain outside the source tree.
   [Kernel manifest](../../docs/runtime_assets.md#delivery-layout)
 
 ## Public wrapper contract
+
+The optional `rpu_ops` host SDK can coexist with the complete reference asset.
+CMake finds its exported target through `rpu_ops_DIR`; `RPU_SOURCE_OPS` opts in
+to eligible single-core SPM GELU/LayerNorm wrappers. Source names have separate
+Program/Kernel cache entries and are recorded through the existing named Graph
+path. Unsupported shapes, layouts, aliases or core counts use reference before
+submission; loading/execution failures are errors. Selection is immutable for
+the process. [Selection contract](../../src/core/rpu_source_ops.h),
+[source loading](../../src/core/rpu_kernel_cache.inc),
+[runtime control](../../docs/runtime_config.md).
+
+The separate eight-core `rmsnorm` source selector is diagnostic-only and requires
+the SDK's RMSNorm capability. Unlike the initial GELU/LayerNorm fallback rules,
+unsupported RMSNorm calls fail closed so validation cannot silently mix arms.
+Its numerical stability and no-regression gates remain required before any
+default selection change.
 
 The reviewable boundary is the host wrapper: tensor shapes and dtypes, memory
 ownership, addresses or offsets, transfer length, participating-core selection,

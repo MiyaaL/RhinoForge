@@ -65,11 +65,29 @@ def test_action_runtime_rejects_pre_bucket_adapter(openloop_namespace, monkeypat
         openloop_namespace["_require_action_execution_runtime"]()
 
 
-def test_unified_switch_rejects_stale_package(openloop_namespace, monkeypatch):
+@pytest.mark.parametrize("abi", [None, 1])
+def test_unified_switch_rejects_stale_package(openloop_namespace, monkeypatch, abi):
     from rpu_backend.adapters.wall_qwen35 import execution
-    monkeypatch.delattr(execution, "WALL_QWEN35_OPT_ABI")
+    if abi is None:
+        monkeypatch.delattr(execution, "WALL_QWEN35_OPT_ABI")
+    else:
+        monkeypatch.setattr(execution, "WALL_QWEN35_OPT_ABI", abi)
     with pytest.raises(RuntimeError, match="rebuild and reinstall.*WALL_QWEN35_OPT"):
         openloop_namespace["_configure_execution_runtime"]()
+
+
+@pytest.mark.parametrize("value,opt", [(None, True), ("1", True), ("0", False)])
+def test_unified_switch_accepts_current_package(openloop_namespace, monkeypatch, value, opt):
+    from rpu_backend.adapters.wall_qwen35 import execution
+    assert execution.WALL_QWEN35_OPT_ABI == 2
+    if value is None:
+        monkeypatch.delenv("WALL_QWEN35_OPT", raising=False)
+    else:
+        monkeypatch.setenv("WALL_QWEN35_OPT", value)
+    calls = []
+    monkeypatch.setattr(execution, "configure_wall_qwen35_execution", calls.append)
+    assert openloop_namespace["_configure_execution_runtime"]() is opt
+    assert calls == [opt]
 
 
 @pytest.mark.parametrize("opt", [True, False])
@@ -385,6 +403,8 @@ def test_wrapper_forwards_only_profile_directories(tmp_path, style):
     fake_python.chmod(0o755)
     asset = tmp_path / "placeholder.ref"
     asset.touch()
+    Path(f"{asset}.kernels").touch()
+    (tmp_path / "librhino_launch.so").touch()
     env = {**os.environ, "ENV_SH": str(env_sh), "PYTHON_BIN": str(fake_python),
            "DATASET_DIR": str(tmp_path), "CHECKPOINT_PATH": str(tmp_path),
            "RHINO_LAUNCH_LIB_DIR": str(tmp_path), "RPU_KERNEL_LIB_PATH": str(asset),

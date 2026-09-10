@@ -200,12 +200,12 @@ def _require_graph_budget_runtime() -> None:
 
 def _configure_execution_runtime() -> bool:
     # The source wrapper may be newer than the installed package. Do not let
-    # an old adapter silently ignore the unified switch.
+    # an old adapter silently use an obsolete execution preset.
     try:
         from rpu_backend.adapters.wall_qwen35 import execution
     except ImportError as exc:
         raise RuntimeError("rebuild and reinstall RhinoForge for WALL_QWEN35_OPT") from exc
-    if getattr(execution, "WALL_QWEN35_OPT_ABI", None) != 1:
+    if getattr(execution, "WALL_QWEN35_OPT_ABI", None) != 2:
         raise RuntimeError("rebuild and reinstall RhinoForge for WALL_QWEN35_OPT")
     opt = execution.resolve_wall_qwen35_opt()
     execution.configure_wall_qwen35_execution(opt)

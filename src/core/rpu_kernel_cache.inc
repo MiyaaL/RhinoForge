@@ -2,6 +2,7 @@
 #include "rpu_ops.h"
 #include "rpu_kernel_manifest.h"
 #include "rpu_linear_tiling.h"
+#include "rpu_source_ops.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -354,6 +355,21 @@ void KernelCache::initialize() {
     }
     auto start = std::chrono::high_resolution_clock::now();
 
+    const auto& source = rpu_source_ops::configuration();
+#ifndef RPU_HAS_SOURCE_OPS
+    TORCH_CHECK(!source.gelu && !source.layernorm && !source.rmsnorm,
+                "RPU_SOURCE_OPS requires a RhinoForge build linked with rpu_ops; configure rpu_ops_DIR");
+#else
+    if (source.gelu || source.layernorm || source.rmsnorm) {
+        TORCH_CHECK(rpu_ops::library_abi_version() == rpu_ops::abi::version,
+                    "rpu_ops host library/header ABI mismatch");
+    }
+#ifndef RPU_OPS_HAS_RMSNORM
+    TORCH_CHECK(!source.rmsnorm,
+                "RPU_SOURCE_OPS=rmsnorm requires the RMSNorm-capable rpu_ops SDK and a rebuilt RhinoForge");
+#endif
+#endif
+
     const auto& available = kernel_manifest_names(KERNEL_LIB_PATH());
     const auto at_names = rpu_pl_tiling::autotile_kernel_names();
     std::vector<std::string> missing_required;
@@ -442,6 +458,24 @@ void KernelCache::initialize() {
         }
     }
 
+#ifdef RPU_HAS_SOURCE_OPS
+    // Distinct source names preserve the existing reference cache and ABI.
+    // Graph capture obtains these Programs through its existing named-kernel path.
+    for (const auto& item : {std::make_pair("gelu_f16", source.gelu),
+                             std::make_pair("layernorm_f16", source.layernorm),
+                             std::make_pair("rmsnorm_f16", source.rmsnorm)}) {
+        if (!item.second) continue;
+        TORCH_CHECK(!available.count(item.first),
+                    "source/reference kernel name collision: ", item.first);
+        CachedKernel cached;
+        cached.program = std::make_unique<::rhino_lkn::Program_t>();
+        const auto rc = rpu_ops::load_program(*cached.program, item.first);
+        TORCH_CHECK(rc == 0, "cannot load source operator ", item.first, ": ", rpu_ops::last_error());
+        cached.kernel = std::make_unique<::rhino_lkn::Kernel_t>(*cached.program, item.first);
+        kernels_.erase(item.first);
+        kernels_.emplace(item.first, std::move(cached));
+    }
+#endif
     auto end = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double, std::milli>(end - start).count();
     if (log_at(3)) {

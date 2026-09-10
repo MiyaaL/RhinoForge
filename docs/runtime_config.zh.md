@@ -109,6 +109,7 @@ profiler 字段和所有适用的 `rpu_execution` stage。
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `RPU_KERNEL_LIB_PATH` | 扩展旁的 combined operator asset；现有文件路径及相邻 `.kernels` manifest | 首次访问 asset / **IMPORT** | 进程级 asset 选择。资产或 manifest 缺失、不兼容或不受信任都会阻止安全执行。 |
+| `RPU_SOURCE_OPS` | 未设置或空值使用 reference；以逗号分隔的 `gelu`、`layernorm`、`rmsnorm` 显式启用源码 wrapper | 首次原生调用 / **NATIVE** | 要求构建时可选链接 `rpu_ops`（`rpu_ops_DIR`）。GELU/LayerNorm 仅覆盖符合条件的单核 SPM 调用，其他调用保留 reference。`rmsnorm` 是仅供诊断的八核 SPM 候选，需要带 RMSNorm 能力的 SDK；不支持的形状/别名直接报错，避免稳定性验证静默混入 reference。配置在进程内固定，精度稳定性与性能验收尚待完成，不扩展模型支持范围。 |
 | `RPU_MODEL_CACHE` | `~/.cache/rhinoforge/models`；目录路径 | 为 HF 默认值执行包 bootstrap / **IMPORT**，alias 解析 / **CALL** | RhinoForge 模型 alias 的根目录。显式值也会提供 HF cache 默认值；导入后修改会影响之后的 alias，但无法可靠地重新配置已导入的 HF 组件。 |
 | `RPU_LOG_LEVEL` | `3`；十进制整数 `0..5`；无效值会告警并回退到 `3` | 原生扩展加载 / **IMPORT** | 进程日志级别：`0` 静默，最高 `5` trace。较高级别会增加输出，并可能暴露路径或请求 metadata。 |
 | `RPU_WARMUP` | `0`；整数；无效值变为 `0`，负数收窄为 `0` | Adapter 构造 / **MODEL** | 支持 warmup 的 adapter 的 warmup forward 次数。会增加启动工作，并可能消耗诊断预算。 |
@@ -181,7 +182,13 @@ SDK 65536 / 8 / 64。切换需要新进程，非 Wall 通用默认值不变。
 优化 Vision/Prefill 和两种 Action 均采用
 `GraphCache(require_single_segment=True)`，每次调用在 SDK 一半的预算内要求
 一个物理 segment，否则执行前报错；关闭时 Action 单步图调用十次。
-增大 Prefill 预算不改变运算精度或 SPM 分块，受控验证仍不代表发布质量认证。
+增大 Graph 预算本身不改变 SPM 分块。优化 Wall Prefill 按执行 bucket
+（64..384 行）整段处理，保留 GDN 内部的 64 行递推；超过 128 行时，
+Full Attention 与 GDN 临时区使用互斥生命周期。容量不足会报错，不会自动
+拆分。通用 Qwen3.5 和关闭优化的 Wall 配置仍保留 128 行准入上限。
+源码 open-loop 入口要求 Wall execution ABI 2，在加载权重前拒绝旧适配器。
+更新框架后须用脚本实际使用的 Python 重新构建安装；仅更新 shell 脚本
+不会更新已安装的后端。这可能改变 FP16 舍入，受控验证仍不代表发布质量认证。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|

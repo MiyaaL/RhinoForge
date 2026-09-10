@@ -31,6 +31,15 @@ kernel 名称。
 
 ## Runtime 分层
 
+构建时可通过 `rpu_ops_DIR` 可选链接外部 `librpu_ops.so`。进程启动前设置
+`RPU_SOURCE_OPS=gelu,layernorm`，仅对符合条件的单核 FP16 SPM 调用启用源码实现；
+LayerNorm 不含 fused skip，且输入数值须符合算子库的约定范围。默认仍使用 reference，
+完整 reference 资产及 manifest 始终必需。源码 Program 使用独立缓存名称，并沿用
+框架原有 Graph 记录、持有、克隆和重放路径；库不拥有队列、张量或模型状态。
+选择在进程内固定，切换实现后应使用新进程。这是实验性算子接入，不扩展模型支持范围。
+另有仅供诊断的 `rmsnorm` 八核候选，需要带该能力的 SDK；不支持的调用直接报错，
+避免稳定性测试静默混用旧实现。精度与性能门槛均通过前，不改变默认选择。
+
 ### Python API 与 adapter
 
 公共 loader 和 policy facade 位于 `rpu_backend.api`。Loader 先读模型配置，解析精确

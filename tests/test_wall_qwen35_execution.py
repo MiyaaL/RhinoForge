@@ -68,6 +68,8 @@ def test_shell_forwards_unified_preset_to_python(tmp_path, opt):
     fake_python.chmod(0o755)
     asset = tmp_path / "placeholder.ref"
     asset.touch()
+    Path(f"{asset}.kernels").touch()
+    (tmp_path / "librhino_launch.so").touch()
     env = {**os.environ, **{k: "stale" for k in KEYS},
            "ENV_SH": str(env_sh), "PYTHON_BIN": str(fake_python),
            "DATASET_DIR": str(tmp_path), "CHECKPOINT_PATH": str(tmp_path),

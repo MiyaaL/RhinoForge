@@ -6,7 +6,7 @@ Graph/SDK budgets; start a fresh process to change the selected arm.
 
 import os
 
-WALL_QWEN35_OPT_ABI = 1
+WALL_QWEN35_OPT_ABI = 2
 
 
 def resolve_wall_qwen35_opt() -> bool:

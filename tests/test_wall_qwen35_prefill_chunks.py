@@ -12,6 +12,24 @@ def test_legacy_does_not_touch_chunk_controls():
     _configure_prefill_chunks(SimpleNamespace(), optimized=False)
 
 
+def test_optimized_prefill_replaces_generic_admission(monkeypatch):
+    from rpu_backend.adapters.wall_qwen35.preprocessing import WALL_PREFIX_BUCKETS
+
+    calls = []
+    for name in ("qwen3_5_set_chunk_size_cap", "qwen3_5_set_chunk_envelope",
+                 "qwen3_5_set_prefill_chunk_size"):
+        monkeypatch.setattr(torch.ops.rpu, name,
+                            lambda *args, name=name: calls.append((name, args)),
+                            raising=False)
+    _configure_prefill_chunks(SimpleNamespace(handle=42), optimized=True)
+    maximum = max(WALL_PREFIX_BUCKETS)
+    assert calls == [
+        ("qwen3_5_set_chunk_size_cap", (42, 0)),
+        ("qwen3_5_set_chunk_envelope", (42, maximum, maximum)),
+        ("qwen3_5_set_prefill_chunk_size", (42, maximum)),
+    ]
+
+
 def test_native_admission_failure_is_not_silently_split(monkeypatch):
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_set_chunk_size_cap",
                         lambda *args: None, raising=False)

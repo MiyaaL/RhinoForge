@@ -101,6 +101,21 @@ add_library(rpu_backend SHARED
 )
 
 target_link_libraries(rpu_backend PRIVATE ${TORCH_LIBRARIES})
+# Optional source operator library. Reference-only builds retain their existing
+# dependency set. Select an installed SDK with -Drpu_ops_DIR=<prefix>/lib/cmake/rpu_ops.
+find_package(rpu_ops 0.2 CONFIG QUIET)
+if(TARGET rpu_ops::rpu_ops)
+    target_link_libraries(rpu_backend PRIVATE rpu_ops::rpu_ops)
+    target_compile_definitions(rpu_backend PRIVATE RPU_HAS_SOURCE_OPS=1)
+endif()
+option(RPU_BUILD_SOURCE_OPS_GRAPH_TEST "Include the board-only source-library Graph test hook" OFF)
+if(RPU_BUILD_SOURCE_OPS_GRAPH_TEST)
+    if(NOT TARGET rpu_ops::rpu_ops)
+        message(FATAL_ERROR "The source Graph test requires rpu_ops_DIR")
+    endif()
+    target_sources(rpu_backend PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../tests/source_ops_graph_smoke.cpp")
+    target_sources(rpu_backend PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../tests/source_rmsnorm_graph_smoke.cpp")
+endif()
 target_include_directories(rpu_backend PRIVATE
     ${TORCH_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}

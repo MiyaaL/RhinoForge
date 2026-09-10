@@ -23,6 +23,19 @@ release-matched operator asset is unavailable.
 
 ## Add or update knowledge
 
+For source-operator migration, keep the complete reference asset and its
+admission checks. Register source Programs under distinct names, use the
+framework's named-kernel Graph path, and freeze selection for the process.
+Validate parameter/address units and fallback geometry before board runs;
+record standalone Launch-batch results separately from Graph BUILD/REPLAY and
+model quality. [Source-library boundary](concepts/launch-runtime.md).
+For local framework/operator dependency closure, keep REF and Launch in the
+approved `rpu_ops/runtime` tree and select that Launch root explicitly at build
+time. Test caller/`ENV_SH` path precedence, missing sidecar/library rejection,
+and sudo forwarding of source selection and a matching Python/native package.
+Do not copy opaque payloads into RhinoForge or infer admission from path
+selection alone. [Local runtime setup](../docs/runtime_assets.md#local-development-with-an-approved-rpu_ops-checkout).
+
 When merging Graph segments, record the node, command and instruction census
 before changing budgets. Preserve stream fences and SDK headroom, and verify
 same-input parity plus stable replay in a fresh process. A single GraphCache
@@ -36,6 +49,9 @@ selects Vision1 + Prefill1 + Action1; `0` restores 3+3+10 on the recorded episod
 Both arms use FP16 Action math. The switch owns all six cold Graph/SDK budgets;
 verify both physical submission counts and the loaded package ABI. Historical
 FP32 measurements remain precision anchors, not a selectable runtime profile.
+The runner requires Wall execution ABI 2: ABI 1 installations can still use the
+old Prefill preset. Verify the wrapper's actual Python/native installation,
+not only the source checkout, after rebuilding.
 
 For the Wall open-loop runner, profiling uses only `--torch-profile-dir DIR`
 and `--hw-perf-dir DIR` (with the existing hardware dump bound). Torch records

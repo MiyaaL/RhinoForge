@@ -3,6 +3,7 @@
 #include "rhino_launch_queue.h"
 
 #include "rpu_ops.h"
+#include "rpu_source_ops.h"
 #include <c10/util/Half.h>
 #include <stdlib.h> // for uint16_t, setenv, unsetenv
 #include <string.h> // for memcpy
@@ -102,6 +103,20 @@ void rpu_launch_eltwise_unary_spm_kernel(
     GeluMode gelu_mode,
     int num_cores)                     // number of cores
 {
+#ifdef RPU_HAS_SOURCE_OPS
+  if (gelu_mode == GeluMode::TANH || gelu_mode == GeluMode::ERF) {
+    const auto plan = rpu_source_ops::gelu_plan(rpu_source_ops::configuration().gelu,
+        input_spm_addr, output_spm_addr, num_elements, gelu_mode == GeluMode::TANH, num_cores);
+    if (plan) {
+      auto* kernel = GET_KERNEL(std::string(rpu_ops::abi::name(plan->entry)));
+      TORCH_CHECK(kernel != nullptr, "source GELU program unavailable");
+      TORCH_CHECK(rpu_ops::abi::apply(*kernel, *plan) == 0, "source GELU parameter binding failed");
+      auto* queue = GET_QUEUE(1);
+      queue->enqueu_kernel(*kernel, {plan->grid[0], plan->grid[1], plan->grid[2]}, {0});
+      return;
+    }
+  }
+#endif
   size_t dwidth = sizeof(c10::Half);
   size_t n = num_elements;
   size_t normal_blk_n = 100 * 256;
